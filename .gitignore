@@ -1,0 +1,8 @@
+# Go 构建产物
+# protoc-gen-svcstub 由 tools/protoc-gen-svcstub 构建，不进版本库
+/tools/protoc-gen-svcstub/protoc-gen-svcstub
+/tools/protoc-gen-svcstub/protoc-gen-svcstub.exe
+
+# 构建 / 运行输出目录（见 scrpits/setup_windows_env.ps1 的 build.py 用法）
+/run/
+/build/
