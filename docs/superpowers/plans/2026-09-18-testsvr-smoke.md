@@ -2,6 +2,11 @@
 
 依据：`docs/superpowers/specs/2026-09-18-testsvr-smoke-design.md`
 
+> **后续变更（2026-09-19）**：本计划已于 2026-09-18 执行完毕。此后 `app` 增加了主循环
+> 与 `Updater` / `Reloader` 能力接口，信号改由 `src/core/sigctrl` 提供，`Module.Shutdown`
+> 改为接收预算 ctx。下文涉及 `signal.NotifyContext` 与三模块顺序的段落已过期，
+> 均以源码和测试为准；文末「已知限制」已逐条标注现状。
+
 每个任务做完就跑一次该任务的验证命令，绿了再进下一个。**不要一次写完再验证**——
 这片代码的价值全在"顺序和退出"上，攒到最后一起调会分不清是哪一层错了。
 
@@ -156,16 +161,19 @@ go build -o build/testsvr.exe ./src/server/testsvr
 
 1. 启动后日志里有 `app built ... modules=3`，且 `module inited` 出现顺序为
    **`heartbeat → ticker → worker`**（worker 注册在最前却排到最后）。
+   （2026-09-19 起为 `heartbeat → ticker → worker → pulse`。）
 2. 三个模块的 `INFO tick` 交错出现，worker 那行带 `ticker=N` 字段且 N 在增长。
 3. 按 Ctrl+C：
    - `module stopped` 出现的顺序是 **`worker → ticker → heartbeat`**
+     （2026-09-19 起为 `pulse → worker → ticker → heartbeat`）
    - 紧接着 `module shutdown` 也是同一逆序
    - 进程退出，**退出码 0**（`echo $?` / `$LASTEXITCODE`）
    - 没有挂起、没有 panic
 
 **这一步无法脚本化**：Windows 上没法给另一个进程发 Ctrl+C（`taskkill /F` 是强杀，
 走不到信号路径），所以只能人眼看。任务 3 的测试已经把 Stop/Shutdown 的语义钉住了，
-这里验的是**信号接线**这一段——`signal.NotifyContext` 有没有真的把 Ctrl+C 接到 ctx 上。
+这里验的是**信号接线**这一段——当时的 `signal.NotifyContext` 有没有真的把 Ctrl+C 接到
+ctx 上；2026-09-19 起换成 `sigctrl.Notify()` → `app.CtrlStop`，验的还是同一段接线。
 
 实施时试过用 `GenerateConsoleCtrlEvent` 从一个助手进程真发 Ctrl+C：API 返回成功，
 但 testsvr 毫无反应、继续打点。所以那条路在非交互环境下无效，**不要以为它验过了**——
@@ -188,9 +196,11 @@ go test -count=1 ./...                  # 全绿，app 包 16 个用例 + smoke 
 
 ## 已知限制（不要试图在本计划内解决）
 
-- Windows 上收不到 `syscall.SIGTERM`，只有 Ctrl+C（`os.Interrupt`）。保留 SIGTERM 是为
-  将来上 Linux，现在验不了。
-- 没有退出超时：`Module.Shutdown` 没有 ctx 参数，模块卡住就永远等下去。`app` 包的注释
-  已记录，等真实模块出现再补。
+- ~~Windows 上收不到 `syscall.SIGTERM`~~ —— **写错了，已更正**。Go 运行时把
+  `CTRL_CLOSE` / `CTRL_LOGOFF` / `CTRL_SHUTDOWN` 映射成 `SIGTERM`，所以关控制台窗口、
+  注销、系统关机走的就是它（运行时还会挂住进程约 5s 给清理留机会）。
+  这让「关窗口 = 优雅退出」成立，SIGTERM 必须留着。
+- ~~没有退出超时~~ —— **已解决**（2026-09-19）：`Module.Shutdown(ctx)` 收到停服预算，
+  `WithShutdownTimeout` 提供全局看门狗（默认 10s），`sigctrl` 另有二次信号强杀。
 - testsvr 不参与 `startall.sh`（该脚本不存在）。
 - `docs/` 与整个项目都不是 git 仓库，本计划与 spec 只落盘，没有版本历史。

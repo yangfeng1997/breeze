@@ -2,6 +2,18 @@
 
 日期：2026-09-18
 
+> **后续变更（2026-09-19）**：本文写的是 testsvr 首版落地时的状态。此后 `app` 增加了
+> **主循环**（`src/core/app/loop.go`）与两个可选能力接口 `Updater` / `Reloader`；
+> `Module.Shutdown` 改为接收停服预算 ctx；信号改由 `src/core/sigctrl` 翻译成 `app.Ctrl`。
+>
+> 与本文冲突处一律以源码和测试为准。具体的过期点：
+>
+> - 下文 `main.go` 示例里的 `signal.NotifyContext` **已不再使用**，改走 `sigctrl.Notify()`；
+> - 模块从 3 个变成 4 个（新增 `pulse`，演示中心化周期更新模板）；
+> - 因此 `Init` 顺序是 `heartbeat → ticker → worker → pulse`，
+>   退出逆序是 `pulse → worker → ticker → heartbeat`；
+> - 「已知限制」两条已解决，见文末。
+
 ## 背景
 
 `src/core/app` 是进程骨架：模块注册 → 依赖拓扑排序 → 生命周期编排（含失败回滚）。
@@ -83,7 +95,8 @@ func main() {
 
 于是日志里能看到：
 
-- Init 顺序 `heartbeat → ticker → worker`——worker 注册在最前（序号 0）却排到最后，
+- Init 顺序 `heartbeat → ticker → worker`（后来加了 `pulse`，如今是
+  `heartbeat → ticker → worker → pulse`）——worker 注册在最前（序号 0）却排到后面，
   被依赖压住了，这是"有依赖会强制重排"；
 - heartbeat 与 ticker 互不依赖，**保持彼此的注册先后**，这是"无依赖保持注册序"；
 - 退出时严格逆序：`worker → ticker → heartbeat`。
@@ -264,7 +277,9 @@ worker 这条最有价值：**它证明 worker 拿到的是同一个、已经 In
 
 ## 退出时序
 
-Ctrl+C → `signal.NotifyContext` 让 ctx done → `Run` 走 `Stop` 再 `Shutdown`：
+Ctrl+C → `signal.NotifyContext` 让 ctx done → `Run` 走 `Stop` 再 `Shutdown`
+（**2026-09-19 起**：改为 `sigctrl.Notify()` 把信号翻译成 `app.CtrlStop` 经 `WithCtrl`
+注入，`Run` 的主循环收到后走同一条 `Stop` → `Shutdown` 路径；ctx 与 `CtrlStop` 等价）：
 
 1. `Stop` 逆序调 `worker.Stop / heartbeat.Stop / ticker.Stop`，各自 `close(done)`；
 2. 所有 `Stop` 走完，框架 `cancel()` 进程 ctx（兜底，防止有 goroutine 还 select 在它上面）；
@@ -327,14 +342,24 @@ goroutine 泄漏——进程退出可能看不出问题，但真实模块会丢�
 2. `go test ./...` 全绿，`app` 包原有 16 个用例不受影响。
 3. 启动后日志中 Init 顺序为 `heartbeat → ticker → worker`，且能看到三者的打点日志
    交错输出，其中 worker 那行带 `ticker=N` 且 N 在增长。
+   （**2026-09-19 起**：模块增至四个，顺序为 `heartbeat → ticker → worker → pulse`，
+   且 `pulse` 打的是 `update` 而非 `tick` —— 它走主循环广播而不是自有 goroutine。）
 4. 运行中按 Ctrl+C，进程退出码为 0，且退出日志的顺序为
    `worker → ticker → heartbeat`（Stop 与 Shutdown 各一遍逆序）。
+   （**2026-09-19 起**：完整逆序是 `pulse → worker → ticker → heartbeat`。）
 5. 粘住退出后进程不残留（无 goroutine 泄漏导致的挂起）。
 
 ## 已知限制
 
-- `syscall.SIGTERM` 在 Windows 上收不到（Ctrl+C 走的是 `os.Interrupt`）。保留它是为了
-  将来跑 Linux 时不用改代码，不是现在就能验证的路径。
-- 没有退出超时兜底：`Module.Shutdown` 没有 ctx 参数，模块卡住时没有任何东西能取消它。
-  `app` 包的注释已记录这一点，等真实模块出现后再补。
+- ~~`syscall.SIGTERM` 在 Windows 上收不到~~ —— **这条当时写错了，已更正**。
+  Go 运行时会把 `CTRL_CLOSE` / `CTRL_LOGOFF` / `CTRL_SHUTDOWN` 映射成 `SIGTERM`
+  （见 `$GOROOT/src/runtime/os_windows.go` 的 `ctrlHandler`），所以 SIGTERM 在 Windows
+  上是**收得到**的 —— 它对应「关控制台窗口 / 注销 / 系统关机」，运行时还会挂住进程
+  一小段时间（默认约 5s）给清理留机会。保留 SIGTERM 不只是为了 Linux，
+  更是为了让关窗口走优雅退出而不是被直接杀掉。现状见 `src/core/sigctrl/sig_other.go`。
+- ~~没有退出超时兜底~~ —— **已解决**（2026-09-19）。`Module.Shutdown` 现在接收停服预算
+  ctx，`App` 侧还有全局看门狗（`WithShutdownTimeout`，默认 10s）：超预算的模块被记名放弃，
+  `Shutdown()` 返回 `ErrShutdownTimeout`。另外 `sigctrl` 里做了二次信号强杀 ——
+  连按两次 Ctrl+C 直接退出，作为循环卡在某个回调里时的最后一道兜底
+  （这条**无法**在 Windows 上验，见 `plans` 里 `GenerateConsoleCtrlEvent` 的失败记录）。
 - testsvr 不参与 `startall.sh` 那套启动链路（该脚本尚不存在）。

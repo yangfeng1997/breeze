@@ -1,6 +1,7 @@
 package smoke
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -91,4 +92,66 @@ func TestShutdownStopsGoroutines(t *testing.T) {
 
 	assertClosed(t, "ticker", tk.exited)
 	assertClosed(t, "worker", wk.exited)
+}
+
+// TestInboxWakeDrivenByNotify 验证第三种模板：事件驱动的模块。
+//
+// 投递数刻意超过单轮上限的三倍，验证它分多轮排空而不是一轮吃完 ——
+// 这条同时钉住了预算生效、以及"返回 true 后框架会自己再调度一轮"。
+func TestInboxWakeDrivenByNotify(t *testing.T) {
+	a := app.New("smoke-test")
+	ib := newInbox(a)
+	a.RegisterModule(func(*app.App) app.Module { return ib })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+
+	total := inboxBudgetCap*3 + 1
+	for i := 0; i < total; i++ {
+		ib.Post(i)
+	}
+
+	waitFor(t, "inbox 排空", func() bool { return ib.count() == total })
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run() error = %v, want nil", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ctx 取消后 Run 没有返回")
+	}
+}
+
+// TestPulseUpdatesDrivenByLoop 验证第二种模板：中心化周期更新驱动的模块
+// （零 goroutine）确实被主循环广播到了，且 Run 收得到 ctx 取消。
+//
+// 与上面两个用例的区别：pulse 没有 exited 可断言 —— 它压根没有 goroutine。
+// "停得干净"对它来说是平凡的，因为没有任何东西在后台跑。
+func TestPulseUpdatesDrivenByLoop(t *testing.T) {
+	a := app.New("smoke-test", app.WithUpdateInterval(time.Millisecond))
+	p := newPulse(a)
+	a.RegisterModule(func(*app.App) app.Module { return p })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+
+	waitFor(t, "pulse 更新", func() bool { return p.count() > 0 })
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run() error = %v, want nil", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ctx 取消后 Run 没有返回")
+	}
 }

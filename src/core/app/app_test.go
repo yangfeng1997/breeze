@@ -42,6 +42,11 @@ type fakeModule struct {
 	// 框架承诺在一切 Shutdown 之前 cancel，否则模块的 Shutdown 等待自有 goroutine
 	// 时会永久阻塞——那个 goroutine 可能正 select 在 App.Context() 上。
 	ctxCanceledAtShutdown bool
+
+	// shutdownCtxErr / shutdownCtxHasDeadline 记录 Shutdown 收到的预算 ctx 的状态。
+	// 它必须与 App.Context() 相反：一个是"还剩多少预算"，一个是"进程正在退出"。
+	shutdownCtxErr         error
+	shutdownCtxHasDeadline bool
 }
 
 func (m *fakeModule) Name() string        { return m.name }
@@ -60,9 +65,11 @@ func (m *fakeModule) Start() error {
 
 func (m *fakeModule) Stop() { m.rec.add(m.name, "Stop") }
 
-func (m *fakeModule) Shutdown() {
+func (m *fakeModule) Shutdown(ctx context.Context) {
 	m.rec.add(m.name, "Shutdown")
 	m.ctxCanceledAtShutdown = m.app.Context().Err() != nil
+	m.shutdownCtxErr = ctx.Err()
+	_, m.shutdownCtxHasDeadline = ctx.Deadline()
 }
 
 // harness 按 spec 顺序注册假模块，并保留实例供查询。
@@ -268,8 +275,8 @@ func (m *cancelOnStart) Start() error {
 	return nil
 }
 
-func (m *cancelOnStart) Stop()     { m.rec.add("canceler", "Stop") }
-func (m *cancelOnStart) Shutdown() { m.rec.add("canceler", "Shutdown") }
+func (m *cancelOnStart) Stop()                        { m.rec.add("canceler", "Stop") }
+func (m *cancelOnStart) Shutdown(ctx context.Context) { m.rec.add("canceler", "Shutdown") }
 
 func TestRunFullLifecycle(t *testing.T) {
 	h := newHarness(spec{name: "a"}, spec{name: "b"})
@@ -506,14 +513,6 @@ func modulesOf(specs ...spec) []Module {
 	out := make([]Module, 0, len(specs))
 	for _, s := range specs {
 		out = append(out, &fakeModule{name: s.name, deps: s.deps})
-	}
-	return out
-}
-
-func namesOf(modules []Module) []string {
-	out := make([]string, 0, len(modules))
-	for _, m := range modules {
-		out = append(out, m.Name())
 	}
 	return out
 }

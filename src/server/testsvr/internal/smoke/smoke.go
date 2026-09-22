@@ -1,11 +1,36 @@
 // Package smoke 提供 testsvr 用的假模块：它们不做业务，只用最小的代价把
-// app 的生命周期、依赖排序与并发退出链路在一个真实进程里跑一遍。
+// app 的生命周期、依赖排序、主循环调度与并发退出链路在一个真实进程里跑一遍。
 //
-// 这里是模板：后面真实的 svr 模块照这个形状写——Start 起 goroutine、
-// Stop 发退出信号、Shutdown 等待结束，三件事分开。
+// 这里是三种模块模板，按活的触发方式选：
+//
+//	beat 系（ticker / heartbeat / worker）
+//	    自己起 goroutine、自持 Ticker；Stop 发退出信号、Shutdown 等待结束，
+//	    三件事分开。适合**会阻塞或耗时不可控**的活：网络 accept/recv、DB、
+//	    文件、等锁、sleep、重试。
+//
+//	pulse（实现 app.Updater）
+//	    零 goroutine，活儿交给主循环按固定节拍（默认 100ms）广播，顺序由拓扑序保证。
+//	    适合**短、非阻塞、周期性**的活：超时扫描、统计聚合、批量 flush 的触发。
+//	    需要独立于全局节拍的频率时不要用它 —— 要么留在 beat 里，要么在
+//	    Update 内自己 n%k 分频。
+//
+//	inbox（实现 app.Waker）
+//	    零 goroutine，只在有人 Post 之后才被主循环调到 —— **没事件时完全不占主循环**。
+//	    适合**事件驱动、但需要在主循环上串行处理**的活（想让自身状态免锁就得用它）。
+//	    投递方 Post 进模块自己的队列后叫一次 app.Notify()。
+//
+// 判据两条，依次问：
+//
+//  1. 这一次的活会不会阻塞或耗时不可控？会 → beat。
+//  2. 是周期来还是事件来？周期 → pulse；事件 → inbox。
+//
+// 一次 Update / Wake 卡住会同时拖住其他模块与停服响应 —— 这是协作式调度的固有代价，
+// 所以后两种必须短。主循环有看门狗能发现卡住（默认 30s 一条 Error），但那只是事后
+// 告警，不是保护。
 package smoke
 
 import (
+	"context"
 	"sync"
 	"time"
 
@@ -79,7 +104,25 @@ func (b *beat) Start() error {
 func (b *beat) Stop() { b.stopOnce.Do(func() { close(b.done) }) }
 
 // Shutdown 等待 goroutine 真正退出。
-func (b *beat) Shutdown() { b.wg.Wait() }
+//
+// 用 wg 而不是 exited：exited 只代表那一个 goroutine 跑完了函数体，wg 才代表全部。
+// 单 goroutine 时两者等价，但这是要抄 9 遍的模板，用 wg 更耐抄。
+//
+// ctx 给的是停服预算的剩余时间。预算耗尽时不再等 —— 模块自己的 goroutine 会随
+// 进程退出被带走（框架不会替我们杀它，它只是不再等）。
+func (b *beat) Shutdown(ctx context.Context) {
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		b.wg.Wait()
+	}()
+
+	select {
+	case <-stopped:
+	case <-ctx.Done():
+		b.app.Logger().Warn("module shutdown out of budget", "module", b.name)
+	}
+}
 
 // count 返回已打点次数，供兄弟模块读取。
 func (b *beat) count() int {
