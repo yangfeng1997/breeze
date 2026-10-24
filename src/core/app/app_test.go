@@ -37,16 +37,6 @@ type fakeModule struct {
 	rec      *recorder
 	initErr  error
 	startErr error
-
-	// ctxCanceledAtShutdown 记录 Shutdown 被调用时进程 ctx 是否已经 cancel。
-	// 框架承诺在一切 Shutdown 之前 cancel，否则模块的 Shutdown 等待自有 goroutine
-	// 时会永久阻塞——那个 goroutine 可能正 select 在 App.Context() 上。
-	ctxCanceledAtShutdown bool
-
-	// shutdownCtxErr / shutdownCtxHasDeadline 记录 Shutdown 收到的预算 ctx 的状态。
-	// 它必须与 App.Context() 相反：一个是"还剩多少预算"，一个是"进程正在退出"。
-	shutdownCtxErr         error
-	shutdownCtxHasDeadline bool
 }
 
 func (m *fakeModule) Name() string        { return m.name }
@@ -61,15 +51,6 @@ func (m *fakeModule) Init() error {
 func (m *fakeModule) Start() error {
 	m.rec.add(m.name, "Start")
 	return m.startErr
-}
-
-func (m *fakeModule) Stop() { m.rec.add(m.name, "Stop") }
-
-func (m *fakeModule) Shutdown(ctx context.Context) {
-	m.rec.add(m.name, "Shutdown")
-	m.ctxCanceledAtShutdown = m.app.Context().Err() != nil
-	m.shutdownCtxErr = ctx.Err()
-	_, m.shutdownCtxHasDeadline = ctx.Deadline()
 }
 
 // harness 按 spec 顺序注册假模块，并保留实例供查询。
@@ -134,15 +115,11 @@ func TestLifecycleOrder(t *testing.T) {
 		spec{name: "lobby", deps: []string{"db"}},
 		spec{name: "db"},
 	)
-	a := h.started(t, "test")
-	a.Stop()
-	a.Shutdown()
+	h.started(t, "test")
 
 	assertCalls(t, h.rec.snapshot(), []string{
 		"gate.Init", "db.Init", "lobby.Init",
 		"gate.Start", "db.Start", "lobby.Start",
-		"lobby.Stop", "db.Stop", "gate.Stop",
-		"lobby.Shutdown", "db.Shutdown", "gate.Shutdown",
 	})
 }
 
@@ -182,7 +159,7 @@ func TestFactoryReceivesApp(t *testing.T) {
 	}
 }
 
-func TestInitFailureRollback(t *testing.T) {
+func TestInitFailure(t *testing.T) {
 	errBoom := errors.New("boom")
 	h := newHarness(
 		spec{name: "a"},
@@ -198,16 +175,11 @@ func TestInitFailureRollback(t *testing.T) {
 	if !errors.Is(err, errBoom) {
 		t.Errorf("Init() error = %v, want wraps %v", err, errBoom)
 	}
-	// b 的 Init 已自行清理，框架不碰它；c 从未 Init，也不该被碰。
-	assertCalls(t, h.rec.snapshot(), []string{"a.Init", "b.Init", "a.Shutdown"})
-
-	// 回滚后 App 进终态，后续调用全是 no-op。
-	a.Stop()
-	a.Shutdown()
-	assertCalls(t, h.rec.snapshot(), []string{"a.Init", "b.Init", "a.Shutdown"})
+	// 框架不回滚：报错即返回，已 Init 的 a 不会收到任何通知，c 也从未被碰。
+	assertCalls(t, h.rec.snapshot(), []string{"a.Init", "b.Init"})
 }
 
-func TestStartFailureRollback(t *testing.T) {
+func TestStartFailure(t *testing.T) {
 	errBoom := errors.New("boom")
 	h := newHarness(
 		spec{name: "a"},
@@ -227,28 +199,11 @@ func TestStartFailureRollback(t *testing.T) {
 	if !errors.Is(err, errBoom) {
 		t.Errorf("Start() error = %v, want wraps %v", err, errBoom)
 	}
-	// 逆序回滚，且分两趟走，与正常路径的 Stop→Shutdown 形状一致：
-	//   d 只 Init 过，只 Shutdown；c 的 Start 已自行清理，框架不得再碰；
-	//   b、a 已 Start，先统统收到 Stop 信号，再逆序等待 Shutdown。
-	// 两趟而非逐模块 Stop+Shutdown，是为了让所有模块先并行收到退出信号，
-	// 总耗时取决于最慢的模块，而不是各模块耗时之和。
+	// 框架不回滚：已 Start 的 a、b 不会收到任何通知 —— 它们要么自己盯着
+	// App.Context()，要么随进程退出被带走。d 从未被碰。
 	assertCalls(t, h.rec.snapshot(), []string{
 		"a.Init", "b.Init", "c.Init", "d.Init",
 		"a.Start", "b.Start", "c.Start",
-		"d.Shutdown",
-		"b.Stop", "a.Stop",
-		"b.Shutdown", "a.Shutdown",
-	})
-
-	// 回滚后 App 已是终态，再调 Stop/Shutdown 全是 no-op。
-	a.Stop()
-	a.Shutdown()
-	assertCalls(t, h.rec.snapshot(), []string{
-		"a.Init", "b.Init", "c.Init", "d.Init",
-		"a.Start", "b.Start", "c.Start",
-		"d.Shutdown",
-		"b.Stop", "a.Stop",
-		"b.Shutdown", "a.Shutdown",
 	})
 }
 
@@ -275,9 +230,6 @@ func (m *cancelOnStart) Start() error {
 	return nil
 }
 
-func (m *cancelOnStart) Stop()                        { m.rec.add("canceler", "Stop") }
-func (m *cancelOnStart) Shutdown(ctx context.Context) { m.rec.add("canceler", "Shutdown") }
-
 func TestRunFullLifecycle(t *testing.T) {
 	h := newHarness(spec{name: "a"}, spec{name: "b"})
 	a := h.newApp("test")
@@ -292,11 +244,10 @@ func TestRunFullLifecycle(t *testing.T) {
 		t.Fatalf("Run() error = %v, want nil", err)
 	}
 
+	// Run 只负责启动与等待，不负责任何收尾 —— 所以序列到 Start 为止。
 	assertCalls(t, h.rec.snapshot(), []string{
 		"a.Init", "b.Init", "canceler.Init",
 		"a.Start", "b.Start", "canceler.Start",
-		"canceler.Stop", "b.Stop", "a.Stop",
-		"canceler.Shutdown", "b.Shutdown", "a.Shutdown",
 	})
 }
 
@@ -312,93 +263,6 @@ func TestRunReturnsStartupError(t *testing.T) {
 	if err := a.Run(ctx); !errors.Is(err, boom) {
 		t.Errorf("Run() error = %v, want wraps %v", err, boom)
 	}
-}
-
-// 框架承诺在一切 Shutdown 之前 cancel 进程 ctx。正常路径由 Stop 末尾负责。
-func TestStopCancelsContextBeforeShutdown(t *testing.T) {
-	h := newHarness(spec{name: "a"}, spec{name: "b"})
-	a := h.started(t, "test")
-	a.Stop()
-	a.Shutdown()
-
-	for _, name := range []string{"a", "b"} {
-		if !h.mods[name].ctxCanceledAtShutdown {
-			t.Errorf("%s: Shutdown 被调用时 ctx 还没 cancel，等它的 goroutine 会一直卡住", name)
-		}
-	}
-}
-
-// 回滚路径曾经漏掉 cancel：启动失败后 ctx 到进程结束都不会 done，
-// 而回滚恰恰是会调 Shutdown 的那条路。
-func TestInitRollbackCancelsContext(t *testing.T) {
-	h := newHarness(spec{name: "a"}, spec{name: "b", initErr: errors.New("boom")})
-	a := h.newApp("test")
-	if err := a.Build(); err != nil {
-		t.Fatalf("Build() error = %v, want nil", err)
-	}
-	if err := a.Init(); err == nil {
-		t.Fatal("Init() error = nil, want non-nil")
-	}
-
-	if !h.mods["a"].ctxCanceledAtShutdown {
-		t.Error("Init 回滚：a 的 Shutdown 被调用时 ctx 还没 cancel")
-	}
-}
-
-func TestStartRollbackCancelsContext(t *testing.T) {
-	h := newHarness(spec{name: "a"}, spec{name: "b", startErr: errors.New("boom")})
-	a := h.newApp("test")
-	if err := a.Build(); err != nil {
-		t.Fatalf("Build() error = %v, want nil", err)
-	}
-	if err := a.Init(); err != nil {
-		t.Fatalf("Init() error = %v, want nil", err)
-	}
-	if err := a.Start(); err == nil {
-		t.Fatal("Start() error = nil, want non-nil")
-	}
-
-	if !h.mods["a"].ctxCanceledAtShutdown {
-		t.Error("Start 回滚：a 的 Shutdown 被调用时 ctx 还没 cancel")
-	}
-}
-
-func TestStopAndShutdownIdempotent(t *testing.T) {
-	h := newHarness(spec{name: "a"}, spec{name: "b"})
-	a := h.started(t, "test")
-
-	a.Stop()
-	a.Stop()
-	a.Shutdown()
-	a.Shutdown()
-
-	// 每个模块的每个阶段只能被调一次。
-	assertCalls(t, h.rec.snapshot(), []string{
-		"a.Init", "b.Init",
-		"a.Start", "b.Start",
-		"b.Stop", "a.Stop",
-		"b.Shutdown", "a.Shutdown",
-	})
-}
-
-func TestStopBeforeStart(t *testing.T) {
-	h := newHarness(spec{name: "a"}, spec{name: "b"})
-	a := h.newApp("test")
-	if err := a.Build(); err != nil {
-		t.Fatalf("Build() error = %v, want nil", err)
-	}
-	if err := a.Init(); err != nil {
-		t.Fatalf("Init() error = %v, want nil", err)
-	}
-
-	// 没有任何模块 Start 过，Stop 不需要发信号；Shutdown 仍要释放 Init 期资源。
-	a.Stop()
-	a.Shutdown()
-
-	assertCalls(t, h.rec.snapshot(), []string{
-		"a.Init", "b.Init",
-		"b.Shutdown", "a.Shutdown",
-	})
 }
 
 func TestPhaseErrors(t *testing.T) {

@@ -1,7 +1,6 @@
 package smoke
 
 import (
-	"context"
 	"sync"
 
 	"project/src/core/app"
@@ -13,7 +12,7 @@ const (
 	inboxQueueSize = 256
 
 	// inboxBudgetCap 是本模块给自己定的单轮上限。框架不给上限（见 app.Waker 的契约），
-	// 所以这个值就是全部的节奏控制 —— 取小了留给别人和停服信号响应时间，
+	// 所以这个值就是全部的节奏控制 —— 取小了留给别人和 ctx 取消的响应时间，
 	// 取大了吞吐高但拖长这一轮。
 	inboxBudgetCap = 8
 )
@@ -23,7 +22,7 @@ const (
 // 与另外两种对照：
 //
 //	beat   自持 goroutine + Ticker，活的会阻塞时用它
-//	pulse  实现 app.Updater，被周期广播，短的非阻塞周期活用它
+//	pulse  实现 app.Tickable，被周期广播，短的非阻塞周期活用它
 //	inbox  实现 app.Waker，只在有人 Post 之后才被调 —— 没事件时完全不占主循环
 type inbox struct {
 	app *app.App
@@ -47,8 +46,6 @@ func (m *inbox) App() *app.App                { return m.app }
 func (m *inbox) DependsOn() []string          { return nil }
 func (m *inbox) Init() error                  { return nil }
 func (m *inbox) Start() error                 { return nil }
-func (m *inbox) Stop()                        {}
-func (m *inbox) Shutdown(ctx context.Context) {}
 
 // Post 可在任意 goroutine 调用：入队后叫醒主循环。
 // 队列满时会阻塞在这里 —— 背压回压给投递方，通常是网络读协程。

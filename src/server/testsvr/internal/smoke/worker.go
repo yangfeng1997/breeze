@@ -34,7 +34,7 @@ func (w *worker) DependsOn() []string { return []string{"ticker"} }
 // Init 按名取兄弟模块。
 //
 // 模块之间不互相 import，只通过 App 拿——这是真实模块之间唯一的协作方式。
-// 若取不到或类型不符就返回错误，框架会回滚且永不 Start 本模块。
+// 若取不到或类型不符就返回错误，框架就此终止启动，永不会 Start 本模块。
 func (w *worker) Init() error {
 	m := w.app.GetModule("ticker")
 	if m == nil {

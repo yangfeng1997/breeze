@@ -22,6 +22,16 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	}
 }
 
+// isClosed 非阻塞地判断 ch 是否已关闭。
+func isClosed(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
 // testApp 造一个 App 并注册两个快周期模块。
 //
 // 走的是生产那条构造路径（newTicker / newWorker），只是周期不同——
@@ -36,26 +46,29 @@ func testApp(t *testing.T) (*app.App, *ticker, *worker) {
 	return a, tk, wk
 }
 
-func start(t *testing.T, a *app.App) {
-	t.Helper()
-	if err := a.Build(); err != nil {
-		t.Fatalf("Build() error = %v, want nil", err)
-	}
-	if err := a.Init(); err != nil {
-		t.Fatalf("Init() error = %v, want nil", err)
-	}
-	if err := a.Start(); err != nil {
-		t.Fatalf("Start() error = %v, want nil", err)
-	}
+// run 在后台跑 Run，返回取消函数与 Run 的返回通道。
+//
+// 模块唯一的退出路径是 App.Context()，而它只在 Run 返回时才 cancel ——
+// 所以测试必须走 Run，不能自己调 Build/Init/Start：那样 ctx 永远不会取消，
+// 模块的 goroutine 也就永远不停。
+func run(a *app.App) (context.CancelFunc, <-chan error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+	return cancel, done
 }
 
-// assertClosed 非阻塞地断言 ch 已关闭。
-func assertClosed(t *testing.T, name string, ch <-chan struct{}) {
+// stop 取消 ctx 并等 Run 返回。
+func stop(t *testing.T, cancel context.CancelFunc, done <-chan error) {
 	t.Helper()
+	cancel()
 	select {
-	case <-ch:
-	default:
-		t.Fatalf("Shutdown 返回后 %s 的 goroutine 仍在运行", name)
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run() error = %v, want nil", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ctx 取消后 Run 没有返回")
 	}
 }
 
@@ -67,31 +80,33 @@ func assertClosed(t *testing.T, name string, ch <-chan struct{}) {
 // 端到端所见则是 testsvr 启动日志里的 module inited 顺序。
 func TestWorkerReadsTicker(t *testing.T) {
 	a, tk, wk := testApp(t)
-	start(t, a)
-	defer func() { a.Stop(); a.Shutdown() }()
+	cancel, done := run(a)
 
 	waitFor(t, "ticker 打点", func() bool { return tk.count() > 0 })
 	waitFor(t, "worker 打点", func() bool { return wk.count() > 0 })
+
+	stop(t, cancel, done)
 }
 
-// TestShutdownStopsGoroutines 钉住退出契约：Shutdown 返回时 goroutine 确已退出。
+// TestCtxCancelStopsGoroutines 钉住 beat 模板的退出契约：
+// ctx 取消之后，模块自己的 goroutine 确实会退出。
 //
-// Shutdown 只 close(done) 而不 wg.Wait() 就是 goroutine 泄漏——进程退出时可能
-// 看不出问题，但真实模块会丢数据、丢连接。这是模板里最容易抄错的一处。
-func TestShutdownStopsGoroutines(t *testing.T) {
+// 这里没有 Shutdown 那样的"等模块结束"阶段可依赖，只能轮询 —— 但也正因为如此，
+// 模块**必须自己盯着 App.Context()**：没有任何人会来叫停它。这是模板里最容易抄错的
+// 一处：起了 goroutine 却不看 ctx，进程退出前它一直在跑，真实模块会丢数据、丢连接。
+func TestCtxCancelStopsGoroutines(t *testing.T) {
 	a, tk, wk := testApp(t)
-	start(t, a)
+	cancel, done := run(a)
 
 	// 先确认两个 goroutine 都真在跑，再断言它们停了：
 	// 否则 goroutine 根本没起来，用例也会通过，等于没测。
 	waitFor(t, "ticker 打点", func() bool { return tk.count() > 0 })
 	waitFor(t, "worker 打点", func() bool { return wk.count() > 0 })
 
-	a.Stop()
-	a.Shutdown()
+	stop(t, cancel, done)
 
-	assertClosed(t, "ticker", tk.exited)
-	assertClosed(t, "worker", wk.exited)
+	waitFor(t, "ticker goroutine 退出", func() bool { return isClosed(tk.exited) })
+	waitFor(t, "worker goroutine 退出", func() bool { return isClosed(wk.exited) })
 }
 
 // TestInboxWakeDrivenByNotify 验证第三种模板：事件驱动的模块。
@@ -103,11 +118,7 @@ func TestInboxWakeDrivenByNotify(t *testing.T) {
 	ib := newInbox(a)
 	a.RegisterModule(func(*app.App) app.Module { return ib })
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	done := make(chan error, 1)
-	go func() { done <- a.Run(ctx) }()
+	cancel, done := run(a)
 
 	total := inboxBudgetCap*3 + 1
 	for i := 0; i < total; i++ {
@@ -116,42 +127,22 @@ func TestInboxWakeDrivenByNotify(t *testing.T) {
 
 	waitFor(t, "inbox 排空", func() bool { return ib.count() == total })
 
-	cancel()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("Run() error = %v, want nil", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("ctx 取消后 Run 没有返回")
-	}
+	stop(t, cancel, done)
 }
 
-// TestPulseUpdatesDrivenByLoop 验证第二种模板：中心化周期更新驱动的模块
+// TestPulseTicksDrivenByLoop 验证第二种模板：中心化周期 tick 驱动的模块
 // （零 goroutine）确实被主循环广播到了，且 Run 收得到 ctx 取消。
 //
 // 与上面两个用例的区别：pulse 没有 exited 可断言 —— 它压根没有 goroutine。
-// "停得干净"对它来说是平凡的，因为没有任何东西在后台跑。
-func TestPulseUpdatesDrivenByLoop(t *testing.T) {
-	a := app.New("smoke-test", app.WithUpdateInterval(time.Millisecond))
+// 对它来说"停得干净"是平凡的，因为没有任何东西在后台跑。
+func TestPulseTicksDrivenByLoop(t *testing.T) {
+	a := app.New("smoke-test", app.WithTickInterval(time.Millisecond))
 	p := newPulse(a)
 	a.RegisterModule(func(*app.App) app.Module { return p })
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	cancel, done := run(a)
 
-	done := make(chan error, 1)
-	go func() { done <- a.Run(ctx) }()
+	waitFor(t, "pulse tick", func() bool { return p.count() > 0 })
 
-	waitFor(t, "pulse 更新", func() bool { return p.count() > 0 })
-	cancel()
-
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("Run() error = %v, want nil", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("ctx 取消后 Run 没有返回")
-	}
+	stop(t, cancel, done)
 }

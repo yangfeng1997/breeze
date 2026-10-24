@@ -31,10 +31,6 @@ var (
 
 	// ErrNilModule 表示工厂返回了 nil 模块。
 	ErrNilModule = errors.New("nil module")
-
-	// ErrShutdownTimeout 表示停服阶段有模块超出预算被放弃，进程没能干净退出。
-	// 看门狗只是"不再等"，它不会杀 goroutine —— 被放弃模块仍在跑，随进程退出被带走。
-	ErrShutdownTimeout = errors.New("shutdown timed out")
 )
 
 // wrapApp 给错误加上进程名前缀，保留 %w 链供 errors.Is 判定。
