@@ -1,0 +1,31 @@
+---
+Language: Cpp
+BasedOnStyle: Google
+AccessModifierOffset: -4
+# AlignConsecutiveAssignments: true
+# AlignConsecutiveDeclarations: true
+AlignTrailingComments: true
+AlignEscapedNewlines: Right
+AllowShortBlocksOnASingleLine: false
+AllowShortFunctionsOnASingleLine: true
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+BinPackArguments: false
+BinPackParameters: false
+# BreakBeforeBinaryOperators: NonAssignment
+BreakBeforeBraces: Allman
+ColumnLimit: 120
+# 所有参数显示在一行
+# ConstructorInitializerAllOnOneLineOrOnePerLine: true
+PackConstructorInitializers: Never
+DerivePointerAlignment: false
+IndentCaseLabels: true
+IndentWidth: 4
+MacroBlockBegin: "DEFINE_FORMATTER_BEGIN|DynAreaSearchBegin"
+MacroBlockEnd: "DEFINE_FORMATTER_END|DynAreaSearchEnd"
+SpacesBeforeTrailingComments: 1
+Standard: Cpp11
+TabWidth: 4
+UseTab: Never
+BreakConstructorInitializers: BeforeComma
+---

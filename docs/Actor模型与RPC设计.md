@@ -38,10 +38,10 @@
 
 | 约束 | 出处 | 对 RPC 的影响 |
 |---|---|---|
-| 主循环单线程，`Update`/`Wake`/`Reload` 与 `Stop`/`Shutdown` 不重叠 | `src/core/app` | pending 表可以是纯单线程结构，**不需要锁** |
-| Build 之后模块集合冻结，`RegisterModule` 在 Build 后 panic | `src/core/app/app.go` | **actor 是运行期动态的，绝不能进 `modulesArr`**，必须由宿主 Module 记账 |
-| 框架不做任何运行时兜底（无上限、无告警） | `src/core/app/CLAUDE.md` | 上界/告警是模块契约的一部分，不是框架责任 |
-| 模块集合的差异靠 `DependsOn` 拓扑排序表达 | `src/core/app/app.go` | 拓扑序只用于**启动**；actor 之间的依赖是运行期消息，不进拓扑 |
+| 主循环单线程，`Update`/`Wake`/`Reload` 与 `Stop`/`Shutdown` 不重叠 | `src/go/core/app` | pending 表可以是纯单线程结构，**不需要锁** |
+| Build 之后模块集合冻结，`RegisterModule` 在 Build 后 panic | `src/go/core/app/app.go` | **actor 是运行期动态的，绝不能进 `modulesArr`**，必须由宿主 Module 记账 |
+| 框架不做任何运行时兜底（无上限、无告警） | `src/go/core/app/CLAUDE.md` | 上界/告警是模块契约的一部分，不是框架责任 |
+| 模块集合的差异靠 `DependsOn` 拓扑排序表达 | `src/go/core/app/app.go` | 拓扑序只用于**启动**；actor 之间的依赖是运行期消息，不进拓扑 |
 
 ### 1.2 参考实现的核心教训（本文多处引用）
 

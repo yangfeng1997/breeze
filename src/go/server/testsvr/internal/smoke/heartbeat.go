@@ -3,7 +3,7 @@ package smoke
 import (
 	"time"
 
-	"project/src/core/app"
+	"project/core/app"
 )
 
 // heartbeat 无依赖，周期与 ticker 错开，便于在日志里分辨两者。

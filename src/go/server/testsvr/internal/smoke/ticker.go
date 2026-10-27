@@ -3,7 +3,7 @@ package smoke
 import (
 	"time"
 
-	"project/src/core/app"
+	"project/core/app"
 )
 
 // ticker 无依赖，只做定时打点，并把自己的计数留给兄弟模块读。

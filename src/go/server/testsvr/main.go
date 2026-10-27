@@ -1,5 +1,5 @@
 // testsvr 是 app 进程骨架的第一个消费者，本身不做业务：它把生命周期、
-// 依赖排序与主循环调度在一个真实进程里跑一遍，并充当 src/server 下
+// 依赖排序与主循环调度在一个真实进程里跑一遍，并充当 src/go/server 下
 // 其余 svr 的装配模板——main 只负责装配，模块实现在 internal/ 里。
 package main
 
@@ -8,8 +8,8 @@ import (
 	"log/slog"
 	"os"
 
-	"project/src/core/app"
-	"project/src/server/testsvr/internal/smoke"
+	"project/core/app"
+	"project/server/testsvr/internal/smoke"
 )
 
 func main() {

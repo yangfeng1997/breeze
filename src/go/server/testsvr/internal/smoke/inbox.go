@@ -3,7 +3,7 @@ package smoke
 import (
 	"sync"
 
-	"project/src/core/app"
+	"project/core/app"
 )
 
 const (

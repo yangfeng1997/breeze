@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"project/src/core/app"
+	"project/core/app"
 )
 
 // waitFor 轮询直到 cond 为真，超时即失败。

@@ -32,7 +32,7 @@ import (
 	"sync"
 	"time"
 
-	"project/src/core/app"
+	"project/core/app"
 )
 
 // beat 是三个假模块共用的骨架：定时打点。

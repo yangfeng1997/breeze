@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-本文件是 `src/core/app/` 的局部索引。改进程骨架、模块接口或生命周期顺序前，先读本文件。
+本文件是 `src/go/core/app/` 的局部索引。改进程骨架、模块接口或生命周期顺序前，先读本文件。
 
 ## 上级入口
 
@@ -9,7 +9,7 @@
 
 ## 目录定位
 
-- Go package：`app`，import 路径 `project/src/core/app`。
+- Go package：`app`，import 路径 `project/core/app`。
 - 进程骨架：模块注册 → 依赖拓扑排序 → 启动编排（Init → Start）→ **主循环**。
 - **只管启动，不管停机**。没有 `Stop` / `Shutdown`，没有超时预算，没有信号处理，
   也不 import `os/signal`。`Run` 阻塞在调用方给的 ctx 上，ctx 结束就返回；

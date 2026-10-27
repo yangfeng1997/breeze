@@ -3,6 +3,9 @@
 /tools/protoc-gen-svcstub/protoc-gen-svcstub
 /tools/protoc-gen-svcstub/protoc-gen-svcstub.exe
 
-# 构建 / 运行输出目录（见 scrpits/setup_windows_env.ps1 的 build.py 用法）
+# 生成代码（src/go/gen、src/cpp/gen）
+/src/*/gen/
+
+# 构建 / 运行输出目录（见 scripts/setup_windows_env.ps1 的 build.py 用法）
 /run/
 /build/

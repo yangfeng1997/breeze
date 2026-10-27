@@ -4,7 +4,7 @@ import (
 	"sync"
 	"time"
 
-	"project/src/core/app"
+	"project/core/app"
 )
 
 // pulse 演示第二种模块模板：中心化周期 tick 驱动，零 goroutine。

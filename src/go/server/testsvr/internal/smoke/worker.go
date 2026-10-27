@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"project/src/core/app"
+	"project/core/app"
 )
 
 // worker 依赖 ticker，用来验证"依赖声明 → 拓扑序 → 按名取到兄弟模块"整条链路。
