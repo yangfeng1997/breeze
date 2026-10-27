@@ -99,12 +99,37 @@ private:
     }
 
     // 先建临时软链再 rename 覆盖：tail -F 之类的读者看不到"软链不存在"的空窗。
+    //
+    // <name>.log 已存在时按类型处理：
+    //   软链（有效或悬空） 直接被覆盖。
+    //   普通文件           旧版本遗留的同名日志：改名 .old 保留。rename 会直接覆盖它，等于悄悄删掉。
+    //   目录               没法替换，只告警，小时文件照写，没有软链。
     void UpdateSymlink(const std::string& file)
     {
         const auto link = dir_ / (name_ + ".log");
         auto tmp = link;
         tmp += ".tmp";
         std::error_code ec;
+
+        const auto type = std::filesystem::symlink_status(link, ec).type(); // 不依赖 ec：不存在时各实现不一
+        if (type == std::filesystem::file_type::directory)
+        {
+            std::fprintf(stderr, "[logger] %s 是目录，无法建软链，小时文件照常写入\n", link.string().c_str());
+            return;
+        }
+        if (type != std::filesystem::file_type::not_found && type != std::filesystem::file_type::symlink)
+        {
+            const auto old = link.string() + ".old";
+            std::filesystem::remove(old, ec);
+            std::filesystem::rename(link, old, ec);
+            if (ec)
+            {
+                std::fprintf(stderr, "[logger] 旧日志 %s 改名失败: %s\n", link.string().c_str(), ec.message().c_str());
+                return;
+            }
+            std::fprintf(stderr, "[logger] %s 原是普通文件，已改名为 %s\n", link.string().c_str(), old.c_str());
+        }
+
         std::filesystem::remove(tmp, ec);
         std::filesystem::create_symlink(file, tmp, ec); // 相对目标：整个目录搬走软链仍有效
         if (!ec)

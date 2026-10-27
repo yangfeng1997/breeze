@@ -70,7 +70,7 @@ public:
     std::string_view Name() const override { return "probe"; }
     Result<> Init() override
     {
-        *ready_ = g_logger.load() != nullptr;
+        *ready_ = g_default_logger.load() != nullptr;
         LOG_INFO("probe-init");
         return {};
     }
@@ -100,10 +100,10 @@ void TestRegisteredFirstInitsFirst()
         app.RegisterModule(MakeLog(Cfg(dir, "svc")));
         app.RegisterModule(MakeProbe(&ready));
         CHECK(app.Build());
-        CHECK(!g_logger.load()); // Build 之后、Init 之前还没有
+        CHECK(!g_default_logger.load()); // Build 之后、Init 之前还没有
         CHECK(app.Init());
         CHECK(app.Start());
-        CHECK(g_logger.load());
+        CHECK(g_default_logger.load());
         LOG_INFO("while-running {}", 1);
     }
     CHECK(ready);
@@ -113,7 +113,7 @@ void TestRegisteredFirstInitsFirst()
     CHECK(Has(text, "probe-init"));
     CHECK(Has(text, "while-running 1"));
 
-    CHECK(!g_logger.load());         // ~App 之后已撤销
+    CHECK(!g_default_logger.load()); // ~App 之后已撤销
     LOG_INFO("after-app-destroyed"); // 回落 stderr，不崩溃
     fs::remove_all(dir);
 }
@@ -146,7 +146,7 @@ void TestInitFailureLeavesNoDefault()
     auto r = app.Init();
     CHECK(!r);
     CHECK(r.error().code == Errc::Module);
-    CHECK(!g_logger.load());
+    CHECK(!g_default_logger.load());
     fs::remove_all(dir);
 }
 
@@ -160,21 +160,21 @@ void TestDestroyOlderAppKeepsNewerLogger()
     app1->RegisterModule(MakeLog(Cfg(dir1, "one")));
     CHECK(app1->Build());
     CHECK(app1->Init());
-    Logger* l1 = g_logger.load();
+    Logger* l1 = g_default_logger.load();
 
     auto app2 = std::make_unique<App>("a2", Options{});
     app2->RegisterModule(MakeLog(Cfg(dir2, "two")));
     CHECK(app2->Build());
     CHECK(app2->Init());
-    Logger* l2 = g_logger.load();
+    Logger* l2 = g_default_logger.load();
     CHECK(l1 && l2 && l1 != l2);
 
     app1.reset();
-    CHECK(g_logger.load() == l2); // 没被 app1 的析构撤掉
+    CHECK(g_default_logger.load() == l2); // 没被 app1 的析构撤掉
     LOG_INFO("still-two");
 
     app2.reset();
-    CHECK(!g_logger.load());
+    CHECK(!g_default_logger.load());
     CHECK(Has(ReadAll(dir2 / "two.log"), "still-two"));
     fs::remove_all(dir1);
     fs::remove_all(dir2);

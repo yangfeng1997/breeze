@@ -1,8 +1,8 @@
 // 日志：spdlog 的薄封装。
 //
-// 默认 logger 是进程级的 g_logger，由 LogModule::Init 登记、析构时撤销；日志宏（LOG_INFO 等）
+// 默认 logger 是进程级的 g_default_logger，由 LogModule::Init 登记、析构时撤销；日志宏（LOG_INFO 等）
 // 每次调用时读它，为空则落到 Logger::Stderr()，所以任何阶段（Build、Init 之前、~App 之后）
-// 打日志都不会崩，也不会丢。要绕过默认 logger 用 LOG_*_TO(logger, ...)。
+// 打日志都不会崩，也不会丢。要指定别的 logger 用 BREEZE_LOG_<LEVEL>(logger, ...)。
 //
 // spdlog 只出现在 .cpp 与 internal/，本头不含它。日志宏见 logger_macros.h。
 //
@@ -18,6 +18,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <source_location>
 #include <string>
 #include <string_view>
@@ -35,6 +36,15 @@ enum class Level : std::uint8_t
     Fatal,
     Off, // 只用于 SetLevel，表示全部关闭（Fatal 宏除外，见 Logger::Fatal）
 };
+
+// 按构建类型的默认运行时级别：Release（NDEBUG）Info，其余 Debug。
+// 定义在 logger.cpp 里：由库按自己的构建类型决定，不随使用方翻译单元的宏而变。
+Level DefaultLevel();
+
+// 小写名字：trace debug info warn error fatal off。供配置文件、管理命令把字符串转成级别。
+std::string_view ToString(Level level);
+// 大小写不敏感，另接受 warning；认不出返回 nullopt。
+std::optional<Level> ParseLevel(std::string_view name);
 
 // 异步队列满时的取舍。spdlog 无法按级别区分，DropOldest 可能恰好丢掉要看的 ERROR；
 // Block 则会在磁盘变慢时拖住调用线程（包括主循环）。
@@ -60,13 +70,19 @@ struct LoggerConfig
     // 可含点号表示类别，如 gatesvr / gatesvr.res / gatesvr.tracing：旧文件清理只认
     // <name>.<YYYY-MM-DD_HH>.log，不会碰同前缀的其它 logger（见 logger_test 的 TestDottedNames…）。
     std::string name = "app";
-    Level level = Level::Info;
+    Level level = DefaultLevel();
 
     // false 时在调用线程里同步写，queueSize / threads / overflow 无效。
     bool async = true;
     std::uint32_t queueSize = 16384;
     std::uint32_t threads = 1;
     Overflow overflow = Overflow::Block;
+
+    // 写完 >= 此级别的日志后立即刷盘（异步时投递刷盘请求）。Off 表示不按级别刷。
+    Level flushLevel = Level::Warn;
+    // 周期刷盘间隔（秒），0 关闭。否则低流量时 INFO 会一直留在缓冲里，进程崩溃后看不到。
+    // 每个开启的 logger 多一个线程（名字 logf:<name>）。
+    std::uint32_t flushIntervalSec = 1;
 
     // 仅 File。每次滚动时删除早于此小时数的文件，0 不清理。只认 <name>.<YYYY-MM-DD_HH>.log，不动其它文件。
     std::uint32_t retainHours = 168;
@@ -97,11 +113,21 @@ public:
     // 级别不够直接返回。msg 已格式化完毕，不再解释 `{}`。
     void Log(Level level, std::source_location loc, std::string_view msg);
 
+    // 位置由调用方给：转接第三方库日志（它们自带 file/line）时用，std::source_location 没法手工构造。
+    // file / func 必须是 NUL 结尾且在调用期间有效。
+    void Log(Level level, const char* file, int line, const char* func, std::string_view msg);
+
     // 写入、排空队列、abort。不受 level 过滤影响，Fatal 一定出得去。
     [[noreturn]] void Fatal(std::source_location loc, std::string_view msg);
 
+    // 运行时可调，立即对所有线程生效。注意编译期剥离在前：Release 下 TRACE 宏已不存在，
+    // 运行时设成 Trace 也出不来 TRACE（见 logger_macros.h 的 BREEZE_LOG_ACTIVE_LEVEL）。
     void SetLevel(Level level) noexcept { level_.store(static_cast<std::uint8_t>(level), std::memory_order_relaxed); }
     Level GetLevel() const noexcept { return static_cast<Level>(level_.load(std::memory_order_relaxed)); }
+
+    // 运行时可调：写完 >= level 的日志立即刷盘。
+    void SetFlushLevel(Level level);
+    Level GetFlushLevel() const;
 
     // 异步时只是投递刷盘请求，不等落盘；要保证落盘用 Shutdown、析构或 Fatal。关闭后是空操作。
     void Flush();
@@ -124,17 +150,21 @@ private:
 
 // 默认 logger。**只许 LogModule 写**：Init 登记，析构时用 compare_exchange 撤销（只撤销自己的）。
 // 用原子是因为框架不强制"Init 先于任何线程"，违反时不该是静默的未定义行为；x86 上读取无额外开销。
-inline std::atomic<Logger*> g_logger{nullptr};
+inline std::atomic<Logger*> g_default_logger{nullptr};
 
 inline Logger& CurrentLogger()
 {
-    Logger* l = g_logger.load(std::memory_order_acquire);
+    Logger* l = g_default_logger.load(std::memory_order_acquire);
     return l ? *l : Logger::Stderr();
 }
 
+// 改 / 读默认 logger 的运行时级别。没有默认 logger 时作用在 stderr 兜底实例上。
+inline void SetLogLevel(Level level) noexcept { CurrentLogger().SetLevel(level); }
+inline Level GetLogLevel() noexcept { return CurrentLogger().GetLevel(); }
+
 namespace detail
 {
-// 让 LOG_*_TO 同时接受对象、裸指针与智能指针。
+// 让 BREEZE_LOG_<LEVEL> 同时接受对象、裸指针与智能指针。
 inline Logger& Ref(Logger& l) { return l; }
 inline Logger& Ref(Logger* l) { return *l; }
 inline Logger& Ref(const std::unique_ptr<Logger>& l) { return *l; }

@@ -8,6 +8,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -15,8 +16,10 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <set>
 #include <sstream>
 #include <string>
+#include <thread>
 
 #include "hourly_file_sink.h"
 #include "logger_macros.h"
@@ -187,8 +190,62 @@ LoggerConfig Cfg(const fs::path& dir, bool async)
     LoggerConfig c;
     c.dir = dir.string();
     c.name = "svc";
+    c.level = Level::Info; // 显式：默认值随构建类型变，用例断言的是 Info 下的行为
     c.async = async;
     return c;
+}
+
+void TestDefaultLevelFollowsBuildType()
+{
+#ifdef NDEBUG
+    CHECK(DefaultLevel() == Level::Info);
+#else
+    CHECK(DefaultLevel() == Level::Debug);
+#endif
+    CHECK(LoggerConfig{}.level == DefaultLevel());
+}
+
+void TestLevelNamesRoundTrip()
+{
+    for (const Level l : {Level::Trace, Level::Debug, Level::Info, Level::Warn, Level::Error, Level::Fatal, Level::Off})
+    {
+        const auto parsed = ParseLevel(ToString(l));
+        CHECK(parsed && *parsed == l);
+    }
+    CHECK(*ParseLevel("INFO") == Level::Info);
+    CHECK(*ParseLevel("Warning") == Level::Warn);
+    CHECK(*ParseLevel("DeBuG") == Level::Debug);
+    CHECK(!ParseLevel(""));
+    CHECK(!ParseLevel("verbose"));
+    CHECK(!ParseLevel("info "));
+}
+
+// 默认 logger 的 SetLogLevel / GetLogLevel：运行时随时改，立即生效。
+void TestSetLogLevelOnDefaultLogger()
+{
+    const auto dir = TempDir("setlevel");
+    std::string err;
+    auto lg = Logger::Create(Cfg(dir, false), err); // Info
+    CHECK(lg);
+    g_default_logger.store(lg.get());
+
+    CHECK(GetLogLevel() == Level::Info);
+    LOG_DEBUG("dbg-before");
+    SetLogLevel(Level::Debug);
+    CHECK(GetLogLevel() == Level::Debug);
+    LOG_DEBUG("dbg-after");
+    SetLogLevel(Level::Error);
+    LOG_WARN("warn-hidden");
+    LOG_ERROR("err-shown");
+    lg->Flush();
+    g_default_logger.store(nullptr);
+
+    const auto text = ReadAll(dir / "svc.log");
+    CHECK(!Has(text, "dbg-before"));
+    CHECK(Has(text, "dbg-after"));
+    CHECK(!Has(text, "warn-hidden"));
+    CHECK(Has(text, "err-shown"));
+    fs::remove_all(dir);
 }
 
 void TestLevelFilterAndRuntimeSetLevel()
@@ -198,10 +255,10 @@ void TestLevelFilterAndRuntimeSetLevel()
     auto lg = Logger::Create(Cfg(dir, false), err);
     CHECK(lg);
 
-    LOG_DEBUG_TO(lg, "hidden-{}", 1);
-    LOG_INFO_TO(lg, "shown x={}", 42);
+    BREEZE_LOG_DEBUG(lg, "hidden-{}", 1);
+    BREEZE_LOG_INFO(lg, "shown x={}", 42);
     lg->SetLevel(Level::Debug);
-    LOG_DEBUG_TO(lg, "now-visible-{}", 2);
+    BREEZE_LOG_DEBUG(lg, "now-visible-{}", 2);
     lg->Flush();
 
     const auto text = ReadAll(dir / "svc.log");
@@ -225,9 +282,9 @@ void TestArgsNotEvaluatedWhenFiltered()
         ++calls;
         return 1;
     };
-    LOG_DEBUG_TO(lg, "{}", expensive());
+    BREEZE_LOG_DEBUG(lg, "{}", expensive());
     CHECK(calls == 0);
-    LOG_INFO_TO(lg, "{}", expensive());
+    BREEZE_LOG_INFO(lg, "{}", expensive());
     CHECK(calls == 1);
     fs::remove_all(dir);
 }
@@ -240,7 +297,7 @@ void TestAsyncDrainsOnDestroy()
         auto lg = Logger::Create(Cfg(dir, true), err);
         CHECK(lg);
         for (int i = 0; i < 1000; ++i)
-            LOG_INFO_TO(lg, "line-{}", i);
+            BREEZE_LOG_INFO(lg, "line-{}", i);
     }
     const auto text = ReadAll(dir / "svc.log");
     CHECK(Has(text, "line-0"));
@@ -321,8 +378,8 @@ void TestStdoutModeWritesNoFiles()
         std::string err;
         auto lg = Logger::Create(StdoutCfg(dir, false), err);
         CHECK(lg);
-        LOG_DEBUG_TO(lg, "hidden-{}", 1);
-        LOG_INFO_TO(lg, "hello-stdout {}", 1);
+        BREEZE_LOG_DEBUG(lg, "hidden-{}", 1);
+        BREEZE_LOG_INFO(lg, "hello-stdout {}", 1);
         lg->Flush();
     }
     const auto text = ReadAll(dir / "out.txt");
@@ -344,7 +401,7 @@ void TestStdoutAsyncDrainsOnDestroy()
         auto lg = Logger::Create(StdoutCfg(dir, true), err);
         CHECK(lg);
         for (int i = 0; i < 500; ++i)
-            LOG_INFO_TO(lg, "line-{}", i);
+            BREEZE_LOG_INFO(lg, "line-{}", i);
     }
     const auto text = ReadAll(dir / "out.txt");
     CHECK(Has(text, "line-0"));
@@ -366,16 +423,53 @@ void TestStdoutModeIgnoresUnwritableDir()
         c.dir = (dir / "file" / "sub").string();
         auto lg = Logger::Create(c, err);
         CHECK(lg);
-        LOG_INFO_TO(lg, "still-works");
+        BREEZE_LOG_INFO(lg, "still-works");
         lg->Flush();
     }
     CHECK(Has(ReadAll(dir / "out.txt"), "still-works"));
     fs::remove_all(dir);
 }
 
+// 业务层给自己的 logger 配一族宏：套内层 BREEZE_LOG_<LEVEL>，写到自己的文件，默认 logger 不受影响。
+Logger* g_extra = nullptr;
+#define EXTRA_LOG_INFO(...) BREEZE_LOG_INFO(g_extra, __VA_ARGS__)
+#define EXTRA_LOG_DEBUG(...) BREEZE_LOG_DEBUG(g_extra, __VA_ARGS__)
+
+void TestBusinessMacroFamilyOnTopOfInnerMacros()
+{
+    const auto dir = TempDir("extra");
+    std::string err;
+    auto mainLg = Logger::Create(Cfg(dir, false), err); // svc.log，Info
+    CHECK(mainLg);
+    auto cfg = Cfg(dir, false);
+    cfg.name = "svc.res";
+    auto extraLg = Logger::Create(cfg, err);
+    CHECK(extraLg);
+
+    g_default_logger.store(mainLg.get());
+    g_extra = extraLg.get();
+
+    LOG_INFO("to-default {}", 1);
+    EXTRA_LOG_INFO("to-extra {}", 2);
+    EXTRA_LOG_DEBUG("extra-hidden"); // extra 也是 Info：级别各自独立
+    mainLg->Flush();
+    extraLg->Flush();
+    g_default_logger.store(nullptr);
+    g_extra = nullptr;
+
+    const auto mainText = ReadAll(dir / "svc.log");
+    const auto extraText = ReadAll(dir / "svc.res.log");
+    CHECK(Has(mainText, "to-default 1"));
+    CHECK(!Has(mainText, "to-extra"));
+    CHECK(Has(extraText, "to-extra 2"));
+    CHECK(!Has(extraText, "to-default"));
+    CHECK(!Has(extraText, "extra-hidden"));
+    fs::remove_all(dir);
+}
+
 void TestFallbackToStderrWhenNoDefault()
 {
-    CHECK(g_logger.load() == nullptr);
+    CHECK(g_default_logger.load() == nullptr);
     CHECK(&Logger::Stderr() == &Logger::Stderr());
 
     const auto dir = TempDir("fallback");
@@ -400,10 +494,10 @@ void TestDefaultLoggerUsedByMacro()
     auto lg = Logger::Create(Cfg(dir, false), err);
     CHECK(lg);
 
-    g_logger.store(lg.get());
+    g_default_logger.store(lg.get());
     LOG_INFO("via-default {}", 1);
     lg->Flush();
-    g_logger.store(nullptr);
+    g_default_logger.store(nullptr);
 
     CHECK(Has(ReadAll(dir / "svc.log"), "via-default 1"));
     LOG_INFO("after-reset"); // 撤销后回落到 stderr，不崩溃
@@ -444,16 +538,16 @@ void TestShutdownDrainsAndRoutesLateLogsToStderr()
         CHECK(lg);
 
         for (int i = 0; i < 500; ++i)
-            LOG_INFO_TO(lg, "line-{}", i);
+            BREEZE_LOG_INFO(lg, "line-{}", i);
         lg->Shutdown();
         // 不销毁 logger，文件里就该已经全了
         CHECK(Has(ReadAll(dir / "logs" / "svc.log"), "line-499"));
 
         {
             StderrCapture cap(dir / "err.txt");
-            LOG_INFO_TO(lg, "late-{}", 1); // 关闭后：转 stderr
-            lg->Flush();                   // 关闭后：空操作，不抛
-            lg->Shutdown();                // 幂等
+            BREEZE_LOG_INFO(lg, "late-{}", 1); // 关闭后：转 stderr
+            lg->Flush();                       // 关闭后：空操作，不抛
+            lg->Shutdown();                    // 幂等
             Logger::Stderr().Flush();
         }
         const auto errText = ReadAll(dir / "err.txt");
@@ -464,6 +558,151 @@ void TestShutdownDrainsAndRoutesLateLogsToStderr()
         lg.reset();                                               // 析构在 Shutdown 之后，不重复处理
         fs::remove_all(dir);
     }
+}
+
+// flushLevel：>= 它的日志写完立即可见，不用等缓冲；运行时可改。
+void TestFlushLevelConfigurable()
+{
+    const auto dir = TempDir("flushlevel");
+    auto c = Cfg(dir, false);
+    c.flushLevel = Level::Info;
+    c.flushIntervalSec = 0;
+    std::string err;
+    auto lg = Logger::Create(c, err);
+    CHECK(lg);
+    CHECK(lg->GetFlushLevel() == Level::Info);
+
+    BREEZE_LOG_INFO(lg, "visible-now"); // 没调 Flush
+    CHECK(Has(ReadAll(dir / "svc.log"), "visible-now"));
+
+    lg->SetFlushLevel(Level::Error);
+    CHECK(lg->GetFlushLevel() == Level::Error);
+    lg->SetFlushLevel(Level::Off);
+    CHECK(lg->GetFlushLevel() == Level::Off);
+    fs::remove_all(dir);
+}
+
+// 周期刷盘：不按级别刷、也不手动 Flush，缓冲里的 INFO 仍会在一个周期内出现在文件里。
+void TestPeriodicFlush()
+{
+    const auto dir = TempDir("periodic");
+    auto c = Cfg(dir, false);
+    c.flushLevel = Level::Off;
+    c.flushIntervalSec = 1;
+    std::string err;
+    auto lg = Logger::Create(c, err);
+    CHECK(lg);
+
+    BREEZE_LOG_INFO(lg, "buffered-line");
+    bool seen = false;
+    for (int i = 0; i < 40 && !seen; ++i) // 最多等 4 秒
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        seen = Has(ReadAll(dir / "svc.log"), "buffered-line");
+    }
+    CHECK(seen);
+    fs::remove_all(dir);
+}
+
+// <name>.log 已存在时：普通文件改名 .old 保留、悬空软链被覆盖、目录则放弃软链但照常写日志。
+void TestSymlinkDirtyStates()
+{
+    {
+        const auto dir = TempDir("link_file");
+        fs::create_directories(dir);
+        std::ofstream(dir / "t.log") << "legacy-content";
+        {
+            StderrCapture cap(dir / "err.txt"); // 改名时会往 stderr 打一行说明
+            HourlyFileSinkMt sink(dir, "t", 0);
+            Feed(sink, At(2026, 10, 26, 12, 0), "new");
+        }
+        CHECK(fs::is_symlink(dir / "t.log"));
+        CHECK(ReadAll(dir / "t.log.old") == "legacy-content");
+        CHECK(Has(ReadAll(dir / "err.txt"), "已改名"));
+        CHECK(Has(ReadAll(dir / "t.log"), "new"));
+        fs::remove_all(dir);
+    }
+    {
+        const auto dir = TempDir("link_dangling");
+        fs::create_directories(dir);
+        fs::create_symlink("no-such-file", dir / "t.log");
+        {
+            HourlyFileSinkMt sink(dir, "t", 0);
+            Feed(sink, At(2026, 10, 26, 12, 0), "new");
+        }
+        CHECK(fs::read_symlink(dir / "t.log") == "t.2026-10-26_12.log");
+        CHECK(!fs::exists(dir / "t.log.old"));
+        fs::remove_all(dir);
+    }
+    {
+        const auto dir = TempDir("link_dir");
+        fs::create_directories(dir / "t.log");
+        {
+            StderrCapture cap(dir / "err.txt");
+            HourlyFileSinkMt sink(dir, "t", 0);
+            Feed(sink, At(2026, 10, 26, 12, 0), "new");
+        }
+        CHECK(fs::is_directory(dir / "t.log"));                  // 没被动
+        CHECK(Has(ReadAll(dir / "t.2026-10-26_12.log"), "new")); // 日志照写
+        CHECK(Has(ReadAll(dir / "err.txt"), "是目录"));
+        fs::remove_all(dir);
+    }
+}
+
+// 线程名：每个 logger 的后台线程带上名字，top -H / gdb 里能认出来。线程名在线程启动后才设，要轮询。
+std::set<std::string> ThreadNames()
+{
+    std::set<std::string> names;
+    for (const auto& e : fs::directory_iterator("/proc/self/task"))
+    {
+        std::string n = ReadAll(e.path() / "comm");
+        if (!n.empty() && n.back() == '\n')
+            n.pop_back();
+        names.insert(n);
+    }
+    return names;
+}
+
+void TestThreadNames()
+{
+    const auto dir = TempDir("threadnames");
+    auto c = Cfg(dir, true);
+    c.flushIntervalSec = 1;
+    std::string err;
+    auto lg = Logger::Create(c, err);
+    CHECK(lg);
+
+    bool pool = false, flusher = false;
+    for (int i = 0; i < 50 && !(pool && flusher); ++i) // 刷盘线程第一次回调才命名，最多等 5 秒
+    {
+        const auto names = ThreadNames();
+        pool = names.contains("log:svc");
+        flusher = names.contains("logf:svc");
+        if (!(pool && flusher))
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    CHECK(pool);
+    CHECK(flusher);
+
+    lg.reset();
+    CHECK(!ThreadNames().contains("log:svc")); // 销毁后线程都没了
+    CHECK(!ThreadNames().contains("logf:svc"));
+    fs::remove_all(dir);
+}
+
+// 带显式 file/line 的重载：转接第三方库日志用。
+void TestLogWithExplicitLocation()
+{
+    const auto dir = TempDir("explicit_loc");
+    std::string err;
+    auto lg = Logger::Create(Cfg(dir, false), err);
+    CHECK(lg);
+    lg->Log(Level::Info, "/some/dir/fake_lib.cc", 77, "Func", "from-third-party");
+    lg->Flush();
+    const auto text = ReadAll(dir / "svc.log");
+    CHECK(Has(text, "from-third-party"));
+    CHECK(Has(text, "fake_lib.cc:77")); // %s 取文件名，%# 取行号
+    fs::remove_all(dir);
 }
 
 void TestFatalInStdoutMode()
@@ -483,8 +722,8 @@ void TestFatalInStdoutMode()
         if (!lg)
             ::_exit(2);
         for (int i = 0; i < 100; ++i)
-            LOG_INFO_TO(lg, "ctx-{}", i);
-        LOG_FATAL_TO(lg, "boom {}", 9);
+            BREEZE_LOG_INFO(lg, "ctx-{}", i);
+        BREEZE_LOG_FATAL(lg, "boom {}", 9);
     }
 
     int status = 0;
@@ -511,8 +750,8 @@ void TestFatalFlushesQueueThenAborts()
         if (!lg)
             ::_exit(2);
         for (int i = 0; i < 200; ++i)
-            LOG_INFO_TO(lg, "ctx-{}", i);
-        LOG_FATAL_TO(lg, "boom {}", 7);
+            BREEZE_LOG_INFO(lg, "ctx-{}", i);
+        BREEZE_LOG_FATAL(lg, "boom {}", 7);
     }
 
     int status = 0;
@@ -542,9 +781,18 @@ int main()
     TestLevelFilterAndRuntimeSetLevel();
     TestArgsNotEvaluatedWhenFiltered();
     TestAsyncDrainsOnDestroy();
+    TestDefaultLevelFollowsBuildType();
+    TestLevelNamesRoundTrip();
+    TestSetLogLevelOnDefaultLogger();
     TestShutdownDrainsAndRoutesLateLogsToStderr();
     TestFallbackToStderrWhenNoDefault();
+    TestBusinessMacroFamilyOnTopOfInnerMacros();
     TestDefaultLoggerUsedByMacro();
+    TestFlushLevelConfigurable();
+    TestPeriodicFlush();
+    TestSymlinkDirtyStates();
+    TestThreadNames();
+    TestLogWithExplicitLocation();
     TestStdoutModeWritesNoFiles();
     TestStdoutAsyncDrainsOnDestroy();
     TestStdoutModeIgnoresUnwritableDir();

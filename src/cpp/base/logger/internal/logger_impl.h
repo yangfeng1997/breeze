@@ -6,6 +6,7 @@
 
 #include <spdlog/async.h>
 #include <spdlog/async_logger.h>
+#include <spdlog/details/periodic_worker.h>
 #include <spdlog/sinks/stdout_sinks.h>
 #include <spdlog/spdlog.h>
 
@@ -25,6 +26,8 @@ struct Logger::Impl
     std::vector<spdlog::sink_ptr> sinks;
     std::shared_ptr<spdlog::logger> logger;
     std::string name;
+    // 周期刷盘线程。必须最先停：它回调 logger->flush()，晚于线程池销毁就会撞上空池。声明在最后，析构也最先。
+    std::unique_ptr<spdlog::details::periodic_worker> flusher;
 };
 
 } // namespace breeze

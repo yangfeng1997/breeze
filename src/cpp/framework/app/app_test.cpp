@@ -85,7 +85,7 @@ void TestOrder()
     CHECK((log == std::vector<std::string>{"b", "c", "a"}));
 }
 
-// App 的启动日志走默认 logger（g_logger）。整个测试进程把它指向 /tmp 下的文件，既不污染终端，
+// App 的启动日志走默认 logger（g_default_logger）。整个测试进程把它指向 /tmp 下的文件，既不污染终端，
 // 也让这里能读回来验证。
 void TestLifecycleLogs(Logger& lg, const std::filesystem::path& dir)
 {
@@ -311,7 +311,7 @@ int main()
     std::string err;
     auto lg = Logger::Create(cfg, err);
     CHECK(lg);
-    g_logger.store(lg.get());
+    g_default_logger.store(lg.get());
 
     TestOrder();
     TestLifecycleLogs(*lg, dir);
@@ -321,7 +321,7 @@ int main()
     TestWakeBacklog();
     TestNotifyFromThreads();
 
-    g_logger.store(nullptr);
+    g_default_logger.store(nullptr);
     std::filesystem::remove_all(dir);
     std::puts("all ok");
     return 0;
