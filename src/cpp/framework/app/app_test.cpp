@@ -305,9 +305,9 @@ int main()
     const auto dir = std::filesystem::temp_directory_path() / std::format("breeze_app_test_{}", ::getpid());
     std::filesystem::remove_all(dir);
     LoggerConfig cfg;
-    cfg.dir = dir.string();
+    cfg.file.dir = dir.string();
     cfg.name = "t";
-    cfg.async = false;
+    cfg.async.enabled = false;
     std::string err;
     auto lg = Logger::Create(cfg, err);
     CHECK(lg);

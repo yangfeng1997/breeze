@@ -118,6 +118,7 @@ std::optional<Level> ParseLevel(std::string_view name)
 
 Logger::Logger(std::unique_ptr<Impl> impl, Level level)
     : impl_(std::move(impl))
+    , initialLevel_(static_cast<std::uint8_t>(level))
     , level_(static_cast<std::uint8_t>(level))
 {
 }
@@ -141,23 +142,24 @@ std::unique_ptr<Logger> Logger::Create(const LoggerConfig& cfg, std::string& err
         else
         {
             std::error_code ec;
-            std::filesystem::create_directories(cfg.dir, ec);
+            std::filesystem::create_directories(cfg.file.dir, ec);
             if (ec)
             {
-                err = std::format("创建日志目录 {} 失败: {}", cfg.dir, ec.message());
+                err = std::format("创建日志目录 {} 失败: {}", cfg.file.dir, ec.message());
                 return nullptr;
             }
-            auto fileSink = std::make_shared<HourlyFileSinkMt>(cfg.dir, cfg.name, cfg.retainHours);
+            auto fileSink = std::make_shared<HourlyFileSinkMt>(
+                cfg.file.dir, cfg.name, cfg.file.retainHours, cfg.file.maxFileBytes, cfg.file.maxFilesPerHour);
             fileSink->Open(spdlog::log_clock::now());
             impl->sinks.push_back(fileSink);
         }
 
-        if (cfg.async)
+        if (cfg.async.enabled)
         {
             impl->tp = std::make_shared<spdlog::details::thread_pool>(
-                cfg.queueSize, cfg.threads, [tname = "log:" + cfg.name] { SetThreadName(tname); });
-            const auto policy = cfg.overflow == Overflow::Block ? spdlog::async_overflow_policy::block
-                                                                : spdlog::async_overflow_policy::overrun_oldest;
+                cfg.async.queueSize, cfg.async.threads, [tname = "log:" + cfg.name] { SetThreadName(tname); });
+            const auto policy = cfg.async.overflow == Overflow::Block ? spdlog::async_overflow_policy::block
+                                                                      : spdlog::async_overflow_policy::overrun_oldest;
             impl->logger = std::make_shared<spdlog::async_logger>(
                 cfg.name, impl->sinks.begin(), impl->sinks.end(), impl->tp, policy);
         }
@@ -170,11 +172,11 @@ std::unique_ptr<Logger> Logger::Create(const LoggerConfig& cfg, std::string& err
         // 过滤只在 Logger::ShouldLog 做；sink 与 spdlog 自己的级别永远放开，
         // 否则运行时 SetLevel 调低后，被创建时级别挡掉的 sink 仍然出不来。
         impl->logger->set_level(spdlog::level::trace);
-        impl->logger->flush_on(ToSpdlog(cfg.flushLevel));
+        impl->logger->flush_on(ToSpdlog(cfg.flush.level));
         impl->logger->set_error_handler([](const std::string& msg)
                                         { std::fprintf(stderr, "[logger] %s\n", msg.c_str()); });
 
-        if (cfg.flushIntervalSec > 0)
+        if (cfg.flush.intervalSec > 0)
         {
             // 线程名要等第一次回调才设得上（periodic_worker 没有线程启动钩子），所以最迟一个周期后才可见。
             impl->flusher = std::make_unique<spdlog::details::periodic_worker>(
@@ -188,7 +190,7 @@ std::unique_ptr<Logger> Logger::Create(const LoggerConfig& cfg, std::string& err
                     }
                     raw->flush();
                 },
-                std::chrono::seconds(cfg.flushIntervalSec));
+                std::chrono::seconds(cfg.flush.intervalSec));
         }
 
         return std::unique_ptr<Logger>(new Logger(std::move(impl), cfg.level));
@@ -208,8 +210,8 @@ Logger& Logger::Stderr()
         cfg.output = Output::Stderr;
         cfg.name = "stderr";
         cfg.level = Level::Info;
-        cfg.async = false;
-        cfg.flushIntervalSec = 0; // 同步写 stderr，无缓冲，不需要刷盘线程
+        cfg.async.enabled = false;
+        cfg.flush.intervalSec = 0; // 同步写 stderr，无缓冲，不需要刷盘线程
         std::string err;
         auto lg = Create(cfg, err);
         if (!lg) // stderr sink 不会失败；真失败了没有任何地方可以报，只能终止

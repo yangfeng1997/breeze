@@ -147,6 +147,113 @@ void TestRetentionOnlyTouchesOwnOldFiles()
     fs::remove_all(dir);
 }
 
+// 一行默认格式的日志占多少字节：用不限大小的 sink 量出来，测试里的上限据此推算，不写死。
+std::uint64_t LineBytes(std::string_view text)
+{
+    const auto dir = TempDir("linebytes");
+    fs::create_directories(dir);
+    {
+        HourlyFileSinkMt sink(dir, "t", 0);
+        Feed(sink, At(2026, 10, 26, 12, 0), text);
+    }
+    const auto n = fs::file_size(dir / "t.2026-10-26_12.log");
+    fs::remove_all(dir);
+    return n;
+}
+
+// 小时内按大小分段；段数用完后丢弃并留说明；下个小时恢复，并记上丢了多少条。
+void TestSizeSegmentsAndHourlyCap()
+{
+    const std::uint64_t L = LineBytes("m-0000");
+    const std::uint64_t kMax = L * 3 + 10; // 一段放 3 行，第 4 行放不下
+    constexpr std::uint32_t kSegs = 3;
+    constexpr int kFed = 100;
+    const auto dir = TempDir("segments");
+    fs::create_directories(dir);
+    {
+        HourlyFileSinkMt sink(dir, "t", 0, kMax, kSegs);
+        for (int i = 0; i < kFed; ++i)
+            Feed(sink, At(2026, 10, 26, 12, 0), std::format("m-{:04}", i));
+        CHECK(fs::read_symlink(dir / "t.log") == "t.2026-10-26_12.2.log"); // 封顶后仍指向最后一段
+        Feed(sink, At(2026, 10, 26, 13, 0), "next-hour");
+    }
+
+    const auto seg0 = dir / "t.2026-10-26_12.log";
+    const auto seg1 = dir / "t.2026-10-26_12.1.log";
+    const auto seg2 = dir / "t.2026-10-26_12.2.log";
+    CHECK(fs::exists(seg0) && fs::exists(seg1) && fs::exists(seg2));
+    CHECK(!fs::exists(dir / "t.2026-10-26_12.3.log")); // 不会超过 kSegs 段
+    CHECK(fs::file_size(seg0) == 3 * L);
+    CHECK(fs::file_size(seg1) == 3 * L);
+
+    // 保留的是头部：m-0000 ~ m-0008 共 9 条，其余丢弃
+    CHECK(Has(ReadAll(seg0), "m-0000"));
+    CHECK(Has(ReadAll(seg2), "m-0008"));
+    CHECK(!Has(ReadAll(seg2), "m-0009"));
+    CHECK(Has(ReadAll(seg2), "超限"));
+
+    const int dropped = kFed - 9;
+    const auto next = ReadAll(dir / "t.2026-10-26_13.log");
+    CHECK(Has(next, std::format("共丢弃 {} 条", dropped)));
+    CHECK(Has(next, "next-hour")); // 下个小时恢复
+    CHECK(fs::read_symlink(dir / "t.log") == "t.2026-10-26_13.log");
+    fs::remove_all(dir);
+}
+
+// 同一小时内重启：续写下一个还放得下的段，不覆盖；段数用完则丢弃。
+void TestRestartWithinHourContinuesInNextSegment()
+{
+    const std::uint64_t L = LineBytes("m-0000");
+    const std::uint64_t kMax = L + 10; // 一段只放一行
+    const auto dir = TempDir("restart_seg");
+    fs::create_directories(dir);
+    auto feedOne = [&](std::string_view text)
+    {
+        HourlyFileSinkMt sink(dir, "t", 0, kMax, 3); // 每次新建 = 一次重启
+        Feed(sink, At(2026, 10, 26, 12, 0), text);
+    };
+    feedOne("m-aaaa");
+    feedOne("m-bbbb");
+    feedOne("m-cccc");
+    feedOne("m-dddd"); // 三段都满了
+
+    const auto seg0 = ReadAll(dir / "t.2026-10-26_12.log");
+    const auto seg1 = ReadAll(dir / "t.2026-10-26_12.1.log");
+    const auto seg2 = ReadAll(dir / "t.2026-10-26_12.2.log");
+    CHECK(Has(seg0, "m-aaaa") && !Has(seg0, "m-bbbb")); // 第 0 段没被覆盖
+    CHECK(Has(seg1, "m-bbbb"));
+    CHECK(Has(seg2, "m-cccc"));
+    CHECK(!Has(seg0 + seg1 + seg2, "m-dddd")); // 第 4 条丢了
+    CHECK(Has(seg2, "超限"));
+    CHECK(!fs::exists(dir / "t.2026-10-26_12.3.log"));
+    fs::remove_all(dir);
+}
+
+// 清理：旧小时的所有段一起删；长得像但不是段的文件不动。
+void TestSegmentCleanupOnlyOwnSegments()
+{
+    const auto dir = TempDir("seg_cleanup");
+    fs::create_directories(dir);
+    for (const char* f : {"t.2000-01-01_00.log",
+                          "t.2000-01-01_00.1.log",
+                          "t.2000-01-01_00.12.log", // 旧：删
+                          "t.2000-01-01_00.x.log",
+                          "t.2000-01-01_00.1.2.log",
+                          "t.2000-01-01_00..log",   // 像但不是：留
+                          "t.2026-10-26_11.1.log"}) // 新：留
+        std::ofstream(dir / f) << "x";
+    {
+        HourlyFileSinkMt sink(dir, "t", 48);
+        Feed(sink, At(2026, 10, 26, 12, 0), "now");
+    }
+    for (const char* f : {"t.2000-01-01_00.log", "t.2000-01-01_00.1.log", "t.2000-01-01_00.12.log"})
+        CHECK(!fs::exists(dir / f));
+    for (const char* f :
+         {"t.2000-01-01_00.x.log", "t.2000-01-01_00.1.2.log", "t.2000-01-01_00..log", "t.2026-10-26_11.1.log"})
+        CHECK(fs::exists(dir / f));
+    fs::remove_all(dir);
+}
+
 // 名字带点号表示类别：gatesvr / gatesvr.res / gatesvr.tracing 共用一个目录，互不干扰。
 void TestDottedNamesDontTouchEachOther()
 {
@@ -188,11 +295,43 @@ void TestDottedNamesDontTouchEachOther()
 LoggerConfig Cfg(const fs::path& dir, bool async)
 {
     LoggerConfig c;
-    c.dir = dir.string();
+    c.file.dir = dir.string();
     c.name = "svc";
     c.level = Level::Info; // 显式：默认值随构建类型变，用例断言的是 Info 下的行为
-    c.async = async;
+    c.async.enabled = async;
     return c;
+}
+
+// LoggerConfig::file 的上限确实传到了 sink；默认值是开着的（风暴防护默认生效）。
+void TestLoggerWiresFileSizeLimits()
+{
+    CHECK(LoggerConfig{}.file.maxFileBytes > 0);
+    CHECK(LoggerConfig{}.file.maxFilesPerHour > 0);
+
+    const auto dir = TempDir("wire_limits");
+    auto c = Cfg(dir, false);
+    c.file.maxFileBytes = 3000;
+    c.file.maxFilesPerHour = 2;
+    std::string err;
+    auto lg = Logger::Create(c, err);
+    CHECK(lg);
+    const std::string pad(80, 'x');
+    for (int i = 0; i < 200; ++i) // 约 200 × 130 字节，远超 2 × 3000
+        BREEZE_LOG_INFO(lg, "line-{} {}", i, pad);
+    lg->Flush();
+
+    bool seg1 = false, seg2 = false;
+    for (const auto& e : fs::directory_iterator(dir))
+    {
+        const auto n = e.path().filename().string();
+        seg1 |= n.ends_with(".1.log");
+        seg2 |= n.ends_with(".2.log");
+        if (!e.is_symlink())
+            CHECK(fs::file_size(e.path()) <= 3000 + 200); // 上限 + 一行说明
+    }
+    CHECK(seg1);
+    CHECK(!seg2);
+    fs::remove_all(dir);
 }
 
 void TestDefaultLevelFollowsBuildType()
@@ -245,6 +384,53 @@ void TestSetLogLevelOnDefaultLogger()
     CHECK(Has(text, "dbg-after"));
     CHECK(!Has(text, "warn-hidden"));
     CHECK(Has(text, "err-shown"));
+    fs::remove_all(dir);
+}
+
+// ResetLevel：恢复成创建时配置的级别，而不是 DefaultLevel()；幂等；对默认 logger 的 ResetLogLevel 同理。
+void TestResetLevel()
+{
+    const auto dir = TempDir("resetlevel");
+    auto c = Cfg(dir, false);
+    c.level = Level::Warn; // 故意不是 Info，也不是任何构建类型的 DefaultLevel
+    std::string err;
+    auto lg = Logger::Create(c, err);
+    CHECK(lg);
+    CHECK(lg->GetLevel() == Level::Warn);
+
+    lg->ResetLevel(); // 没改过就复位：无变化
+    CHECK(lg->GetLevel() == Level::Warn);
+
+    lg->SetLevel(Level::Debug);
+    BREEZE_LOG_INFO(lg, "while-debug");
+    lg->ResetLevel();
+    CHECK(lg->GetLevel() == Level::Warn);
+    BREEZE_LOG_INFO(lg, "after-reset-info"); // 又被挡掉
+    BREEZE_LOG_WARN(lg, "after-reset-warn");
+    lg->ResetLevel(); // 幂等
+    CHECK(lg->GetLevel() == Level::Warn);
+
+    lg->SetLevel(Level::Off);
+    lg->ResetLevel(); // 从 Off 也能恢复
+    CHECK(lg->GetLevel() == Level::Warn);
+
+    lg->SetFlushLevel(Level::Error);
+    lg->ResetLevel(); // 只管 min level
+    CHECK(lg->GetFlushLevel() == Level::Error);
+
+    lg->Flush();
+    const auto text = ReadAll(dir / "svc.log");
+    CHECK(Has(text, "while-debug"));
+    CHECK(!Has(text, "after-reset-info"));
+    CHECK(Has(text, "after-reset-warn"));
+
+    // 默认 logger 的自由函数版
+    g_default_logger.store(lg.get());
+    SetLogLevel(Level::Trace);
+    CHECK(GetLogLevel() == Level::Trace);
+    ResetLogLevel();
+    CHECK(GetLogLevel() == Level::Warn);
+    g_default_logger.store(nullptr);
     fs::remove_all(dir);
 }
 
@@ -420,7 +606,7 @@ void TestStdoutModeIgnoresUnwritableDir()
         StdoutCapture cap(dir / "out.txt");
         std::string err;
         auto c = StdoutCfg(dir, false);
-        c.dir = (dir / "file" / "sub").string();
+        c.file.dir = (dir / "file" / "sub").string();
         auto lg = Logger::Create(c, err);
         CHECK(lg);
         BREEZE_LOG_INFO(lg, "still-works");
@@ -565,8 +751,8 @@ void TestFlushLevelConfigurable()
 {
     const auto dir = TempDir("flushlevel");
     auto c = Cfg(dir, false);
-    c.flushLevel = Level::Info;
-    c.flushIntervalSec = 0;
+    c.flush.level = Level::Info;
+    c.flush.intervalSec = 0;
     std::string err;
     auto lg = Logger::Create(c, err);
     CHECK(lg);
@@ -587,8 +773,8 @@ void TestPeriodicFlush()
 {
     const auto dir = TempDir("periodic");
     auto c = Cfg(dir, false);
-    c.flushLevel = Level::Off;
-    c.flushIntervalSec = 1;
+    c.flush.level = Level::Off;
+    c.flush.intervalSec = 1;
     std::string err;
     auto lg = Logger::Create(c, err);
     CHECK(lg);
@@ -667,7 +853,7 @@ void TestThreadNames()
 {
     const auto dir = TempDir("threadnames");
     auto c = Cfg(dir, true);
-    c.flushIntervalSec = 1;
+    c.flush.intervalSec = 1;
     std::string err;
     auto lg = Logger::Create(c, err);
     CHECK(lg);
@@ -778,12 +964,17 @@ int main()
     TestClockGoingBackwardsReopens();
     TestRetentionOnlyTouchesOwnOldFiles();
     TestDottedNamesDontTouchEachOther();
+    TestSizeSegmentsAndHourlyCap();
+    TestRestartWithinHourContinuesInNextSegment();
+    TestSegmentCleanupOnlyOwnSegments();
+    TestLoggerWiresFileSizeLimits();
     TestLevelFilterAndRuntimeSetLevel();
     TestArgsNotEvaluatedWhenFiltered();
     TestAsyncDrainsOnDestroy();
     TestDefaultLevelFollowsBuildType();
     TestLevelNamesRoundTrip();
     TestSetLogLevelOnDefaultLogger();
+    TestResetLevel();
     TestShutdownDrainsAndRoutesLateLogsToStderr();
     TestFallbackToStderrWhenNoDefault();
     TestBusinessMacroFamilyOnTopOfInnerMacros();

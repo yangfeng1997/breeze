@@ -52,9 +52,9 @@ bool Has(const std::string& s, std::string_view needle) { return s.find(needle) 
 LoggerConfig Cfg(const fs::path& dir, const char* name)
 {
     LoggerConfig c;
-    c.dir = dir.string();
+    c.file.dir = dir.string();
     c.name = name;
-    c.async = false;
+    c.async.enabled = false;
     return c;
 }
 

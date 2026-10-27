@@ -86,3 +86,16 @@ add_test(NAME log_module_test COMMAND log_module_test)
 add_executable(logger_strip_test ${LOGGER_DIR}/logger_strip_test.cpp)
 target_link_libraries(logger_strip_test PRIVATE breeze_logger)
 add_test(NAME logger_strip_test COMMAND logger_strip_test)
+
+# 鲁棒性（队列溢出、多后台线程、多线程压力、Shutdown 并发、滚动并发）与时区/夏令时。
+# 都要直接用 internal/ 里的 sink 和测试工具，所以与 logger_test 一样看得到 internal/ 与 spdlog。
+add_executable(logger_robust_test ${LOGGER_DIR}/logger_robust_test.cpp)
+target_include_directories(logger_robust_test PRIVATE ${LOGGER_DIR}/internal)
+target_link_libraries(logger_robust_test PRIVATE breeze_logger spdlog::spdlog Threads::Threads)
+add_test(NAME logger_robust_test COMMAND logger_robust_test)
+
+# TZ 环境变量只能在没有其它线程时改，所以单独一个进程。
+add_executable(logger_tz_test ${LOGGER_DIR}/logger_tz_test.cpp)
+target_include_directories(logger_tz_test PRIVATE ${LOGGER_DIR}/internal)
+target_link_libraries(logger_tz_test PRIVATE breeze_logger spdlog::spdlog)
+add_test(NAME logger_tz_test COMMAND logger_tz_test)

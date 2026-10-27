@@ -40,9 +40,9 @@ int main()
     const auto dir = fs::temp_directory_path() / std::format("breeze_strip_test_{}", ::getpid());
     fs::remove_all(dir);
     LoggerConfig cfg;
-    cfg.dir = dir.string();
+    cfg.file.dir = dir.string();
     cfg.name = "s";
-    cfg.async = false;
+    cfg.async.enabled = false;
     cfg.level = Level::Trace; // 运行时全开：证明缺的是编译期剥离，不是运行时过滤
     std::string err;
     auto lg = Logger::Create(cfg, err);

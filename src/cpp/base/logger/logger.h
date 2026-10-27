@@ -12,6 +12,9 @@
 //          启动期、崩溃信息不经 Logger，由启动脚本重定向，如 `>> x.stdout.log 2>> x.stderr.log`。
 //   Stdout 只写 stdout，不建目录、不建文件。容器里由运行时收集并轮转。
 //   Stderr 只写 stderr，同上。Logger::Stderr() 的兜底实例用它。
+//
+// 仅支持 Linux（软链、prctl 线程命名）。
+// 守护化（daemon / fork）必须在创建任何 Logger 之前：fork 之后后台线程不会跟过去。
 
 #pragma once
 
@@ -54,7 +57,7 @@ enum class Overflow : std::uint8_t
     DropOldest,
 };
 
-// 输出目标。Stdout / Stderr 下 dir / retainHours 无效，也不会创建任何文件。
+// 输出目标。Stdout / Stderr 下 LoggerConfig::file 整组无效，也不会创建任何文件。
 enum class Output : std::uint8_t
 {
     File,
@@ -62,32 +65,52 @@ enum class Output : std::uint8_t
     Stderr,
 };
 
+// 仅 Output::File。
+struct FileOptions
+{
+    std::string dir = "logs";
+    // 每次滚动时删除早于此小时数的文件（含它的所有段），0 不清理。
+    // 只认 <name>.<YYYY-MM-DD_HH>.log 与 <name>.<YYYY-MM-DD_HH>.<段号>.log，不动其它文件。
+    std::uint32_t retainHours = 168;
+    // 日志风暴防护：单个文件（段）的字节上限，0 不限。写满后同一小时内顺延为 <name>.<hour>.1.log、.2.log …
+    std::uint64_t maxFileBytes = 256ull << 20;
+    // 一个小时最多几段，0 不限。段数用完后该小时剩余日志**被丢弃**（文件里留一条说明），下个小时恢复。
+    // 磁盘占用上界 = retainHours × maxFilesPerHour × maxFileBytes，按它给磁盘留余量。
+    std::uint32_t maxFilesPerHour = 4;
+};
+
+// 仅 async.enabled 为 true 时有效。
+struct AsyncOptions
+{
+    // false 时在调用线程里同步写，其余字段无效。
+    bool enabled = true;
+    std::uint32_t queueSize = 16384;
+    std::uint32_t threads = 1;
+    Overflow overflow = Overflow::Block;
+};
+
+struct FlushOptions
+{
+    // 写完 >= 此级别的日志后立即刷盘（异步时投递刷盘请求）。Off 表示不按级别刷。
+    Level level = Level::Warn;
+    // 周期刷盘间隔（秒），0 关闭。否则低流量时 INFO 会一直留在缓冲里，进程崩溃后看不到。
+    // 每个开启的 logger 多一个线程（名字 logf:<name>）。
+    std::uint32_t intervalSec = 1;
+};
+
 struct LoggerConfig
 {
     Output output = Output::File;
-    std::string dir = "logs"; // 仅 File
     // File 下是文件名前缀；同时是 pattern 里 %n。同一 dir 下必须唯一，否则会写同一个文件、抢同一条软链。
     // 可含点号表示类别，如 gatesvr / gatesvr.res / gatesvr.tracing：旧文件清理只认
     // <name>.<YYYY-MM-DD_HH>.log，不会碰同前缀的其它 logger（见 logger_test 的 TestDottedNames…）。
     std::string name = "app";
     Level level = DefaultLevel();
-
-    // false 时在调用线程里同步写，queueSize / threads / overflow 无效。
-    bool async = true;
-    std::uint32_t queueSize = 16384;
-    std::uint32_t threads = 1;
-    Overflow overflow = Overflow::Block;
-
-    // 写完 >= 此级别的日志后立即刷盘（异步时投递刷盘请求）。Off 表示不按级别刷。
-    Level flushLevel = Level::Warn;
-    // 周期刷盘间隔（秒），0 关闭。否则低流量时 INFO 会一直留在缓冲里，进程崩溃后看不到。
-    // 每个开启的 logger 多一个线程（名字 logf:<name>）。
-    std::uint32_t flushIntervalSec = 1;
-
-    // 仅 File。每次滚动时删除早于此小时数的文件，0 不清理。只认 <name>.<YYYY-MM-DD_HH>.log，不动其它文件。
-    std::uint32_t retainHours = 168;
-
     std::string pattern = "[%Y-%m-%d %H:%M:%S.%e] [%l] [%t] [%s:%#] %v";
+
+    FileOptions file;
+    AsyncOptions async;
+    FlushOptions flush;
 };
 
 class Logger
@@ -125,6 +148,10 @@ public:
     void SetLevel(Level level) noexcept { level_.store(static_cast<std::uint8_t>(level), std::memory_order_relaxed); }
     Level GetLevel() const noexcept { return static_cast<Level>(level_.load(std::memory_order_relaxed)); }
 
+    // 恢复成创建时 LoggerConfig::level 给的级别（不是 DefaultLevel()）。排查完问题把临时调高的级别还原，
+    // 不用调用方记住原值。幂等。只管 min level，flush level 不动。
+    void ResetLevel() noexcept { level_.store(initialLevel_, std::memory_order_relaxed); }
+
     // 运行时可调：写完 >= level 的日志立即刷盘。
     void SetFlushLevel(Level level);
     Level GetFlushLevel() const;
@@ -136,7 +163,8 @@ public:
     // **对象本身仍然有效**：之后再来的 Log() 一律转去 Logger::Stderr()，不丢、不抛、不崩 ——
     // 这样晚到的调用（刚读到指针的线程）不会碰到已释放的内存，不必靠"线程都已停掉"的约定。
     // 真正释放留给析构。唯一的窄窗口：恰好在 Shutdown 期间已进入 Log() 的异步调用，
-    // 会撞上已销毁的线程池，由 error handler 往 stderr 打一行，这条日志丢失。
+    // 会撞上已销毁的线程池，由 error handler 往 stderr 打一行，这条日志丢失；
+    // 若此刻有线程正持有线程池（post 进行中），线程池由最后一个持有者销毁，Shutdown 可能在排空完成前返回。
     void Shutdown();
 
 private:
@@ -144,6 +172,7 @@ private:
     Logger(std::unique_ptr<Impl> impl, Level level);
 
     std::unique_ptr<Impl> impl_;
+    const std::uint8_t initialLevel_;
     std::atomic<std::uint8_t> level_;
     std::atomic<bool> closed_{false};
 };
@@ -161,6 +190,7 @@ inline Logger& CurrentLogger()
 // 改 / 读默认 logger 的运行时级别。没有默认 logger 时作用在 stderr 兜底实例上。
 inline void SetLogLevel(Level level) noexcept { CurrentLogger().SetLevel(level); }
 inline Level GetLogLevel() noexcept { return CurrentLogger().GetLevel(); }
+inline void ResetLogLevel() noexcept { CurrentLogger().ResetLevel(); }
 
 namespace detail
 {

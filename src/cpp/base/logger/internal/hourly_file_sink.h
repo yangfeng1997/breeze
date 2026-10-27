@@ -1,4 +1,4 @@
-// 按小时滚动的文件 sink，同时维护 <name>.log 软链。
+// 按小时滚动、小时内按大小分段的文件 sink，同时维护 <name>.log 软链。
 //
 // 滚动与清理一律以**消息自带的时间**为准，不读时钟 —— 单测可以直接喂未来的时间点。
 // 文件在第一条消息（或 Open）到来时才创建，不是构造时。
@@ -6,6 +6,12 @@
 // 文件名 <name>.<YYYY-MM-DD_HH>.log。时间串里只用 '-' 和 '_'：name 可含点号（gatesvr.res），
 // 时间串再有点号就分不出哪段是名字；冒号在 Windows 上不能做文件名。
 // 定长零填充，字符串比较即时间比较。
+//
+// 大小上限（maxFileBytes > 0 时）：一个小时的第 0 段是 <name>.<hour>.log，写满后顺延为
+// <name>.<hour>.1.log、.2.log …，最多 maxFilesPerHour 段（0 不限）。段数用完后该小时剩余日志**丢弃**，
+// 并在最后一段留一条说明，下个小时恢复，并在新文件里记上丢了多少条。软链始终指向当前段。
+// 总量上界 = 保留小时数 × maxFilesPerHour × maxFileBytes（外加几行说明）。
+// 同一小时内重启：从第 0 段起找第一个还放得下的段，不覆盖。
 //
 // **只许 base/logger 内部包含**（含 spdlog 头）。
 
@@ -32,10 +38,17 @@ template <class Mutex>
 class HourlyFileSink final : public spdlog::sinks::base_sink<Mutex>
 {
 public:
-    HourlyFileSink(std::filesystem::path dir, std::string name, std::uint32_t retainHours)
+    // maxFileBytes / maxFilesPerHour 为 0 表示不限。
+    HourlyFileSink(std::filesystem::path dir,
+                   std::string name,
+                   std::uint32_t retainHours,
+                   std::uint64_t maxFileBytes = 0,
+                   std::uint32_t maxFilesPerHour = 0)
         : dir_(std::move(dir))
         , name_(std::move(name))
         , retainHours_(retainHours)
+        , maxFileBytes_(maxFileBytes)
+        , maxFilesPerHour_(maxFilesPerHour)
     {
     }
 
@@ -53,9 +66,25 @@ protected:
         // 时间倒退（校时）也重开：否则会把早一小时的日志写进当前文件。
         if (msg.time >= end_ || msg.time < start_)
             Rotate(msg.time);
+        if (capped_)
+        {
+            ++dropped_;
+            return;
+        }
+
         spdlog::memory_buf_t buf;
         this->formatter_->format(msg, buf);
+        while (!Fits(buf.size()))
+        {
+            if (!NextSegment())
+            {
+                Cap();
+                ++dropped_;
+                return;
+            }
+        }
         file_.write(buf);
+        bytes_ += buf.size();
     }
 
     void flush_() override { file_.flush(); }
@@ -82,10 +111,67 @@ private:
         return true;
     }
 
+    // 段号后缀：".<1 位以上数字>"。其它（".x"、".1.2"、"."）都不是，宁可漏删也不误删。
+    static bool IsSegmentSuffix(std::string_view t)
+    {
+        if (t.size() < 2 || t[0] != '.')
+            return false;
+        return std::all_of(t.begin() + 1, t.end(), [](char c) { return c >= '0' && c <= '9'; });
+    }
+
+    std::string SegmentFile() const
+    {
+        return segment_ == 0 ? std::format("{}.{}.log", name_, hourKey_)
+                             : std::format("{}.{}.{}.log", name_, hourKey_, segment_);
+    }
+
+    // 打开当前段（追加：同小时重启不覆盖），记下已有大小，软链指过去。
+    void OpenSegment()
+    {
+        const std::string file = SegmentFile();
+        file_.open((dir_ / file).string(), false);
+        bytes_ = file_.size();
+        UpdateSymlink(file);
+    }
+
+    // 空文件不拒绝：单条日志本身超过上限也得写进去，否则会死循环换段。
+    bool Fits(std::size_t n) const { return maxFileBytes_ == 0 || bytes_ == 0 || bytes_ + n <= maxFileBytes_; }
+
+    bool NextSegment()
+    {
+        if (maxFilesPerHour_ > 0 && segment_ + 1 >= maxFilesPerHour_)
+            return false;
+        ++segment_;
+        OpenSegment();
+        return true;
+    }
+
+    // 说明行直接写，不经格式化器：它是 sink 自己的话，不是某个 logger 的日志。
+    void WriteNote(const std::string& text)
+    {
+        const std::string line = "[logger] " + text + "\n";
+        spdlog::memory_buf_t b;
+        b.append(line.data(), line.data() + line.size());
+        file_.write(b);
+        bytes_ += line.size();
+    }
+
+    void Cap()
+    {
+        capped_ = true;
+        WriteNote(std::format("本小时日志量超限（单文件 {} 字节 x {} 个），后续日志被丢弃，下个小时恢复",
+                              maxFileBytes_,
+                              maxFilesPerHour_));
+    }
+
     void Rotate(spdlog::log_clock::time_point tp)
     {
-        const std::string file = std::format("{}.{}.log", name_, HourKey(tp));
-        file_.open((dir_ / file).string(), false); // 追加：同小时重启不覆盖
+        const auto droppedPrev = dropped_;
+        capped_ = false;
+        dropped_ = 0;
+        hourKey_ = HourKey(tp);
+        segment_ = 0;
+        OpenSegment();
 
         std::tm tm = spdlog::details::os::localtime(spdlog::log_clock::to_time_t(tp));
         tm.tm_min = 0;
@@ -93,7 +179,8 @@ private:
         start_ = spdlog::log_clock::from_time_t(std::mktime(&tm));
         end_ = start_ + std::chrono::hours(1);
 
-        UpdateSymlink(file);
+        if (droppedPrev > 0)
+            WriteNote(std::format("上一个小时因超限共丢弃 {} 条日志", droppedPrev));
         if (retainHours_ > 0)
             Cleanup(tp);
     }
@@ -141,7 +228,8 @@ private:
         }
     }
 
-    // 文件名里的小时串定长且零填充，字符串比较即时间比较。
+    // 只认 <name>.<YYYY-MM-DD_HH>.log 与 <name>.<YYYY-MM-DD_HH>.<段号>.log，早于截止小时的删掉
+    // （含它的所有段）。小时串定长且零填充，字符串比较即时间比较。
     void Cleanup(spdlog::log_clock::time_point now)
     {
         const std::string cutoff = HourKey(now - std::chrono::hours(retainHours_));
@@ -153,11 +241,14 @@ private:
         for (std::filesystem::directory_iterator it(dir_, ec), end; !ec && it != end; it.increment(ec))
         {
             const std::string fn = it->path().filename().string();
-            if (fn.size() != prefix.size() + kKeyLen + kSuffix.size() || !fn.starts_with(prefix) ||
-                !fn.ends_with(kSuffix))
+            if (!fn.starts_with(prefix) || !fn.ends_with(kSuffix))
                 continue;
-            const std::string key = fn.substr(prefix.size(), kKeyLen);
-            if (!IsHourKey(key))
+            const std::string mid = fn.substr(prefix.size(), fn.size() - prefix.size() - kSuffix.size());
+            if (mid.size() < kKeyLen)
+                continue;
+            const std::string key = mid.substr(0, kKeyLen);
+            const std::string tail = mid.substr(kKeyLen);
+            if (!IsHourKey(key) || (!tail.empty() && !IsSegmentSuffix(tail)))
                 continue;
             if (key < cutoff)
             {
@@ -170,9 +261,17 @@ private:
     std::filesystem::path dir_;
     std::string name_;
     std::uint32_t retainHours_;
+    std::uint64_t maxFileBytes_;
+    std::uint32_t maxFilesPerHour_;
+
     spdlog::details::file_helper file_;
     spdlog::log_clock::time_point start_{};
     spdlog::log_clock::time_point end_{};
+    std::string hourKey_;
+    std::uint32_t segment_ = 0;
+    std::uint64_t bytes_ = 0;
+    bool capped_ = false;
+    std::uint64_t dropped_ = 0;
     bool warned_ = false;
 };
 
