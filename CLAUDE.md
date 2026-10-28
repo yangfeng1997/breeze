@@ -17,10 +17,21 @@
   Go 命令要在 `src/go/` 下跑，或用 `go -C src/go ...`
 - `src/cpp` — C++ 侧，`CMakeLists.txt` 在此。`framework/app` 对照 Go 版
   `src/go/core/app` 实现，语义以后者的 CLAUDE.md 为准
-- `src/*/gen` — 生成代码输出目录，不进版本库
+- `src/*/gen/<类别>/` — 生成代码输出目录，不进版本库；一类生成物一个子目录（现有 `config/`，策划表等以后各占一个）。
+  C++ 的 include 根是 `src/cpp/gen`：`#include "config/common_config.h"`。`python3 scripts/configure.py` 一次生成全部
+  并配置 cmake；C++ 构建在 schema 变动时也会自动重生成自己那份
+- `config/schema` — 配置 schema（`*.proto`，自定义 option 在 `options.proto`），配置结构的事实源；
+  配置数据本身仍是 YAML：`config/common.yaml`（全量，带本机开发默认值，单独可读）+ `config/env/{dev,test,prod}.yaml`
+  （后者覆盖前者；env 文件只能覆盖 schema 里标了 `env_value` 的字段，且要全部写出，`cluster.env` 必须与文件名一致；
+  密钥用 `${ENV:}` 注入，只有 dev 有默认值）。
+  C++ 框架的 `ConfigModule`（`src/cpp/framework/kernel/config_module.h`）只加载 `--config` 传入的**一个**文件，
+  不隐式找 env / 业务文件；业务自己的 yaml 由业务自己 `Config::Load`。
+  `common_config_test` 会读这些真实文件，改 schema 或 yaml 后对不上会失败。`tools/configgen` 从 schema 生成 C++ / Go / JSON Schema（需要 `protoc`），
+  用法与 schema 格式见 [tools/configgen/CLAUDE.md](tools/configgen/CLAUDE.md)。目前只有 `common.proto`
+  （cluster / etcd / redis / mongo）；生成器自带样例在 `tools/configgen/testdata/schema/`
 - `docs/` — 设计文档。服务间通信的基线是
   [docs/Actor模型与RPC设计.md](docs/Actor模型与RPC设计.md)：实现 RPC 或 actor 层前先读它
-- `scripts/` — Windows 环境脚本（**目录名拼写如此，勿"修正"**）
+- `scripts/` — `configure.py`（生成代码 + 配置 cmake，只用标准库）与 Windows 环境脚本（**目录名拼写如此，勿"修正"**）
 - `build/`、`run/` — 构建产物，不进版本库
 
 ## 服务

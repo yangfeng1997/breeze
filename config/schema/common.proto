@@ -1,0 +1,70 @@
+// 所有服务共用的配置：集群身份与基础设施（etcd / redis / mongo）。
+// 事实源。改完 C++ 构建时自动重新生成；用法见 tools/configgen/CLAUDE.md。
+//
+// 字段编号只是为了满足 proto 语法，配置按**键名**（字段名）读取，编号改动没有影响。
+//
+// 密钥（redis.password、mongo.uri）不写进配置文件，yaml 里用占位符引用，部署时注入：
+//   password: ${ENV:REDIS_PWD}            环境变量（K8s Secret 注入）
+//   password: ${FILE:/run/secrets/redis}  挂载的 secret 文件
+
+syntax = "proto3";
+
+package config;
+
+import "options.proto";
+
+// 部署环境。每个环境的覆盖文件里要写同名的 cluster.env，启动时与 --env 核对，防止误用别的环境的配置。
+enum Env {
+  ENV_UNSPECIFIED = 0;
+  ENV_DEV = 1;
+  ENV_TEST = 2;
+  ENV_PROD = 3;
+}
+
+// 所有服务共用的公共配置。
+message CommonConfig {
+  option (config.root) = true;
+
+  // 四段都必填：整段缺失不能悄悄取空默认值（world_id 会变成 0，etcd 没有地址）
+  ClusterConfig cluster = 1 [(config.required) = true];
+  EtcdConfig etcd = 2 [(config.required) = true];
+  RedisConfig redis = 3 [(config.required) = true];
+  MongoConfig mongo = 4 [(config.required) = true];
+}
+
+// 集群身份。
+message ClusterConfig {
+  // 集群名
+  string name = 1 [(config.required) = true];
+  Env env = 2 [(config.required) = true, (config.env_value) = true];
+  // 世界编号，从 1 起
+  uint32 world_id = 3 [(config.required) = true, (config.env_value) = true,
+                 (config.range) = {min: 1, max: 4294967295}];
+}
+
+message EtcdConfig {
+  // etcd 地址，如 http://host:2379
+  repeated string endpoints = 1 [(config.required) = true, (config.env_value) = true, (config.min_count) = 1];
+  // 建立连接的超时
+  uint32 dial_timeout_ms = 2 [(config.default) = "5000", (config.env_value) = true, (config.range) = {min: 1, max: 600000}];
+}
+
+// Redis 集群。
+message RedisConfig {
+  repeated RedisNode nodes = 1 [(config.required) = true, (config.env_value) = true, (config.min_count) = 1];
+  // 用 ${ENV:...} 或 ${FILE:...} 引用，不要写明文
+  string password = 2 [(config.required) = true, (config.env_value) = true, (config.secret) = true];
+  uint32 connect_timeout_ms = 3 [(config.default) = "5000", (config.range) = {min: 1, max: 600000}];
+}
+
+message RedisNode {
+  string host = 1 [(config.required) = true];
+  uint32 port = 2 [(config.required) = true, (config.range) = {min: 1, max: 65535}];
+}
+
+message MongoConfig {
+  // 连接串，含账号密码，所以按密钥处理；用 ${ENV:...} 引用
+  string uri = 1 [(config.required) = true, (config.env_value) = true, (config.secret) = true];
+  string database = 2 [(config.required) = true, (config.env_value) = true];
+  uint32 connect_timeout_ms = 3 [(config.default) = "5000", (config.range) = {min: 1, max: 600000}];
+}

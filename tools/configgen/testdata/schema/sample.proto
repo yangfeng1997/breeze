@@ -1,0 +1,58 @@
+// 覆盖生成器全部特性的样例：标量、枚举、嵌套、容器、optional、import、secret、reloadable、range、
+// min_count、默认值。
+syntax = "proto3";
+
+package config.sample;
+
+import "options.proto";
+import "sample_types.proto";
+
+// 工作模式。
+enum Mode {
+  MODE_UNSPECIFIED = 0;
+  MODE_FAST = 1;
+  MODE_SAFE = 2;
+  MODE_DROP_OLDEST = 3;
+}
+
+// 账号。
+message Creds {
+  string user = 1 [(config.default) = "u"];
+  // 密码，打印时打码
+  string password = 2 [(config.secret) = true];
+  int32 pin = 3 [(config.secret) = true];
+}
+
+message Tuning {
+  int32 a = 1 [(config.default) = "1"];
+  int32 b = 2 [(config.default) = "2"];
+}
+
+// 网关服配置。
+message GateConfig {
+  option (config.root) = true;
+
+  string name = 1 [(config.default) = "gate"];
+  // TCP 监听端口
+  uint32 tcp_port = 2 [(config.required) = true, (config.range) = {min: 1, max: 65535}];
+  uint32 heartbeat_sec = 3 [(config.default) = "30", (config.reloadable) = true];
+  double ratio = 4 [(config.default) = "0.5", (config.range) = {min: 0, max: 1},
+                    (config.reloadable) = true];
+  uint64 big = 5 [(config.default) = "18446744073709551615"];
+  int32 neg = 6 [(config.default) = "-5", (config.range) = {min: -10, max: 10}];
+  float small_f = 7 [(config.default) = "1.5"];
+  bool on = 8 [(config.default) = "true"];
+  Mode mode = 9 [(config.default) = "fast", (config.env_value) = true];
+  config.sample_types.Level level = 10 [(config.default) = "info"];
+  repeated Mode modes = 11;
+  Creds creds = 12;
+  Tuning tuning = 13 [(config.reloadable) = true];
+  repeated config.sample_types.Endpoint endpoints = 14;
+  map<string, int32> limits = 15;
+  map<string, config.sample_types.Endpoint> by_name = 16;
+  optional int32 opt = 17;
+  optional config.sample_types.Endpoint opt_ep = 18;
+  repeated string tags = 20;
+  // 至少要有一个元素
+  repeated string seeds = 21 [(config.min_count) = 1];
+}

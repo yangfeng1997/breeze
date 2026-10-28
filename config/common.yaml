@@ -1,0 +1,32 @@
+# 所有服务共用的配置，结构见 schema/common.proto。写全量：schema 里的每个字段都在这里出现，
+# 包括取默认值的。配置的全貌看这里，不用去翻 schema 的 default。
+#
+# 与 env/<环境>.yaml 合并使用，后者覆盖前者（map 递归合并，标量与列表整体替换）：
+#   Config::Load({"common.yaml", "env/dev.yaml"})
+#
+# 因环境而异的字段在 schema 里标了 env_value：
+#   - env/*.yaml 只能覆盖这些字段，覆盖别的字段测试会失败；
+#   - 每个环境文件都要把它们全部写出来，不靠继承（漏写会悄悄沿用这里的本机值）；
+#   - 这里写的是本机开发的默认值，单独读 common.yaml 就是一份能跑的开发配置。
+# schema 加了字段、yaml 漏写或多写，tools/configgen 的 test_shipped_config_* 会失败。
+#
+# 密钥不写明文，用 ${ENV:名字} 或 ${FILE:路径} 引用，部署时注入；只有本机默认值带 :-默认。
+
+cluster:
+  name: gameserver
+  env: dev                       # env_value
+  world_id: 1                    # env_value
+
+etcd:
+  endpoints: ['http://127.0.0.1:2379']   # env_value
+  dial_timeout_ms: 5000                  # env_value
+
+redis:
+  nodes: [{ host: 127.0.0.1, port: 6379 }]   # env_value
+  password: ${ENV:BREEZE_REDIS_PWD:-}        # env_value
+  connect_timeout_ms: 5000
+
+mongo:
+  uri: ${ENV:BREEZE_MONGO_URI:-mongodb://127.0.0.1:27017}   # env_value
+  database: breeze                                          # env_value
+  connect_timeout_ms: 5000

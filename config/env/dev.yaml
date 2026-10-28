@@ -1,0 +1,18 @@
+# 开发环境：本机直连，密钥有开发用默认值，开箱即用。
+# 只能写 schema 里标了 env_value 的字段，且要写全（见 common.yaml 头部）。地址是占位，按实际开发机调整。
+
+cluster:
+  env: dev
+  world_id: 1
+
+etcd:
+  endpoints: ['http://127.0.0.1:2379']
+  dial_timeout_ms: 5000
+
+redis:
+  nodes: [{ host: 127.0.0.1, port: 6379 }]
+  password: ${ENV:BREEZE_REDIS_PWD:-}
+
+mongo:
+  uri: ${ENV:BREEZE_MONGO_URI:-mongodb://127.0.0.1:27017}
+  database: breeze

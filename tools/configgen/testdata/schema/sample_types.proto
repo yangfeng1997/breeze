@@ -1,0 +1,21 @@
+// 被 sample.proto import 的共享类型。
+syntax = "proto3";
+
+package config.sample_types;
+
+import "options.proto";
+
+// 日志级别。
+enum Level {
+  LEVEL_UNSPECIFIED = 0;
+  LEVEL_DEBUG = 1;
+  LEVEL_INFO = 2;
+  LEVEL_WARN = 3;
+  LEVEL_ERROR = 4;
+}
+
+// 一个网络端点。
+message Endpoint {
+  string host = 1 [(config.required) = true];
+  uint32 port = 2 [(config.required) = true, (config.range) = {min: 1, max: 65535}];
+}

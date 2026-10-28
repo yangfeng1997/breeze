@@ -1,0 +1,25 @@
+# 生产环境。地址是占位（*.prod.internal），换成真实地址；密钥与 world_id 由部署注入，没有默认值。
+# 只能写 schema 里标了 env_value 的字段，且要写全（见 common.yaml 头部）。
+# cluster.env 必须写 prod：启动时与 --env 核对，防止拿错环境的配置。
+
+cluster:
+  env: prod
+  world_id: ${ENV:BREEZE_WORLD_ID}
+
+etcd:
+  endpoints:
+    - http://etcd-1.prod.internal:2379
+    - http://etcd-2.prod.internal:2379
+    - http://etcd-3.prod.internal:2379
+  dial_timeout_ms: 3000
+
+redis:
+  nodes:
+    - { host: redis-1.prod.internal, port: 6379 }
+    - { host: redis-2.prod.internal, port: 6379 }
+    - { host: redis-3.prod.internal, port: 6379 }
+  password: ${ENV:BREEZE_REDIS_PWD}
+
+mongo:
+  uri: ${ENV:BREEZE_MONGO_URI}
+  database: breeze

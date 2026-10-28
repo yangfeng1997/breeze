@@ -6,6 +6,9 @@
 # 生成代码（src/go/gen、src/cpp/gen）
 /src/*/gen/
 
+# Python 字节码（tools/configgen 的测试会产生）
+__pycache__/
+
 # 构建 / 运行输出目录（见 scripts/setup_windows_env.ps1 的 build.py 用法）
 /run/
 /build/

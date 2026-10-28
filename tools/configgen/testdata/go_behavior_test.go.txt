@@ -1,0 +1,115 @@
+package config
+
+import (
+	"reflect"
+	"strings"
+	"testing"
+)
+
+// 与 C++ 侧 configgen_cpp_test.cpp 同一份 schema、同一组期望：两种语言的行为要一致。
+
+func TestDefaults(t *testing.T) {
+	c := NewGateConfig()
+	if c.Name != "gate" || c.HeartbeatSec != 30 || c.Ratio != 0.5 || c.Neg != -5 || c.SmallF != 1.5 || !c.On {
+		t.Fatalf("标量默认值不对: %+v", c)
+	}
+	if c.Big != 18446744073709551615 {
+		t.Fatalf("uint64 默认值不对: %d", c.Big)
+	}
+	if c.Mode != ModeFast || c.Level != LevelInfo {
+		t.Fatalf("枚举默认值不对: %v %v", c.Mode, c.Level)
+	}
+	if c.Creds.User != "u" || c.Tuning.A != 1 || c.Tuning.B != 2 {
+		t.Fatalf("嵌套结构体的默认值没有填: %+v %+v", c.Creds, c.Tuning)
+	}
+	if c.Modes != nil || c.Endpoints != nil || c.Opt != nil || c.OptEp != nil {
+		t.Fatalf("容器 / optional 默认应该是空")
+	}
+}
+
+func TestValidate(t *testing.T) {
+	good := NewGateConfig()
+	good.TcpPort = 80
+	good.Seeds = []string{"a"} // min_count: 1
+	if err := good.Validate(); err != nil {
+		t.Fatalf("合法配置被拒绝: %v", err)
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(*GateConfig)
+		want   string
+	}{
+		{"范围", func(c *GateConfig) { c.TcpPort = 70000 }, "tcp_port"},
+		{"负数范围", func(c *GateConfig) { c.Neg = 11 }, "neg"},
+		{"浮点范围", func(c *GateConfig) { c.Ratio = 1.5 }, "ratio"},
+		{"枚举", func(c *GateConfig) { c.Mode = "turbo" }, "mode"},
+		{"import 的枚举", func(c *GateConfig) { c.Level = "trace" }, "level"},
+		{"list 元素的枚举", func(c *GateConfig) { c.Modes = []Mode{ModeFast, "bad"} }, "modes[1]"},
+		{"list 里的结构体", func(c *GateConfig) { c.Endpoints = []Endpoint{{Host: "a", Port: 0}} }, "endpoints[0]"},
+		{"optional 结构体", func(c *GateConfig) { c.OptEp = &Endpoint{Host: "a", Port: 99999} }, "opt_ep"},
+		{"map 里的结构体", func(c *GateConfig) { c.ByName = map[string]Endpoint{"m": {Host: "a", Port: 0}} }, "by_name.m"},
+		{"min_count", func(c *GateConfig) { c.Seeds = []string{} }, "seeds"},
+	}
+	for _, tc := range cases {
+		c := good
+		tc.mutate(&c)
+		err := c.Validate()
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: 期望错误里含 %q，实际 %v", tc.name, tc.want, err)
+		}
+	}
+}
+
+func TestRequiredKeys(t *testing.T) {
+	if got := (GateConfig{}).RequiredKeys(); !reflect.DeepEqual(got, []string{"tcp_port"}) {
+		t.Errorf("GateConfig 必填键: %v", got)
+	}
+	if got := (Endpoint{}).RequiredKeys(); !reflect.DeepEqual(got, []string{"host", "port"}) {
+		t.Errorf("Endpoint 必填键: %v", got)
+	}
+	if got := (Tuning{}).RequiredKeys(); got != nil {
+		t.Errorf("Tuning 没有必填键: %v", got)
+	}
+}
+
+func TestRedacted(t *testing.T) {
+	c := NewGateConfig()
+	c.Creds.Password = "hunter2"
+	c.Creds.Pin = 4321
+	c.Endpoints = []Endpoint{{Host: "a", Port: 80}}
+	r := c.Redacted()
+	if r.Creds.Password != "***" || r.Creds.Pin != 0 || r.Creds.User != "u" {
+		t.Fatalf("打码结果不对: %+v", r.Creds)
+	}
+	if c.Creds.Password != "hunter2" || c.Creds.Pin != 4321 {
+		t.Fatalf("原对象被改了: %+v", c.Creds)
+	}
+	r.Endpoints[0].Host = "changed" // 副本里的切片不能和原对象共享底层数组
+	if c.Endpoints[0].Host != "a" {
+		t.Fatalf("Redacted 的切片与原对象共享了内存")
+	}
+}
+
+func TestNonReloadableChanges(t *testing.T) {
+	cur := NewGateConfig()
+	cur.Endpoints = []Endpoint{{Host: "a", Port: 80}}
+
+	next := cur
+	next.HeartbeatSec = 99 // reloadable
+	next.Ratio = 0.9       // reloadable
+	next.Tuning.A = 100    // tuning 整个子树 reloadable
+	if got := cur.NonReloadableChanges(next); len(got) != 0 {
+		t.Fatalf("只改了可热更的字段，却报了 %v", got)
+	}
+
+	next.TcpPort = 8001
+	next.Name = "other"
+	next.Creds.Password = "new" // secret 一定不可热更
+	next.Endpoints = append([]Endpoint{}, cur.Endpoints...)
+	next.Endpoints = append(next.Endpoints, Endpoint{Host: "b", Port: 81})
+	want := []string{"name", "tcp_port", "creds.password", "endpoints"}
+	if got := cur.NonReloadableChanges(next); !reflect.DeepEqual(got, want) {
+		t.Fatalf("期望 %v，实际 %v", want, got)
+	}
+}

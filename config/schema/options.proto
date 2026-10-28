@@ -1,0 +1,45 @@
+// 配置 schema 的自定义 option。tools/configgen 生成 C++ / Go / JSON Schema 时读取。
+//
+// 用法：
+//   import "options.proto";
+//   uint32 tcp_port = 1 [(config.required) = true, (config.range) = {min: 1, max: 65535}];
+//
+// 编号 52001-52007（FieldOptions）、52101（MessageOptions）由本项目配置占用。
+// docs/Actor模型与RPC设计.md 里 actor 的 option 用 51001-51003，别重叠。
+// 改编号或新增 option 时，要同步 tools/configgen/configgen.py 里的 OPTION_NUMBERS，生成器启动时会核对。
+
+syntax = "proto3";
+
+package config;
+
+import "google/protobuf/descriptor.proto";
+
+// 数值范围，闭区间。int64 / uint64 的边界超过 2^53 会丢精度，生成器会拒绝。
+message Range {
+  double min = 1;
+  double max = 2;
+}
+
+extend google.protobuf.FieldOptions {
+  // 键必须存在（按是否写了判断，0 也是合法值）。与 default 互斥。
+  bool required = 52001;
+  // 敏感字段：打印时显示 ***，ConfigRedacted 里打码。不能有默认值，与 reloadable 互斥。
+  bool secret = 52002;
+  // 允许热更，默认不允许。标在结构体字段上表示整个子树可热更。
+  bool reloadable = 52003;
+  // 默认值，写成字符串，按字段类型解析：数字 "30"、布尔 "true"、枚举写 yaml 里的名字 "fast"。
+  string default = 52004;
+  // 数值范围。
+  Range range = 52005;
+  // repeated / map 字段的最少元素个数。
+  uint32 min_count = 52006;
+  // 这个字段因环境而异：config/env/*.yaml 只能覆盖标了 env_value 的字段，且每个环境文件都要写出来（不靠继承，
+  // 防止漏写时悄悄沿用别的环境的值）；common.yaml 里也要有这个字段（写全量）。只能标在叶子字段上。
+  // 只影响校验（JSON Schema 的 x-env-value，由 tools/configgen 的测试检查），不改变生成的 C++ / Go。
+  bool env_value = 52007;
+}
+
+extend google.protobuf.MessageOptions {
+  // 为这个 message 生成 JSON Schema（给编辑器补全、拼写检查）。
+  bool root = 52101;
+}
