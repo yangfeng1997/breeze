@@ -23,6 +23,28 @@ enum class CloseReason : std::uint8_t
     SlowConsumer,  // 发送积压超过 HighWaterMark
     IoError,       // 读写出错，errno 见 OnClosed 的 sys_errno
 };
+inline constexpr std::size_t kCloseReasonCount = static_cast<std::size_t>(CloseReason::IoError) + 1;
+
+// 日志用。
+constexpr const char* ToString(CloseReason r) noexcept
+{
+    switch (r)
+    {
+        case CloseReason::PeerClosed:
+            return "PeerClosed";
+        case CloseReason::LocalClose:
+            return "LocalClose";
+        case CloseReason::IdleTimeout:
+            return "IdleTimeout";
+        case CloseReason::ProtocolError:
+            return "ProtocolError";
+        case CloseReason::SlowConsumer:
+            return "SlowConsumer";
+        case CloseReason::IoError:
+            return "IoError";
+    }
+    return "?";
+}
 
 class ConnectionHandler
 {

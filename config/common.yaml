@@ -30,3 +30,20 @@ mongo:
   uri: ${ENV:BREEZE_MONGO_URI:-mongodb://127.0.0.1:27017}   # env_value
   database: breeze                                          # env_value
   connect_timeout_ms: 5000
+
+# 网络库（framework/net 的 NetModule）。取的都是生产默认值，字段含义见 schema/net.proto；
+# 面向客户端的进程（gate）在部署配置里设 idle_timeout_ms。
+net:
+  io_threads: 4
+  max_connections_per_loop: 65536
+  high_water_mark_bytes: 262144
+  idle_timeout_ms: 0
+  keepalive_idle_s: 60
+  keepalive_interval_s: 10
+  keepalive_count: 3
+  tcp_user_timeout_ms: 0
+  inbound_max_messages_per_conn: 256
+  inbound_max_bytes_per_conn: 65536
+  inbound_global_budget_mb: 256
+  wake_budget: 1024
+  shutdown_deadline_ms: 5000

@@ -1,6 +1,8 @@
 #include "connection_handle.h"
 
+#include <algorithm>
 #include <cstdio>
+#include <limits>
 
 #include "connection_handler.h"
 #include "event_loop.h"
@@ -33,10 +35,13 @@ SendResult ConnectionHandle::Send(SharedBuffer payload) const
 {
     EventLoop* loop = ResolveLoop(*this);
     if (loop == nullptr)
-        return SendResult::Closed;
+        return SendResult::Closed; // group 已销毁：没有 loop 可记
     ConnectionTable::Slot* s = loop->table().Find(slot(), generation());
     if (s == nullptr)
+    {
+        LoopStats::Add(loop->stats().send_closed_stale);
         return SendResult::Closed;
+    }
 
     // 水位：先累加再比较（校验与累加不是原子的，见 ConnectionTable 头注释）。超限就把这次的份额退回去，
     // 本条消息不发，并让连接以 SlowConsumer 关闭。
@@ -45,6 +50,7 @@ SendResult ConnectionHandle::Send(SharedBuffer payload) const
     if (pending > s->high_water.load(std::memory_order_relaxed))
     {
         s->pending_bytes.fetch_sub(len, std::memory_order_relaxed);
+        LoopStats::Add(loop->stats().send_closed_slow_consumer);
         loop->PostOp(EventLoop::Op::Close, *this, static_cast<std::uint32_t>(CloseReason::SlowConsumer), {});
         return SendResult::Closed;
     }
@@ -56,6 +62,27 @@ void ConnectionHandle::Close() const
 {
     if (EventLoop* loop = ResolveLoop(*this))
         loop->PostOp(EventLoop::Op::Close, *this, static_cast<std::uint32_t>(CloseReason::LocalClose), {});
+}
+
+void ConnectionHandle::CloseGracefully(std::chrono::milliseconds timeout) const
+{
+    EventLoop* loop = ResolveLoop(*this);
+    if (loop == nullptr)
+        return;
+    const auto ms = std::clamp<std::int64_t>(timeout.count(), 0, std::numeric_limits<std::uint32_t>::max());
+    loop->PostOp(EventLoop::Op::CloseGracefully, *this, static_cast<std::uint32_t>(ms), {});
+}
+
+void ConnectionHandle::PauseRead() const
+{
+    if (EventLoop* loop = ResolveLoop(*this))
+        loop->PostOp(EventLoop::Op::PauseRead, *this, 0, {});
+}
+
+void ConnectionHandle::ResumeRead() const
+{
+    if (EventLoop* loop = ResolveLoop(*this))
+        loop->PostOp(EventLoop::Op::ResumeRead, *this, 0, {});
 }
 
 } // namespace breeze

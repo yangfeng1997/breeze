@@ -7,12 +7,17 @@
 //   breeze 本库的 ConnectionHandler 直接回调（LoopServer + LengthPrefixCodec），echo 用视图版 Send，不拷贝（与 muduo
 //   同一方案） breeze-copy  同 breeze，但 echo 先拷成 SharedBuffer 再发（旧写法，留作参照） breeze-fixed  诊断用：同
 //   breeze，但回复预先建好的固定 payload（不分配、不拷贝），用来把框架开销与 echo 里的拷贝分开
+//   breeze-mainloop  本库 + framework/net（§9 第 4 组）：真实的 App::Run 主循环 + NetModule（1 个 IO 线程），IO
+//   线程把事件 回投主循环，业务在主循环线程上经 ConnectionHandle::Send 回显。与 breeze 的差就是 MainLoopExecutor
+//   的代价：拷成 SharedBuffer、事件入队、唤醒主循环、两次线程跳转、回包经任务队列
 // raw 与 muduo 把收到的字节原样写回；breeze 先分帧、再把 payload 拷成 SharedBuffer 发回——这是框架多出来的真实成本，
 // 所以对比里 breeze 比 raw / muduo 多做了分帧与一次拷贝。
 //
 // 压测方式：每条连接闭环 ping-pong（发一帧、等完整回包、再发下一帧），预热后计时。
-// 用法：net_bench --impl raw|raw-iov|muduo|breeze|breeze-copy|breeze-fixed --transport tcp|uds --size 64 --conns 64
+// 用法：net_bench --impl raw|raw-iov|muduo|breeze|breeze-copy|breeze-fixed|breeze-mainloop --transport tcp|uds --size
+// 64 --conns 64
 //                 [--duration 3] [--warmup 1] [--client-threads 4] [--server-cpu 2] [--client-cpus 4,6,8,10]
+//                 [--mainloop-cpu 12]   breeze-mainloop 的主循环线程绑哪个核（IO 线程用 --server-cpu）
 
 #include <poll.h>
 #include <sched.h>
@@ -31,14 +36,18 @@
 #include <cstring>
 #include <future>
 #include <memory>
+#include <stop_token>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "app.h"
 #include "connection.h"
+#include "group_access.h"
 #include "length_prefix_codec.h"
 #include "loop_server.h"
 #include "loop_thread.h"
+#include "net_module.h"
 
 #ifdef BREEZE_BENCH_MUDUO
 #include <muduo/base/Logging.h>
@@ -51,7 +60,7 @@ using namespace breeze;
 namespace
 {
 
-using Clock = std::chrono::steady_clock;
+using BenchClock = std::chrono::steady_clock; // 不叫 Clock：framework 的 module.h 里有 breeze::Clock，会二义
 
 [[noreturn]] void Die(const char* what)
 {
@@ -75,7 +84,7 @@ void PinTo(int cpu)
     sched_setaffinity(0, sizeof(set), &set); // 绑定调用线程
 }
 
-struct Options
+struct BenchOptions
 {
     std::string impl = "breeze";
     std::string transport = "tcp";
@@ -85,6 +94,7 @@ struct Options
     int warmup_s = 1;
     int client_threads = 4;
     int server_cpu = -1;
+    int mainloop_cpu = -1;
     std::vector<int> client_cpus;
 };
 
@@ -116,6 +126,8 @@ public:
     virtual pthread_t ServerThread() = 0;
     // 服务端 loop 已经跑过的轮数；没有"轮"概念的实现返回 0。
     virtual std::uint64_t Iterations() { return 0; }
+    // 除 IO 线程之外还有第二个服务端线程（主循环）的实现返回它，否则 0：同样读它的 CPU 时间，看瓶颈在哪一个。
+    virtual pthread_t ExtraThread() { return 0; }
 };
 
 // 裸 epoll：水平触发，读多少原样写回多少。
@@ -350,6 +362,114 @@ private:
     std::unique_ptr<LoopServer> srv_;
 };
 
+// 本库 + framework/net：真实的 App::Run 主循环 + NetModule（1 个 IO
+// 线程），业务在主循环线程上经句柄把收到的消息原样发回 （SharedBuffer 在 IO
+// 线程拷出来、主循环线程直接发回，不再拷）。比 breeze 多出的就是 MainLoopExecutor 的代价。
+class MainLoopServer final : public EchoServer
+{
+    class EchoBiz final : public MainLoopHandler
+    {
+    public:
+        void OnMessage(ConnectionHandle h, SharedBuffer msg) override { (void)h.Send(std::move(msg)); }
+    };
+
+    class BizModule final : public Module
+    {
+    public:
+        BizModule(App& a, EchoBiz& biz, std::string listen, std::promise<Endpoint>& ready)
+            : Module(a)
+            , biz_(biz)
+            , listen_(std::move(listen))
+            , ready_(ready)
+        {
+        }
+        std::string_view Name() const override { return "biz"; }
+        std::vector<std::string_view> DependsOn() const override { return {"net"}; }
+        Result<> Init() override
+        {
+            auto s = app().GetModule<NetModule>("net")->AddServer(listen_, biz_, factory_);
+            if (!s)
+                return std::unexpected(s.error());
+            server_ = *s;
+            return {};
+        }
+        Result<> Start() override
+        {
+            ready_.set_value(server_->endpoint());
+            return {};
+        }
+
+    private:
+        EchoBiz& biz_;
+        std::string listen_;
+        LengthPrefixCodecFactory factory_{1024 * 1024};
+        std::promise<Endpoint>& ready_;
+        NetServer* server_ = nullptr;
+    };
+
+public:
+    explicit MainLoopServer(int mainloop_cpu)
+        : mainloop_cpu_(mainloop_cpu)
+    {
+    }
+
+    Endpoint Start(const Endpoint& ep, int cpu) override
+    {
+        NetModuleOptions no;
+        no.group = {1, 1u << 16}; // 连接表要装得下 10k 连接
+        app_ = std::make_unique<App>("bench");
+        app_->RegisterModule(
+            [&](App& a)
+            {
+                auto m = std::make_unique<NetModule>(a, no);
+                net_ = m.get();
+                return m;
+            });
+        std::promise<Endpoint> ready;
+        app_->RegisterModule([&](App& a) { return std::make_unique<BizModule>(a, biz_, ep.ToString(), ready); });
+        auto bound = ready.get_future();
+        thread_ = std::thread(
+            [this]
+            {
+                PinTo(mainloop_cpu_);
+                result_ = app_->Run(stop_.get_token());
+                if (!result_)
+                    Die(result_.error().msg.c_str());
+            });
+        const Endpoint actual = bound.get(); // Run 失败时 Die 会退出进程，不会一直等
+        EventLoop& loop = GroupAccess::LoopAt(net_->group(), 0);
+        std::promise<pthread_t> io;
+        loop.Post(
+            [&io, cpu]
+            {
+                PinTo(cpu);
+                io.set_value(pthread_self());
+            });
+        io_thread_ = io.get_future().get();
+        return actual;
+    }
+    void Stop() override
+    {
+        stop_.request_stop();
+        thread_.join();
+        // 压测客户端已经全部关闭：不排空，直接销毁（group 析构兜底停 IO 线程）。
+        app_.reset();
+    }
+    pthread_t ServerThread() override { return io_thread_; }
+    pthread_t ExtraThread() override { return thread_.native_handle(); }
+    std::uint64_t Iterations() override { return GroupAccess::LoopAt(net_->group(), 0).Iterations(); }
+
+private:
+    int mainloop_cpu_;
+    EchoBiz biz_;
+    std::unique_ptr<App> app_;
+    NetModule* net_ = nullptr;
+    std::stop_source stop_;
+    Result<> result_;
+    std::thread thread_;
+    pthread_t io_thread_{};
+};
+
 #ifdef BREEZE_BENCH_MUDUO
 class MuduoServer final : public EchoServer
 {
@@ -407,7 +527,7 @@ private:
 };
 #endif
 
-std::unique_ptr<EchoServer> MakeServer(const std::string& impl, std::size_t size)
+std::unique_ptr<EchoServer> MakeServer(const std::string& impl, std::size_t size, int mainloop_cpu)
 {
     if (impl.rfind("raw", 0) == 0)
     {
@@ -425,6 +545,8 @@ std::unique_ptr<EchoServer> MakeServer(const std::string& impl, std::size_t size
         return std::make_unique<BreezeServer>(std::make_unique<CopyEchoHandler>());
     if (impl == "breeze-fixed")
         return std::make_unique<BreezeServer>(std::make_unique<FixedReplyHandler>(size));
+    if (impl == "breeze-mainloop")
+        return std::make_unique<MainLoopServer>(mainloop_cpu);
 #ifdef BREEZE_BENCH_MUDUO
     if (impl == "muduo")
         return std::make_unique<MuduoServer>();
@@ -512,7 +634,7 @@ public:
                 if (measuring.load(std::memory_order_relaxed))
                 {
                     const auto lat =
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - c.sent_at).count();
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(BenchClock::now() - c.sent_at).count();
                     result_.lat_ns.push_back(static_cast<std::uint32_t>(std::min<std::int64_t>(lat, UINT32_MAX)));
                     ++result_.msgs;
                 }
@@ -532,12 +654,12 @@ private:
         std::vector<std::byte> rbuf;
         std::size_t got = 0;
         bool verified = false;
-        Clock::time_point sent_at;
+        BenchClock::time_point sent_at;
     };
 
     void SendNext(Conn& c)
     {
-        c.sent_at = Clock::now();
+        c.sent_at = BenchClock::now();
         std::size_t off = 0;
         while (off < frame_.size())
         {
@@ -585,7 +707,7 @@ double Percentile(const std::vector<std::uint32_t>& sorted, double p)
 
 int main(int argc, char** argv)
 {
-    Options o;
+    BenchOptions o;
     for (int i = 1; i < argc; ++i)
     {
         const std::string a = argv[i];
@@ -611,6 +733,8 @@ int main(int argc, char** argv)
             o.client_threads = std::atoi(next().c_str());
         else if (a == "--server-cpu")
             o.server_cpu = std::atoi(next().c_str());
+        else if (a == "--mainloop-cpu")
+            o.mainloop_cpu = std::atoi(next().c_str());
         else if (a == "--client-cpus")
             o.client_cpus = ParseCpus(next());
         else
@@ -645,7 +769,7 @@ int main(int argc, char** argv)
         Die("--transport 只能是 tcp 或 uds");
     REQUIRE(listen_ep.has_value());
 
-    auto server = MakeServer(o.impl, o.size);
+    auto server = MakeServer(o.impl, o.size, o.mainloop_cpu);
     const Endpoint ep = server->Start(*listen_ep, o.server_cpu);
 
     std::vector<std::unique_ptr<Worker>> workers;
@@ -681,13 +805,16 @@ int main(int argc, char** argv)
     go = true;
     std::this_thread::sleep_for(std::chrono::seconds(o.warmup_s));
     const double cpu0 = ThreadCpuSeconds(server->ServerThread());
+    const bool has_extra = server->ExtraThread() != 0;
+    const double extra0 = has_extra ? ThreadCpuSeconds(server->ExtraThread()) : 0.0;
     const std::uint64_t iter0 = server->Iterations();
-    const auto t0 = Clock::now();
+    const auto t0 = BenchClock::now();
     measuring = true;
     std::this_thread::sleep_for(std::chrono::seconds(o.duration_s));
     measuring = false;
-    const auto t1 = Clock::now();
+    const auto t1 = BenchClock::now();
     const double cpu1 = ThreadCpuSeconds(server->ServerThread());
+    const double extra1 = has_extra ? ThreadCpuSeconds(server->ExtraThread()) : 0.0;
     const std::uint64_t iters = server->Iterations() - iter0;
     stop = true;
     for (auto& t : threads)
@@ -719,5 +846,7 @@ int main(int argc, char** argv)
         Percentile(lat, 0.99) / 1000.0,
         (cpu1 - cpu0) / secs * 100.0,
         iters == 0 ? 0.0 : static_cast<double>(msgs) / static_cast<double>(iters));
+    if (has_extra) // 第二个服务端线程（主循环）的 CPU 占用，单独一行以免打乱 RESULT 的固定字段
+        std::printf("EXTRA main_cpu_pct=%.0f\n", (extra1 - extra0) / secs * 100.0);
     return 0;
 }

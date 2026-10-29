@@ -171,6 +171,8 @@ int SetKeepAlive(int fd, const KeepAlive& ka)
     return 0;
 }
 
+int SetUserTimeout(int fd, int ms) { return SetIntOpt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, ms); }
+
 int Bind(int fd, const Endpoint& ep)
 {
     if (ep.kind() == Endpoint::Kind::Unix)

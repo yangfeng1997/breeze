@@ -68,6 +68,7 @@ int Create(const Endpoint& ep, Fd& out);
 int SetNoDelay(int fd);
 int SetReuseAddr(int fd);
 int SetKeepAlive(int fd, const KeepAlive& ka); // 仅 TCP
+int SetUserTimeout(int fd, int ms);            // 仅 TCP：TCP_USER_TIMEOUT，不开 keepalive 时单独用
 
 // UDS 路径会先探测残留的 socket 文件：连得上（有人在监听）→ EADDRINUSE；连不上（残留）→ unlink 后再 bind；
 // 路径上不是 socket 的文件不动，直接 EADDRINUSE。

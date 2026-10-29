@@ -18,9 +18,12 @@
 - `src/cpp` — C++ 侧，`CMakeLists.txt` 在此。`framework/app` 对照 Go 版
   `src/go/core/app` 实现，语义以后者的 CLAUDE.md 为准。
   `base/queue` 是 SPSC/MPSC 无锁队列（包 moodycamel，公开 API 不暴露其类型），网络库的底座；
-  `base/net` 是 Reactor 网络库（仅 Linux），目前有 `Endpoint` / `SharedBuffer` / `Buffer` / `FrameCodec` 等基础件，
-  `EventLoop` / `Connection` / `Acceptor` 已有（单 loop，`ConnectionHandle` 与 `EventLoopGroup` 起在建中）；
+  `base/net` 是 Reactor 网络库（仅 Linux）：`Endpoint` / `SharedBuffer` / `Buffer` / `FrameCodec` 等基础件，
+  `EventLoop` / `Connection` / `ConnectionHandle` / `EventLoopGroup` / `NetServer` / `NetClient`（含重连）已完整，
+  `framework/net` 有 `MainLoopExecutor`（IO 线程事件回投 App 主循环，带入口背压）与 `NetModule`；
+  **`NetModule` 的停机由 main 负责**：`App::Run` 返回后在同一个线程调 `NetModule::Shutdown()`。
   `base/net/internal/` 是不公开的实现，测试按需加私有 include 路径；
+  **tsan 没有在 WSL 本机跑过**（沙箱里起不来），上真机前见 [docs/网络库设计.md](docs/网络库设计.md) §11.2；
   基线 bench 默认不构建：`cmake --preset release -DBREEZE_BUILD_BENCH=ON`（联网拉 muduo 源码），跑 `src/cpp/bench/run_baseline.sh`；
   `tsan` / `asan` 预设跑消毒器（`cmake --preset tsan`），`tsan.supp` 只压制 moodycamel 的 fence 误报。
   **本机没有 `protoc` 时不要跑全量构建**（`breeze_config_schemas` 要它），按 target 构建：`cmake --build build/cpp --target <名>`
@@ -34,8 +37,9 @@
   C++ 框架的 `ConfigModule`（`src/cpp/framework/kernel/config_module.h`）只加载 `--config` 传入的**一个**文件，
   不隐式找 env / 业务文件；业务自己的 yaml 由业务自己 `Config::Load`。
   `common_config_test` 会读这些真实文件，改 schema 或 yaml 后对不上会失败。`tools/configgen` 从 schema 生成 C++ / Go / JSON Schema（需要 `protoc`），
-  用法与 schema 格式见 [tools/configgen/CLAUDE.md](tools/configgen/CLAUDE.md)。目前只有 `common.proto`
-  （cluster / etcd / redis / mongo）；生成器自带样例在 `tools/configgen/testdata/schema/`
+  用法与 schema 格式见 [tools/configgen/CLAUDE.md](tools/configgen/CLAUDE.md)。目前有 `common.proto`
+  （cluster / etcd / redis / mongo，另引用 `net.proto` 的 `net` 段：网络库，字段全有生产默认值，段本身非 required）；
+  生成器自带样例在 `tools/configgen/testdata/schema/`
 - `docs/` — 设计文档。服务间通信的基线是
   [docs/Actor模型与RPC设计.md](docs/Actor模型与RPC设计.md)：实现 RPC 或 actor 层前先读它。
   C++ 网络库（`base/queue` / `base/net` / `framework/net`）的设计基线是

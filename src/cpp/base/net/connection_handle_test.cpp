@@ -29,11 +29,6 @@ using namespace breeze::testing;
 namespace
 {
 
-SharedBuffer Buf(std::string_view s)
-{
-    return SharedBuffer::CopyFrom({reinterpret_cast<const std::byte*>(s.data()), s.size()});
-}
-
 // 记录每条连接的句柄与关闭原因；默认不回显（要回显的用例自己开）。
 class Recorder final : public ConnectionHandler
 {
@@ -226,7 +221,8 @@ void TestStaleHandleDoesNotReachReusedSlot()
 
     CHECK(hc.Send(Buf("to-C")) == SendResult::Ok);
     CHECK(c.RecvFrame() == "to-C"); // 第一帧就是它：旧句柄的发送没有串进来，C 也还活着
-    CHECK(s.loop().table().PendingBytes(hc.slot()) == 0);
+    // 记账在 sendmsg 返回之后才扣：客户端已经收到时 IO 线程可能还没扣，要等。
+    CHECK(WaitUntil([&] { return s.loop().table().PendingBytes(hc.slot()) == 0; }));
     CHECK(rec.ClosedCount() == 2); // A、B；C 没被关
 }
 
@@ -336,14 +332,18 @@ void TestSendRacingClose()
     TestClient c(s.ep());
     const ConnectionHandle h = rec.WaitHandle(0);
 
+    // 每个线程发送有上限：任务队列无界，Close 任务排在队尾，且 moodycamel 无 token 出队时先排空较新的生产者，
+    // 主线程这个最老的生产者要等发送线程的积压清完才轮得到。不设上限时 4 个线程比 IO 线程快得多，
+    // 队列越灌越长、Close 永远等不到（实测内存被吃光）。
     constexpr int kThreads = 4;
+    constexpr int kMaxPerThread = 20000;
     std::vector<std::thread> ths;
     for (int t = 0; t < kThreads; ++t)
     {
         ths.emplace_back(
             [&]
             {
-                while (h.Send(Buf("x")) == SendResult::Ok)
+                for (int n = 0; n < kMaxPerThread && h.Send(Buf("x")) == SendResult::Ok; ++n)
                 {
                 }
             });
@@ -351,7 +351,7 @@ void TestSendRacingClose()
     std::this_thread::sleep_for(5ms);
     h.Close();
     for (auto& th : ths)
-        th.join(); // Close 生效之后 Send 返回 Closed，线程自然退出
+        th.join(); // Close 生效之后 Send 返回 Closed，线程提前退出；否则发满上限也退出
     CHECK(c.WaitClosed());
     const auto done = rec.WaitClosed(1);
     CHECK(done[0].second == CloseReason::LocalClose);

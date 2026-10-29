@@ -10,6 +10,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -41,6 +42,15 @@ public:
     };
     static_assert(sizeof(Slot) == 64);
 
+    // 空闲检测用的 last_active_time：单独的连续数组，只有所属 IO 线程访问，idle 扫描只读它，不碰 Connection 对象。
+    // timeout_ms == 0 表示这个槽不参加空闲检测（空槽，或这条连接没开 idle_timeout）。
+    struct IdleEntry
+    {
+        std::chrono::steady_clock::time_point last_active{};
+        std::uint32_t timeout_ms = 0;
+        bool paused = false; // 被 PauseRead 暂停：扫描跳过
+    };
+
     explicit ConnectionTable(std::uint32_t capacity);
     ~ConnectionTable();
 
@@ -71,6 +81,17 @@ public:
     Slot& slot(std::uint32_t i) noexcept { return slots_[i]; }
     // generation 相符且已装了连接才返回；任务在连接关闭之后才到达时用它识别"迟到"。
     Connection* Current(std::uint32_t slot, std::uint32_t generation) noexcept;
+    // 不校验 generation：idle 扫描按槽下标取当前连接。没装连接返回空。
+    Connection* At(std::uint32_t slot) noexcept { return conns_[slot].get(); }
+    IdleEntry& idle(std::uint32_t slot) noexcept { return idle_[slot]; }
+    // 遍历所有已装的连接（停机时用）。f 里可以关闭连接（回收在本轮分发之后），但不能新建连接。
+    template <class F>
+    void ForEachConnection(F&& f)
+    {
+        for (auto& c : conns_)
+            if (c)
+                f(*c);
+    }
     // 销毁连接、generation + 1、清零、放回空闲环尾，并归还名额。
     void Reclaim(std::uint32_t slot);
 
@@ -78,6 +99,7 @@ private:
     std::uint32_t capacity_;
     std::unique_ptr<Slot[]> slots_;
     std::vector<std::unique_ptr<Connection>> conns_;
+    std::vector<IdleEntry> idle_;
     std::vector<std::uint32_t> free_; // 环形队列，容量 = capacity_
     std::uint32_t free_head_ = 0;
     std::uint32_t free_count_ = 0;

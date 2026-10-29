@@ -11,6 +11,7 @@ ConnectionTable::ConnectionTable(std::uint32_t capacity)
     : capacity_(capacity)
     , slots_(std::make_unique<Slot[]>(capacity))
     , conns_(capacity)
+    , idle_(capacity)
     , free_(capacity)
     , free_count_(capacity)
 {
@@ -75,6 +76,7 @@ void ConnectionTable::Reclaim(std::uint32_t slot)
 {
     Slot& s = slots_[slot];
     conns_[slot].reset();
+    idle_[slot] = {};
     // 先让旧句柄失效，再清零：发送方只在 generation 相符时才会累加 pending_bytes。
     s.generation.fetch_add(1, std::memory_order_release);
     s.state.store(State::Free, std::memory_order_release);

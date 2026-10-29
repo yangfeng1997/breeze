@@ -7,6 +7,7 @@
 #include <cerrno>
 #include <climits>
 #include <iterator>
+#include <latch>
 
 #include "connection.h"
 #include "logger.h"
@@ -111,6 +112,24 @@ void EventLoop::Quit()
     t.kind = Task::Kind::Quit;
     tasks_.Enqueue(std::move(t));
     Wake();
+}
+
+int EventLoop::CallSync(std::move_only_function<int()> fn)
+{
+    // 只认"确实正在这个 loop 的线程里"，不能用 InLoopThread()：它对"loop 还没开始运行"一律放行（装配阶段的宽松语义），
+    // 而 group 的线程已经创建、只是还没跑到第一轮时，调用线程会被误判成 loop 线程。
+    if (t_running_loop == this)
+        return fn();
+    int rc = 0;
+    std::latch done(1);
+    Post(
+        [&]
+        {
+            rc = fn();
+            done.count_down();
+        });
+    done.wait();
+    return rc;
 }
 
 void EventLoop::Wake()
@@ -255,6 +274,108 @@ void EventLoop::ProcessClosing()
     }
 }
 
+// ---- 空闲检测 ----
+
+void EventLoop::ArmIdleScan()
+{
+    if (idle_timer_ == 0)
+        idle_timer_ = RunAfter(kIdleScanInterval, [this] { ScanIdle(); });
+}
+
+void EventLoop::IdleRegister(std::uint32_t slot, std::uint32_t timeout_ms)
+{
+    AssertInLoopThread();
+    auto& e = table_->idle(slot);
+    cached_now_ = Now();
+    e.last_active = cached_now_;
+    e.timeout_ms = timeout_ms;
+    e.paused = false;
+    ++idle_active_;
+    ArmIdleScan();
+}
+
+void EventLoop::IdleUnregister(std::uint32_t slot)
+{
+    auto& e = table_->idle(slot);
+    if (e.timeout_ms == 0)
+        return;
+    e.timeout_ms = 0;
+    --idle_active_; // 扫描定时器下次触发时发现没有登记的连接，就不再重装
+}
+
+void EventLoop::IdleSetPaused(std::uint32_t slot, bool paused)
+{
+    auto& e = table_->idle(slot);
+    if (e.timeout_ms == 0)
+        return;
+    e.paused = paused;
+    if (!paused)
+        e.last_active = Now(); // 恢复读时重新计时：过载期间的暂停不算空闲
+}
+
+void EventLoop::ScanIdle()
+{
+    idle_timer_ = 0;
+    if (idle_active_ == 0)
+        return;
+    const auto now = Now();
+    const std::uint32_t cap = table_->capacity();
+    const std::uint32_t chunk = (cap + kIdleScanSlices - 1) / kIdleScanSlices;
+    for (std::uint32_t i = 0; i < chunk; ++i)
+    {
+        const std::uint32_t slot = idle_cursor_;
+        if (++idle_cursor_ == cap)
+            idle_cursor_ = 0;
+        const auto& e = table_->idle(slot);
+        if (e.timeout_ms == 0 || e.paused || now - e.last_active < std::chrono::milliseconds(e.timeout_ms))
+            continue;
+        if (Connection* c = table_->At(slot))
+            c->CloseIdle();
+    }
+    ArmIdleScan();
+}
+
+// ---- 停机 ----
+
+EventLoop::HookId EventLoop::AddShutdownHook(std::move_only_function<void()> fn)
+{
+    AssertInLoopThread();
+    const HookId id = next_hook_id_++;
+    hooks_.emplace_back(id, std::move(fn));
+    return id;
+}
+
+void EventLoop::RemoveShutdownHook(HookId id)
+{
+    AssertInLoopThread();
+    std::erase_if(hooks_, [id](const auto& h) { return h.first == id; });
+}
+
+void EventLoop::BeginShutdown(std::chrono::milliseconds grace)
+{
+    AssertInLoopThread();
+    shutting_down_ = true;
+    // 钩子先搬出来再跑：钩子里调 RemoveShutdownHook 不会破坏正在遍历的容器。
+    auto hooks = std::move(hooks_);
+    hooks_.clear();
+    for (auto& h : hooks)
+        h.second();
+    table_->ForEachConnection(
+        [&](Connection& c)
+        {
+            if (grace.count() == 0)
+                c.Close();
+            else
+                c.CloseGracefully(grace);
+        });
+}
+
+void EventLoop::CloseAllConnections()
+{
+    AssertInLoopThread();
+    table_->ForEachConnection([](Connection& c) { c.Close(); });
+}
+
 // ---- 主循环 ----
 
 void EventLoop::RunTask(Task& t)
@@ -273,10 +394,24 @@ void EventLoop::RunTask(Task& t)
             Connection* c = table_->Current(t.handle.slot(), t.handle.generation());
             if (c == nullptr)
                 break;
-            if (t.op == Op::Send)
-                c->SendFromTask(std::move(t.payload));
-            else
-                c->CloseFromTask(static_cast<CloseReason>(t.arg));
+            switch (t.op)
+            {
+                case Op::Send:
+                    c->SendFromTask(std::move(t.payload));
+                    break;
+                case Op::Close:
+                    c->CloseFromTask(static_cast<CloseReason>(t.arg));
+                    break;
+                case Op::CloseGracefully:
+                    c->CloseGracefully(std::chrono::milliseconds(t.arg));
+                    break;
+                case Op::PauseRead:
+                    c->PauseRead();
+                    break;
+                case Op::ResumeRead:
+                    c->ResumeRead();
+                    break;
+            }
             break;
         }
     }
@@ -317,12 +452,21 @@ void EventLoop::RunOnce(int timeout_ms)
     // 无论被什么唤醒，醒来先清标志，再（在分发到唤醒 fd 时）读空 eventfd。
     sleeping_.store(false, std::memory_order_seq_cst);
 
+    // lag 量的是真实耗时，所以不用可注入的假时钟。
+    const auto busy_start = Clock::now();
+    if (idle_active_ > 0)
+        cached_now_ = Now();
+
     for (int i = 0; i < n; ++i)
         static_cast<Pollable*>(events[i].data.ptr)->OnEvents(events[i].events);
 
     RunTasks(pending);
     RunTimers();
     ProcessClosing();
+
+    const auto lag = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - busy_start).count());
+    if (lag > stats_.max_lag_ns.load(std::memory_order_relaxed))
+        stats_.max_lag_ns.store(lag, std::memory_order_relaxed);
 }
 
 void EventLoop::Run()

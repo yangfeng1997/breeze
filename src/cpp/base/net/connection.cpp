@@ -5,7 +5,9 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
+#include <limits>
 
 #include "event_loop.h"
 #include "logger.h"
@@ -58,13 +60,15 @@ Connection::Connection(EventLoop& loop,
                        ConnectionHandle handle)
     : loop_(loop)
     , fd_(std::move(fd))
-    , peer_(std::move(peer))
     , handler_(handler)
     , codec_(std::move(codec))
     , slot_(slot)
     , slot_index_(slot_index)
-    , handle_(handle)
+    , idle_timeout_ms_(static_cast<std::uint32_t>(
+          std::clamp<std::int64_t>(options.idle_timeout.count(), 0, std::numeric_limits<std::uint32_t>::max())))
     , high_water_(options.high_water_mark)
+    , peer_(std::move(peer))
+    , handle_(handle)
 {
 }
 
@@ -83,6 +87,13 @@ bool Connection::Establish()
     }
     registered_ = true;
     notified_connected_ = true;
+    if (idle_timeout_ms_ != 0)
+    {
+        loop_.IdleRegister(slot_index_, idle_timeout_ms_);
+        idle_registered_ = true;
+    }
+    LOG_DEBUG(
+        "connection established {} peer={}", handle_.ToString(), peer_.endpoint ? peer_.endpoint->ToString() : "-");
     handler_.OnConnected(*this);
     return true;
 }
@@ -92,11 +103,11 @@ bool Connection::Establish()
 void Connection::OnEvents(std::uint32_t events)
 {
     // 同一轮里本连接可能已经在别的回调里被关闭：对象还在（延后销毁），但不再处理任何事件。
-    if (state_ != State::Connected)
+    if (state_ == State::Disconnected)
         return;
     if ((events & EPOLLHUP) && !(events & EPOLLIN))
     {
-        CloseWith(CloseReason::PeerClosed, 0);
+        CloseWith(PeerCloseReason(), 0);
         return;
     }
     if (events & EPOLLERR)
@@ -107,7 +118,7 @@ void Connection::OnEvents(std::uint32_t events)
     }
     if (events & (EPOLLIN | EPOLLRDHUP))
         HandleRead();
-    if (state_ == State::Connected && (events & EPOLLOUT))
+    if (state_ != State::Disconnected && (events & EPOLLOUT))
         HandleWrite();
 }
 
@@ -117,7 +128,9 @@ void Connection::OnEvents(std::uint32_t events)
 std::size_t Connection::DecodeAll(std::span<const std::byte> data)
 {
     std::size_t total = 0;
-    while (state_ == State::Connected && total < data.size())
+    std::uint64_t messages = 0;
+    // Disconnecting 也要分发：优雅关闭期间对端的最后几条回包不能丢。
+    while (state_ != State::Disconnected && total < data.size())
     {
         std::size_t used = 0;
         const DecodeResult r = codec_->Decode(
@@ -127,12 +140,14 @@ std::size_t Connection::DecodeAll(std::span<const std::byte> data)
         if (r == DecodeResult::Ok)
         {
             total += used;
+            ++messages;
             continue;
         }
         if (r == DecodeResult::Error)
             CloseWith(CloseReason::ProtocolError, 0); // 不尝试重新同步
         break;
     }
+    LoopStats::Bump(loop_.stats().messages_in, messages); // 每次 read 记一次，不是每条消息一次
     return total;
 }
 
@@ -154,16 +169,20 @@ void Connection::HandleRead()
     }
     if (n == 0)
     {
-        CloseWith(CloseReason::PeerClosed, 0); // 读到 EOF
+        CloseWith(PeerCloseReason(), 0); // 读到 EOF
         return;
     }
+
+    LoopStats::Bump(loop_.stats().bytes_in, static_cast<std::uint64_t>(n));
+    if (idle_timeout_ms_ != 0)
+        loop_.IdleTouch(slot_index_);
 
     const std::span<const std::byte> fresh(buf, static_cast<std::size_t>(n));
     if (in_.ReadableBytes() == 0)
     {
         // 常见路径：没有遗留的半帧，直接从线程本地缓冲分帧，不碰每连接的缓冲；只有尾部的半个帧才拷进去。
         const std::size_t used = DecodeAll(fresh);
-        if (used < fresh.size() && state_ == State::Connected)
+        if (used < fresh.size() && state_ != State::Disconnected)
             in_.Append(fresh.subspan(used));
         return;
     }
@@ -218,7 +237,10 @@ SendResult Connection::SendImpl(std::span<const std::byte> payload, SharedBuffer
 {
     loop_.AssertInLoopThread();
     if (state_ != State::Connected)
+    {
+        LoopStats::Add(loop_.stats().send_closed_stale);
         return SendResult::Closed;
+    }
 
     std::array<std::byte, kMaxFrameHeaderSize> header; // 不清零：只有 header_len 个字节会被用到
     const std::size_t header_len = codec_->EncodeHeader(payload.size(), header);
@@ -226,6 +248,7 @@ SendResult Connection::SendImpl(std::span<const std::byte> payload, SharedBuffer
     {
         // payload 超过 codec 的上限：对端按同样的上限会判协议错误并断开，不如本端先关，别让它带着错位的流继续跑。
         LOG_ERROR("Send 的 payload 超过 codec 上限 size={}，关闭连接", payload.size());
+        LoopStats::Add(loop_.stats().send_closed_oversize);
         CloseWith(CloseReason::ProtocolError, 0);
         return SendResult::Closed;
     }
@@ -239,13 +262,16 @@ SendResult Connection::SendImpl(std::span<const std::byte> payload, SharedBuffer
         const ssize_t n = SendIov(fd_.get(), iov, cnt);
         if (n < 0)
         {
+            LoopStats::Add(loop_.stats().send_closed_io_error);
             CloseWith(CloseReason::IoError, errno);
             return SendResult::Closed;
         }
+        LoopStats::Bump(loop_.stats().bytes_out, static_cast<std::uint64_t>(n));
         if (static_cast<std::size_t>(n) == header_len + payload.size())
         {
             if (counted)
                 slot_.pending_bytes.fetch_sub(payload.size(), std::memory_order_relaxed);
+            LoopStats::Bump(loop_.stats().messages_out);
             return SendResult::Ok;
         }
         written = static_cast<std::size_t>(n);
@@ -260,6 +286,7 @@ SendResult Connection::SendImpl(std::span<const std::byte> payload, SharedBuffer
         if (pending > high_water_)
         {
             LOG_WARN("发送积压 {} 字节超过水位 {}，按慢消费者关闭连接", pending, high_water_);
+            LoopStats::Add(loop_.stats().send_closed_slow_consumer);
             CloseWith(CloseReason::SlowConsumer, 0);
             return SendResult::Closed;
         }
@@ -271,6 +298,7 @@ SendResult Connection::SendImpl(std::span<const std::byte> payload, SharedBuffer
     p.offset = written;
     if (!want_write_)
         SetWriteInterest(true);
+    LoopStats::Bump(loop_.stats().messages_out);
     return SendResult::Ok;
 }
 
@@ -293,6 +321,7 @@ void Connection::HandleWrite()
             CloseWith(CloseReason::IoError, errno);
             return;
         }
+        LoopStats::Bump(loop_.stats().bytes_out, static_cast<std::uint64_t>(n));
 
         std::size_t left = static_cast<std::size_t>(n);
         while (left > 0)
@@ -315,6 +344,8 @@ void Connection::HandleWrite()
             return; // 内核缓冲满了，等下一次 EPOLLOUT
     }
     SetWriteInterest(false); // 队列排空：EPOLLOUT 仅在队列非空时注册
+    if (state_ == State::Disconnecting)
+        ShutdownWrite(); // 优雅关闭：该发的都发完了，告诉对端我们这边结束
 }
 
 void Connection::SetWriteInterest(bool want)
@@ -322,7 +353,73 @@ void Connection::SetWriteInterest(bool want)
     if (want == want_write_ || !registered_)
         return;
     want_write_ = want;
-    loop_.Mod(this, fd_.get(), EPOLLIN | EPOLLRDHUP | (want ? EPOLLOUT : 0));
+    ApplyInterest();
+}
+
+// epoll 的关注事件由两个独立的开关合成：读（PauseRead 摘掉）与写（队列非空才有）。
+// 暂停时连 EPOLLRDHUP 一起摘：它水平触发，对端半关闭后会一直就绪，保留着就是空转。
+// EPOLLERR / EPOLLHUP 不需要订阅，内核总会报，所以暂停的连接遇到 RST 照样被关掉。
+void Connection::ApplyInterest()
+{
+    if (!registered_)
+        return;
+    std::uint32_t ev = paused_ ? 0u : static_cast<std::uint32_t>(EPOLLIN | EPOLLRDHUP);
+    if (want_write_)
+        ev |= EPOLLOUT;
+    loop_.Mod(this, fd_.get(), ev);
+}
+
+void Connection::ShutdownWrite()
+{
+    if (::shutdown(fd_.get(), SHUT_WR) != 0 && errno != ENOTCONN) // ENOTCONN：对端已经断了，随后的 HUP / ERR 会收尾
+        CloseWith(CloseReason::IoError, errno);
+}
+
+// ---- 流控与优雅关闭 ----
+
+void Connection::PauseRead()
+{
+    loop_.AssertInLoopThread();
+    if (state_ != State::Connected || paused_)
+        return;
+    paused_ = true;
+    ApplyInterest();
+    LoopStats::Bump(loop_.stats().paused);
+    if (idle_registered_)
+        loop_.IdleSetPaused(slot_index_, true);
+}
+
+void Connection::ResumeRead()
+{
+    loop_.AssertInLoopThread();
+    if (!paused_)
+        return;
+    paused_ = false;
+    LoopStats::Drop(loop_.stats().paused);
+    if (state_ == State::Disconnected)
+        return;
+    ApplyInterest(); // 水平触发：内核缓冲里已有的数据会立刻再次就绪
+    if (idle_registered_)
+        loop_.IdleSetPaused(slot_index_, false);
+}
+
+void Connection::CloseGracefully(std::chrono::milliseconds timeout)
+{
+    loop_.AssertInLoopThread();
+    if (state_ != State::Connected)
+        return;
+    state_ = State::Disconnecting;
+    slot_.state.store(ConnectionTable::State::Disconnecting, std::memory_order_release); // 跨线程 Send 从此得到 Closed
+    if (paused_)
+        ResumeRead(); // 暂停着读不到对端在 FIN 之前发来的最后几条消息（对端 FIN 后内核报 EPOLLHUP，会直接关掉）
+    grace_timer_ = loop_.RunAfter(timeout,
+                                  [this]
+                                  {
+                                      grace_timer_ = 0;
+                                      CloseWith(CloseReason::LocalClose, 0); // 对端没在期限内关闭：强关
+                                  });
+    if (out_.empty())
+        ShutdownWrite(); // 否则由 HandleWrite 在队列排空时做
 }
 
 // ---- 关闭：标记 → 本轮分发之后回调 OnClosed → 销毁 ----
@@ -337,6 +434,22 @@ void Connection::CloseWith(CloseReason reason, int sys_errno)
     slot_.state.store(ConnectionTable::State::Disconnected, std::memory_order_release); // 跨线程 Send 从此得到 Closed
     close_reason_ = reason;
     close_errno_ = sys_errno;
+    // 下面三件都要在回收之前做完：定时器里捕获着 this；暂停数与空闲登记是 loop 级的计数。
+    if (grace_timer_ != 0)
+    {
+        loop_.Cancel(grace_timer_);
+        grace_timer_ = 0;
+    }
+    if (paused_)
+    {
+        paused_ = false;
+        LoopStats::Drop(loop_.stats().paused);
+    }
+    if (idle_registered_)
+    {
+        loop_.IdleUnregister(slot_index_);
+        idle_registered_ = false;
+    }
     if (registered_)
     {
         loop_.Del(fd_.get());
@@ -348,8 +461,11 @@ void Connection::CloseWith(CloseReason reason, int sys_errno)
 
 void Connection::NotifyClosed()
 {
-    if (notified_connected_)
-        handler_.OnClosed(*this, close_reason_, close_errno_);
+    if (!notified_connected_)
+        return;
+    LoopStats::Bump(loop_.stats().closed[static_cast<std::size_t>(close_reason_)]);
+    LOG_DEBUG("connection closed {} reason={} errno={}", handle_.ToString(), ToString(close_reason_), close_errno_);
+    handler_.OnClosed(*this, close_reason_, close_errno_);
 }
 
 } // namespace breeze

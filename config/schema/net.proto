@@ -1,0 +1,45 @@
+// 网络库（framework/net 的 NetModule）的配置：IO 线程、连接数、每连接选项、入口背压、停机。
+// 事实源；这里的默认值就是生产默认值（base/net 自己的默认值保持中立，见 docs/网络库设计.md §4.7 / §5）。
+// 改完 C++ 构建时自动重新生成；用法见 tools/configgen/CLAUDE.md。
+
+syntax = "proto3";
+
+package config;
+
+import "options.proto";
+
+message NetConfig {
+  // ---- IO 线程与连接容量 ----
+  // IO 线程数（每个线程一个 EventLoop）。
+  uint32 io_threads = 1 [(config.default) = "4", (config.range) = {min: 1, max: 256}];
+  // 每个 loop 的连接数上限，连接表按它预分配（每槽约 90 字节）。所有 loop 都满了就拒绝新连接。
+  uint32 max_connections_per_loop = 2 [(config.default) = "65536", (config.range) = {min: 1, max: 1048576}];
+
+  // ---- 每连接 ----
+  // 发送积压（排队 + 在途）的软上限；超过就按慢消费者关闭连接。内部链路按需调大。
+  uint32 high_water_mark_bytes = 3 [(config.default) = "262144", (config.range) = {min: 1024, max: 1073741824}];
+  // 空闲超时：连续这么久没收到任何字节就关闭，0 = 不检测。面向客户端的进程（gate）在部署配置里设置；
+  // 内部链路没有心跳时不要开，否则安静的连接会被关掉。
+  uint32 idle_timeout_ms = 4 [(config.default) = "0", (config.range) = {min: 0, max: 86400000}];
+  // TCP keepalive：只开 SO_KEEPALIVE 而不设参数时内核默认 7200s 等于没开，所以三个参数一起设；默认约 90s 发现对端消失。
+  // idle 为 0 则不开 keepalive。UDS 不适用。
+  uint32 keepalive_idle_s = 5 [(config.default) = "60", (config.range) = {min: 0, max: 86400}];
+  uint32 keepalive_interval_s = 6 [(config.default) = "10", (config.range) = {min: 1, max: 3600}];
+  uint32 keepalive_count = 7 [(config.default) = "3", (config.range) = {min: 1, max: 127}];
+  // TCP_USER_TIMEOUT：已发出的数据多久得不到确认就断开，0 = 不设。
+  uint32 tcp_user_timeout_ms = 8 [(config.default) = "0", (config.range) = {min: 0, max: 3600000}];
+
+  // ---- 入口背压（回投主循环的事件队列）----
+  // 每连接在途（已入队、主循环尚未消费）的条数与字节上限，超过就暂停读该连接；降到一半以下恢复。
+  // 字节上限要小：10 万连接 × 256KB ≈ 25GB。
+  uint32 inbound_max_messages_per_conn = 9 [(config.default) = "256", (config.range) = {min: 1, max: 1048576}];
+  uint32 inbound_max_bytes_per_conn = 10 [(config.default) = "65536", (config.range) = {min: 1, max: 1073741824}];
+  // 全局入站字节预算（MB）：所有连接在途字节之和超过它，就暂停产生新事件的连接，降到一半以下统一恢复。
+  uint32 inbound_global_budget_mb = 11 [(config.default) = "256", (config.range) = {min: 1, max: 65536}];
+  // 主循环每次被唤醒最多处理多少个事件；没处理完会补一个唤醒再转一轮，不会饿死 tick。
+  uint32 wake_budget = 12 [(config.default) = "1024", (config.range) = {min: 1, max: 1048576}];
+
+  // ---- 停机 ----
+  // NetModule::Shutdown 里等连接优雅关闭的时间，到点强关。
+  uint32 shutdown_deadline_ms = 13 [(config.default) = "5000", (config.range) = {min: 0, max: 600000}];
+}

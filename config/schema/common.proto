@@ -12,6 +12,7 @@ syntax = "proto3";
 package config;
 
 import "options.proto";
+import "net.proto";
 
 // 部署环境。每个环境的覆盖文件里要写同名的 cluster.env，启动时与 --env 核对，防止误用别的环境的配置。
 enum Env {
@@ -25,11 +26,13 @@ enum Env {
 message CommonConfig {
   option (config.root) = true;
 
-  // 四段都必填：整段缺失不能悄悄取空默认值（world_id 会变成 0，etcd 没有地址）
+  // 前四段都必填：整段缺失不能悄悄取空默认值（world_id 会变成 0，etcd 没有地址）
   ClusterConfig cluster = 1 [(config.required) = true];
   EtcdConfig etcd = 2 [(config.required) = true];
   RedisConfig redis = 3 [(config.required) = true];
   MongoConfig mongo = 4 [(config.required) = true];
+  // 网络库（framework/net）。不是 required：字段全有生产默认值（见 net.proto），整段缺省就用默认值，没有"悄悄取空"的风险。
+  NetConfig net = 5;
 }
 
 // 集群身份。

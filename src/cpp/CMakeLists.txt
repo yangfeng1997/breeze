@@ -54,6 +54,7 @@ set(LOGGER_DIR base/logger)
 set(KERNEL_DIR framework/kernel)
 set(QUEUE_DIR base/queue)
 set(NET_DIR base/net)
+set(NET_MODULE_DIR framework/net)
 
 # CLI11 只 PRIVATE 链接：公开头文件不含它，使用方看不到这个依赖。
 # internal/ 里的 args_impl.h 含 CLI11，必须 PRIVATE，不能并入公开目录。
@@ -143,13 +144,17 @@ if(BREEZE_BUILD_NET)
     ${NET_DIR}/connection.cpp
     ${NET_DIR}/connection_handle.cpp
     ${NET_DIR}/event_loop_group.cpp
+    ${NET_DIR}/net_server.cpp
+    ${NET_DIR}/net_client.cpp
     ${NET_DIR}/internal/thread.cpp
     ${NET_DIR}/internal/connection_table.cpp
     ${NET_DIR}/internal/group_registry.cpp
     ${NET_DIR}/internal/socket.cpp
     ${NET_DIR}/internal/event_loop.cpp
     ${NET_DIR}/internal/acceptor.cpp
-    ${NET_DIR}/internal/loop_server.cpp)
+    ${NET_DIR}/internal/loop_server.cpp
+    ${NET_DIR}/internal/transport.cpp
+    ${NET_DIR}/internal/connector.cpp)
   target_include_directories(breeze_net PUBLIC ${NET_DIR} PRIVATE ${NET_DIR}/internal)
   # breeze_queue 是 PUBLIC：internal/event_loop.h 里有 MpscQueue，要用 internal/ 的测试也得看得到它。
   target_link_libraries(breeze_net PUBLIC Threads::Threads breeze_queue PRIVATE breeze_logger)
@@ -193,6 +198,16 @@ target_include_directories(breeze_kernel PUBLIC ${KERNEL_DIR})
 target_link_libraries(breeze_kernel PUBLIC breeze_app breeze_logger breeze_config breeze_args breeze_config_schemas)
 target_compile_options(breeze_kernel PRIVATE -Wall -Wextra)
 breeze_apply_log_level(breeze_kernel)
+
+# framework/net：把 base/net 的连接事件回投 App 主循环（MainLoopExecutor）并装配成模块（NetModule）。
+# net.proto 生成的头文件经 breeze_config_schemas 传递。网络库只支持 Linux。
+if(BREEZE_BUILD_NET)
+  add_library(breeze_net_module ${NET_MODULE_DIR}/main_loop_executor.cpp ${NET_MODULE_DIR}/net_module.cpp)
+  target_include_directories(breeze_net_module PUBLIC ${NET_MODULE_DIR})
+  target_link_libraries(breeze_net_module PUBLIC breeze_net breeze_kernel breeze_queue breeze_config_schemas)
+  target_compile_options(breeze_net_module PRIVATE -Wall -Wextra)
+  breeze_apply_log_level(breeze_net_module)
+endif()
 
 add_executable(log_module_test ${KERNEL_DIR}/log_module_test.cpp)
 target_link_libraries(log_module_test PRIVATE breeze_kernel)
@@ -265,6 +280,8 @@ if(BREEZE_BUILD_NET)
     endif()
     target_compile_options(${name} PRIVATE -Wall -Wextra)
     add_test(NAME ${name} COMMAND ${name})
+    # EventLoop 的任务队列用 moodycamel：tsan 下要带压制清单（原因见 tsan.supp）；其它预设下为空。
+    set_tests_properties(${name} PROPERTIES ENVIRONMENT "${BREEZE_TEST_ENV}")
   endfunction()
 
   breeze_net_test(endpoint_test)
@@ -279,6 +296,25 @@ if(BREEZE_BUILD_NET)
   breeze_net_test(event_loop_group_test INTERNAL)
   breeze_net_test(connection_handle_test INTERNAL)
   breeze_net_test(echo_test INTERNAL)
+  breeze_net_test(net_server_test INTERNAL)
+  breeze_net_test(net_client_test INTERNAL)
+  breeze_net_test(net_flow_test INTERNAL)
+  breeze_net_test(net_lifecycle_test INTERNAL)
+
+  # framework/net 的测试复用 base/net 的测试公共件（net_test_util.h 带 internal/ 里的 event_loop.h）。
+  function(breeze_net_module_test name)
+    add_executable(${name} ${NET_MODULE_DIR}/${name}.cpp)
+    target_link_libraries(${name} PRIVATE breeze_net_module)
+    target_include_directories(${name} PRIVATE ${NET_DIR}/internal)
+    target_compile_options(${name} PRIVATE -Wall -Wextra)
+    add_test(NAME ${name} COMMAND ${name})
+    set_tests_properties(${name} PROPERTIES ENVIRONMENT "${BREEZE_TEST_ENV}")
+  endfunction()
+
+  breeze_net_module_test(main_loop_executor_test)
+  breeze_net_module_test(net_module_test)
+  # NetModule(app) 的用例读仓库里真实的 config/common.yaml（net 段）
+  target_compile_definitions(net_module_test PRIVATE BREEZE_CONFIG_DIR="${CONFIG_SCHEMA_ROOT}/..")
 
   # net 库内不抛、不 catch（设计 §4.11）。framework/net 还没有时 check 脚本会跳过它。
   add_test(NAME net_no_exceptions_test
@@ -304,6 +340,8 @@ if(BREEZE_BUILD_BENCH AND BREEZE_BUILD_NET)
     ${muduo_SOURCE_DIR}/muduo/net/poller/*.cc)
   # AsyncLogging 用 Boost 的 circular_buffer，bench 用不到异步日志，直接排除。
   list(FILTER MUDUO_SRCS EXCLUDE REGEX "/AsyncLogging\\.cc$")
+  # muduo/net/boilerplate.cc 是个新建文件用的模板，include 的头文件大小写是 BoilerPlate.h，区分大小写的文件系统上找不到。
+  list(FILTER MUDUO_SRCS EXCLUDE REGEX "/boilerplate\\.cc$")
   add_library(muduo_bench STATIC ${MUDUO_SRCS})
   # bench/muduo_shim 提供 boost/any.hpp（映射到 std::any），不引入 Boost。
   target_include_directories(muduo_bench PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/bench/muduo_shim ${muduo_SOURCE_DIR})
@@ -314,7 +352,7 @@ if(BREEZE_BUILD_BENCH AND BREEZE_BUILD_NET)
 
   add_executable(net_bench bench/net_bench.cpp)
   target_include_directories(net_bench PRIVATE ${NET_DIR}/internal)
-  target_link_libraries(net_bench PRIVATE breeze_net breeze_logger muduo_bench)
+  target_link_libraries(net_bench PRIVATE breeze_net breeze_net_module breeze_logger muduo_bench)
   target_compile_definitions(net_bench PRIVATE BREEZE_BENCH_MUDUO=1)
   target_compile_options(net_bench PRIVATE -Wall -Wextra)
 endif()

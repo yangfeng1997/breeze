@@ -6,6 +6,7 @@
 #include <dirent.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <array>
@@ -15,15 +16,21 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <unordered_map>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "buffer.h"
+#include "connection.h"
+#include "connection_handler.h"
 #include "endpoint.h"
 #include "event_loop.h"
 #include "length_prefix_codec.h"
+#include "shared_buffer.h"
 #include "socket.h"
 
 #define CHECK(cond)                                                                                                    \
@@ -55,6 +62,58 @@ bool WaitUntil(Pred pred, std::chrono::milliseconds timeout = kWait)
     }
     return true;
 }
+
+inline SharedBuffer Buf(std::string_view s)
+{
+    return SharedBuffer::CopyFrom({reinterpret_cast<const std::byte*>(s.data()), s.size()});
+}
+
+inline std::string Str(std::span<const std::byte> b) { return {reinterpret_cast<const char*>(b.data()), b.size()}; }
+
+// 回显：EventRecorder::on_message 的常用实现，用视图版 Send 直接从读缓冲写回。
+inline void Echo(Connection& c, std::string_view sv)
+{
+    (void)c.Send(std::as_bytes(std::span(sv)));
+}
+
+// 临时目录，放 UDS 的 socket 文件；析构时清掉里面的文件与目录本身。
+class TempDir
+{
+public:
+    TempDir()
+    {
+        char tmpl[] = "/tmp/breeze-net-XXXXXX";
+        const char* p = ::mkdtemp(tmpl);
+        CHECK(p != nullptr);
+        path_ = p;
+    }
+    ~TempDir()
+    {
+        if (DIR* d = ::opendir(path_.c_str()))
+        {
+            while (const dirent* e = ::readdir(d))
+            {
+                if (e->d_name[0] != '.')
+                    ::unlink((path_ + "/" + e->d_name).c_str());
+            }
+            ::closedir(d);
+        }
+        ::rmdir(path_.c_str());
+    }
+    TempDir(const TempDir&) = delete;
+    TempDir& operator=(const TempDir&) = delete;
+
+    const std::string& path() const { return path_; }
+    Endpoint Unix(const std::string& name) const
+    {
+        const auto ep = Endpoint::Unix(path_ + "/" + name);
+        CHECK(ep.has_value());
+        return *ep;
+    }
+
+private:
+    std::string path_;
+};
 
 // 在 loop 线程上执行 fn 并等它跑完（loop 已经在运行时，Acceptor::Listen 之类只能在 loop 线程调用）。
 inline void RunOnLoop(EventLoop& loop, std::function<void()> fn)
@@ -102,6 +161,137 @@ struct LeakCheck
             std::abort();
         }
     }
+};
+
+// 线程安全地记录连接事件。可选的钩子在 IO 线程上、记录之后调用（要回显、要在回调里关连接 / 暂停读时用）。
+// CheckInvariants 验证设计 §7 第 2 条：每条连接 OnConnected 先于一切，恰一个 OnClosed 且在最后一个 OnMessage 之后。
+class EventRecorder final : public ConnectionHandler
+{
+public:
+    struct Closed
+    {
+        ConnectionHandle handle;
+        CloseReason reason;
+        int err;
+    };
+    struct Message
+    {
+        ConnectionHandle handle;
+        std::string payload;
+    };
+
+    std::function<void(Connection&)> on_connected;
+    std::function<void(Connection&, std::string_view)> on_message;
+    std::function<void(Connection&, CloseReason)> on_closed;
+
+    void OnConnected(Connection& c) noexcept override
+    {
+        {
+            const std::lock_guard lk(mu_);
+            connected_.push_back(c.handle());
+            seq_[c.handle()].push_back('C');
+        }
+        if (on_connected)
+            on_connected(c);
+    }
+    void OnMessage(Connection& c, std::span<const std::byte> payload) noexcept override
+    {
+        const std::string s = Str(payload);
+        {
+            const std::lock_guard lk(mu_);
+            messages_.push_back({c.handle(), s});
+            seq_[c.handle()].push_back('M');
+        }
+        if (on_message)
+            on_message(c, s);
+    }
+    void OnClosed(Connection& c, CloseReason r, int err) noexcept override
+    {
+        {
+            const std::lock_guard lk(mu_);
+            closed_.push_back({c.handle(), r, err});
+            seq_[c.handle()].push_back('X');
+        }
+        if (on_closed)
+            on_closed(c, r);
+    }
+
+    std::size_t connected_count() const
+    {
+        const std::lock_guard lk(mu_);
+        return connected_.size();
+    }
+    std::size_t message_count() const
+    {
+        const std::lock_guard lk(mu_);
+        return messages_.size();
+    }
+    std::size_t closed_count() const
+    {
+        const std::lock_guard lk(mu_);
+        return closed_.size();
+    }
+    std::vector<std::string> payloads() const
+    {
+        const std::lock_guard lk(mu_);
+        std::vector<std::string> out;
+        for (const auto& m : messages_)
+            out.push_back(m.payload);
+        return out;
+    }
+
+    bool WasClosed(ConnectionHandle h) const
+    {
+        const std::lock_guard lk(mu_);
+        for (const auto& c : closed_)
+            if (c.handle == h)
+                return true;
+        return false;
+    }
+
+    ConnectionHandle WaitConnected(std::size_t i, std::chrono::milliseconds timeout = kWait) const
+    {
+        CHECK(WaitUntil([&] { return connected_count() > i; }, timeout));
+        const std::lock_guard lk(mu_);
+        return connected_[i];
+    }
+    Closed WaitClosed(std::size_t i, std::chrono::milliseconds timeout = kWait) const
+    {
+        CHECK(WaitUntil([&] { return closed_count() > i; }, timeout));
+        const std::lock_guard lk(mu_);
+        return closed_[i];
+    }
+    bool WaitMessages(std::size_t n, std::chrono::milliseconds timeout = kWait) const
+    {
+        return WaitUntil([&] { return message_count() >= n; }, timeout);
+    }
+
+    // 每条连接的事件序列必须匹配 C M* X?（X 至多一个，且最后）。
+    void CheckInvariants() const
+    {
+        const std::lock_guard lk(mu_);
+        for (const auto& [h, seq] : seq_)
+        {
+            CHECK(!seq.empty() && seq.front() == 'C');
+            std::size_t closes = 0;
+            for (std::size_t i = 0; i < seq.size(); ++i)
+            {
+                if (seq[i] == 'X')
+                {
+                    ++closes;
+                    CHECK(i + 1 == seq.size()); // OnClosed 之后不再有该连接的任何回调
+                }
+            }
+            CHECK(closes <= 1);
+        }
+    }
+
+private:
+    mutable std::mutex mu_;
+    std::vector<ConnectionHandle> connected_;
+    std::vector<Message> messages_;
+    std::vector<Closed> closed_;
+    std::unordered_map<ConnectionHandle, std::string> seq_; // 每条连接的事件序列：C / M / X
 };
 
 // 阻塞风格的测试客户端（LengthPrefixCodec 分帧），所有等待都带超时。

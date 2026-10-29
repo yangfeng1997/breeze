@@ -6,12 +6,16 @@
 #pragma once
 
 #include <array>
+#include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <type_traits>
 
 #include "buffer.h"
+#include "connection_context.h"
 #include "connection_handle.h"
 #include "connection_handler.h"
 #include "connection_options.h"
@@ -51,7 +55,34 @@ public:
     // 重复调用、对已关闭的连接调用都是空操作。
     void Close();
 
+    // 优雅关闭：转入 Disconnecting（Send 从此返回 Closed），发送队列排空后 shutdown(SHUT_WR)，同时启动 timeout 定时器；
+    // 对端在期限内关闭则正常结束，否则强关。两种结果 OnClosed 的原因都是 LocalClose。
+    // 期间仍读、仍分发 OnMessage（对端在 FIN 之前发来的最后几条消息不丢），并忽略 PauseRead（已暂停的会先恢复读）。
+    // 对非 Connected 的连接是空操作。
+    void CloseGracefully(std::chrono::milliseconds timeout);
+
+    // 摘掉 / 恢复 EPOLLIN，流控用（MainLoopExecutor 的入口背压）。只影响之后的 read：本次 read 已经读进来的帧照常交付
+    // （最多 64KB），所以暂停是软的、超出量有界。暂停期间不计空闲，恢复时重新计时；重复调用是空操作。
+    void PauseRead();
+    void ResumeRead();
+
+    // 每连接的用户数据，随连接销毁。Release 下 GetContext 是 static_cast，Debug 下 dynamic_cast 并断言类型对得上。
+    void SetContext(std::unique_ptr<ConnectionContext> ctx) noexcept { ctx_ = std::move(ctx); }
+    template <class T>
+    T* GetContext() const noexcept
+    {
+        static_assert(std::is_base_of_v<ConnectionContext, T>);
+#ifdef NDEBUG
+        return static_cast<T*>(ctx_.get());
+#else
+        T* p = dynamic_cast<T*>(ctx_.get());
+        assert(p != nullptr || ctx_ == nullptr); // 取成了别的类型
+        return p;
+#endif
+    }
+
     bool IsConnected() const noexcept { return state_ == State::Connected; }
+    bool IsPaused() const noexcept { return paused_; }
     const PeerInfo& peer() const noexcept { return peer_; }
 
     // 可复制、可跨线程使用的句柄（ConnectionHandle::Send / Close）。独立 loop（不属于任何 group）上的连接没有句柄，
@@ -78,6 +109,7 @@ private:
     enum class State : std::uint8_t
     {
         Connected,
+        Disconnecting, // 优雅关闭中：不再接受 Send，仍读，等写队列排空与对端关闭
         Disconnected,
     };
 
@@ -99,30 +131,45 @@ private:
     // 只由 EventLoop 在执行跨线程任务时调用。
     void SendFromTask(SharedBuffer payload);
     void CloseFromTask(CloseReason reason) { CloseWith(reason, 0); }
+    void CloseIdle() { CloseWith(CloseReason::IdleTimeout, 0); } // 只由 EventLoop 的空闲扫描调用
     void HandleRead();
     std::size_t DecodeAll(std::span<const std::byte> data);
     void HandleWrite();
     void SetWriteInterest(bool want);
+    void ApplyInterest();
+    void ShutdownWrite();
+    // 对端关闭（EOF / HUP）的原因：我们先发起了优雅关闭时，对端回应的 FIN 是正常结束，算 LocalClose。
+    CloseReason PeerCloseReason() const noexcept
+    {
+        return state_ == State::Disconnecting ? CloseReason::LocalClose : CloseReason::PeerClosed;
+    }
     void CloseWith(CloseReason reason, int sys_errno);
     void NotifyClosed(); // 只由 EventLoop 在回收时调用
 
+    // 成员顺序是性能决定的：每条消息都碰的热字段集中在前（两条缓存行内），冷的（对端信息、句柄、上下文、定时器、关闭原因）放后面。
+    // 10 万连接时每连接多碰一条缓存行就是可测量的代价（docs/网络库设计.md §9.1 / §9.3）。改动时用 sizeof 与 offsetof
+    // 核对。
     EventLoop& loop_;
     Fd fd_;
-    PeerInfo peer_;
     ConnectionHandler& handler_;
     std::unique_ptr<FrameCodec> codec_;
     ConnectionTable::Slot& slot_; // 热字段（状态、pending_bytes）在连接表里，别的线程不碰本对象就能读
     const std::uint32_t slot_index_;
-    const ConnectionHandle handle_;
+    const std::uint32_t idle_timeout_ms_; // 0 = 不参加空闲检测
     const std::uint64_t high_water_;
-
-    Buffer in_;
-    std::deque<Pending> out_;
-
     State state_ = State::Connected;
     bool registered_ = false;         // 是否已登记到 epoll
     bool want_write_ = false;         // epoll 里是否带 EPOLLOUT
+    bool paused_ = false;             // PauseRead 生效中（epoll 里不带 EPOLLIN）
+    bool idle_registered_ = false;    // 在 EventLoop 的空闲检测里登记过
     bool notified_connected_ = false; // 回调过 OnConnected 才会回调 OnClosed
+    Buffer in_;
+    std::deque<Pending> out_;
+
+    PeerInfo peer_;
+    const ConnectionHandle handle_;
+    std::unique_ptr<ConnectionContext> ctx_;
+    std::uint64_t grace_timer_ = 0; // CloseGracefully 的超时定时器（EventLoop::TimerId），0 = 没有
     CloseReason close_reason_ = CloseReason::LocalClose;
     int close_errno_ = 0;
 };

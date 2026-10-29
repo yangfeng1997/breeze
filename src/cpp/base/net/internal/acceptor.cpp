@@ -116,7 +116,10 @@ void Acceptor::HandleFdExhausted()
         Fd victim;
         std::optional<Endpoint> peer;
         if (sock::Accept(listen_fd_.get(), victim, peer) == 0)
+        {
             rejected_fd_exhausted_.fetch_add(1, std::memory_order_relaxed); // victim 离开作用域即关闭
+            LoopStats::Bump(loop_.stats().rejected_fd_exhausted);
+        }
     }
     idle_fd_ = OpenIdleFd();
 

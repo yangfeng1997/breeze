@@ -1,6 +1,7 @@
 #include "event_loop_group.h"
 
 #include <cerrno>
+#include <thread>
 
 #include "connection_handle.h"
 #include "event_loop.h"
@@ -24,7 +25,15 @@ EventLoopGroup::EventLoopGroup(EventLoopGroupOptions options)
 {
 }
 
-EventLoopGroup::~EventLoopGroup() { Shutdown(std::chrono::milliseconds::zero()); }
+// 析构只做兜底：没 Shutdown 过就直接停，不排空，也就不会回调 OnClosed（那时 handler 可能已经销毁）。
+EventLoopGroup::~EventLoopGroup()
+{
+    if (state_ != State::Running)
+        return;
+    state_ = State::Stopped;
+    StopWorkers(workers_.size());
+    GroupRegistry::Global().Unregister(id_);
+}
 
 int EventLoopGroup::Start()
 {
@@ -76,14 +85,69 @@ void EventLoopGroup::StopWorkers(std::size_t started)
         workers_[i]->thread.Join();
 }
 
-void EventLoopGroup::Shutdown(std::chrono::milliseconds)
+namespace
+{
+// 强关之后等 OnClosed 跑完的时间上限：只有 handler 阻塞在回调里才会用满。
+constexpr std::chrono::milliseconds kForceCloseWait{2000};
+} // namespace
+
+bool EventLoopGroup::WaitDrained(std::chrono::steady_clock::time_point until) const
+{
+    for (;;)
+    {
+        bool drained = true;
+        for (const auto& w : workers_)
+            drained = drained && w->loop.table().Live() == 0;
+        if (drained)
+            return true;
+        if (std::chrono::steady_clock::now() >= until)
+            return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+void EventLoopGroup::DrainConnections(std::chrono::milliseconds deadline)
+{
+    const auto limit = std::chrono::steady_clock::now() + deadline;
+    // 各 loop 先停自己的 Acceptor / Connector，再对连接优雅关闭，此后的新连接任务一律丢弃。
+    for (auto& w : workers_)
+    {
+        EventLoop* l = &w->loop;
+        l->Post([l, deadline] { l->BeginShutdown(deadline); });
+    }
+    if (WaitDrained(limit))
+        return;
+    LOG_WARN("EventLoopGroup 停机：{}ms 内连接没有走完，强关剩余连接", deadline.count());
+    for (auto& w : workers_)
+    {
+        EventLoop* l = &w->loop;
+        l->Post([l] { l->CloseAllConnections(); });
+    }
+    if (!WaitDrained(std::chrono::steady_clock::now() + kForceCloseWait))
+        LOG_ERROR("EventLoopGroup 停机：强关之后连接仍未清空，直接停 loop");
+}
+
+void EventLoopGroup::Shutdown(std::chrono::milliseconds deadline)
 {
     if (state_ != State::Running)
         return;
-    state_ = State::Stopped;
+    state_ = State::Stopping;
+    DrainConnections(deadline);
     StopWorkers(workers_.size());
     GroupRegistry::Global().Unregister(id_); // 之后本 group 的句柄解析不到
+    state_ = State::Stopped;
     // loop 对象留到析构：引用它们的 NetServer / 迟到的任务不会碰到已销毁的对象，线程已经 join，不会再有人运行它们。
+}
+
+NetStats EventLoopGroup::GetStats() const
+{
+    NetStats out;
+    for (const auto& w : workers_)
+    {
+        out.connections += w->loop.table().Live();
+        w->loop.stats().AddTo(out);
+    }
+    return out;
 }
 
 // ---- GroupAccess ----
@@ -105,8 +169,9 @@ EventLoop& GroupAccess::LoopAt(const EventLoopGroup& g, std::size_t i)
 
 EventLoop& GroupAccess::PickLoop(const EventLoopGroup& g)
 {
-    if (!g.running())
-        LOG_FATAL("EventLoopGroup 尚未 Start 或已 Shutdown，不能选 loop");
+    // 只在从未 Start 过时是编程错误：Shutdown 期间（Stopping）accept 线程里仍可能走到这里，选到的 loop 会拒绝新连接。
+    if (g.workers_.empty())
+        LOG_FATAL("EventLoopGroup 尚未 Start，不能选 loop");
     EventLoop* best = &g.workers_[0]->loop;
     std::size_t best_live = best->ConnectionCount();
     for (std::size_t i = 1; i < g.workers_.size(); ++i)

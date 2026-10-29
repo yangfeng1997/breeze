@@ -18,11 +18,13 @@
 #include <memory>
 #include <thread>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "connection_handle.h"
 #include "connection_options.h"
 #include "connection_table.h"
+#include "loop_stats.h"
 #include "mpsc_queue.h"
 #include "peer_info.h"
 #include "pollable.h"
@@ -59,9 +61,13 @@ public:
     // 跨线程投递给连接的操作（ConnectionHandle 用）。不带 std::function：热路径上不多一次堆分配。
     enum class Op : std::uint8_t
     {
-        Send,  // payload；发送方已把 payload.size() 计入槽的 pending_bytes
-        Close, // arg = CloseReason
+        Send,            // payload；发送方已把 payload.size() 计入槽的 pending_bytes
+        Close,           // arg = CloseReason
+        CloseGracefully, // arg = 超时毫秒
+        PauseRead,
+        ResumeRead,
     };
+    using HookId = std::uint64_t; // 0 = 无效
 
     explicit EventLoop(NowFn now = {});
     ~EventLoop();
@@ -80,10 +86,16 @@ public:
     void PostOp(Op op, ConnectionHandle handle, std::uint32_t arg, SharedBuffer payload);
     // 让 Run() 返回。已投递的任务与已到期的事件在返回前照常处理。
     void Quit();
+    // 在 loop 线程上执行 fn 并等它返回结果。调用线程本来就是这个 loop 的线程时直接调用。
+    // 只能对已有线程在跑的 loop 调用：没人运行它则永远等不到（NetServer / NetClient 的 Start 要求 group 已 Start）。
+    int CallSync(std::move_only_function<int()> fn);
 
     // 连接表：Find / TryReserve / Live 等任意线程可用，其余见 ConnectionTable。
     ConnectionTable& table() noexcept { return *table_; }
     const LoopOptions& options() const noexcept { return options_; }
+    // 计数：IO 线程写，任意线程可读。写法见 loop_stats.h。
+    LoopStats& stats() noexcept { return stats_; }
+    const LoopStats& stats() const noexcept { return stats_; }
 
     // ---- 只能在 loop 线程 ----
 
@@ -116,6 +128,25 @@ public:
                               const ConnectionOptions& options);
     // 连接已标记关闭，放进回收列表：本轮分发之后才回调 OnClosed 并销毁，保证回调栈内对象仍然有效。
     void QueueClose(Connection* conn);
+
+    // ---- 空闲检测（设计 §4.7）----
+    // 登记 / 注销一条开了 idle_timeout 的连接；有登记的连接时才有扫描定时器。IdleTouch 记"收到了字节"，
+    // 用本轮开头取的时间（不为每次 read 单独取时钟，精度 ≤ 1s 够用）。
+    void IdleRegister(std::uint32_t slot, std::uint32_t timeout_ms);
+    void IdleUnregister(std::uint32_t slot);
+    void IdleTouch(std::uint32_t slot) noexcept { table_->idle(slot).last_active = cached_now_; }
+    void IdleSetPaused(std::uint32_t slot, bool paused);
+
+    // ---- 停机（设计 §4.8），只能在 loop 线程 ----
+    // 停机钩子：停掉 Acceptor / Connector 之类"会产生新连接"的东西。BeginShutdown 时各执行一次，之后清空。
+    HookId AddShutdownHook(std::move_only_function<void()> fn);
+    void RemoveShutdownHook(HookId id);
+    // 执行钩子，之后不再接受新连接（accepting() 变 false），并对现有连接优雅关闭；grace 为 0 则直接关。
+    void BeginShutdown(std::chrono::milliseconds grace);
+    // 强关所有连接（BeginShutdown 的优雅期到了还没走完时用）。
+    void CloseAllConnections();
+    // false = 正在停机：跨线程投递来的"新连接"任务要丢弃，归还预留名额。
+    bool accepting() const noexcept { return !shutting_down_; }
 
     // 已预留 + 已建立的连接数，任意线程可读。
     std::size_t ConnectionCount() const noexcept { return table_->Live(); }
@@ -173,6 +204,12 @@ private:
     void RunTimers();
     void ProcessClosing();
     void DropCancelledTimers();
+    void ScanIdle();
+    void ArmIdleScan();
+
+    // 空闲扫描：每 kIdleScanInterval 扫 1/kIdleScanSlices 的槽，所以每个槽 ≤ 1s 被检查一次。
+    static constexpr std::chrono::milliseconds kIdleScanInterval{100};
+    static constexpr std::uint32_t kIdleScanSlices = 10;
 
     static constexpr std::size_t kTaskBatch = 64;
     static constexpr int kMaxTaskRounds = 4; // 每轮最多处理 4 批任务
@@ -201,6 +238,18 @@ private:
     TimerId next_timer_id_ = 1;
 
     std::vector<Connection*> closing_;
+
+    LoopStats stats_;
+
+    // 空闲检测：登记了 idle_timeout 的连接数；cached_now_ 在 idle_active_ > 0 时每轮开头刷新。
+    std::uint32_t idle_active_ = 0;
+    std::uint32_t idle_cursor_ = 0;
+    TimerId idle_timer_ = 0;
+    Clock::time_point cached_now_{};
+
+    bool shutting_down_ = false;
+    std::vector<std::pair<HookId, std::move_only_function<void()>>> hooks_;
+    HookId next_hook_id_ = 1;
 };
 
 } // namespace breeze
