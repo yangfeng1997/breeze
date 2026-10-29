@@ -14,8 +14,23 @@ set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 # 只影响这两处，不影响调试信息，gdb 找源码照常。日志里 %s 本来就只取文件名。
 add_compile_options(-fmacro-prefix-map=${CMAKE_SOURCE_DIR}/=)
 
+# 消毒器：-DBREEZE_SANITIZE=thread|address,undefined 等，见 CMakePresets 的 tsan / asan。
+# 必须在所有 add_library / add_executable 之前，否则不作用于它们。
+set(BREEZE_SANITIZE "" CACHE STRING "sanitizer 列表（-fsanitize= 的值）；留空则不开")
+if(BREEZE_SANITIZE)
+  add_compile_options(-fsanitize=${BREEZE_SANITIZE} -fno-omit-frame-pointer)
+  add_link_options(-fsanitize=${BREEZE_SANITIZE})
+endif()
+# 依赖无锁库的测试在 tsan 下要带压制清单（原因见 tsan.supp）；其它预设下为空，set_tests_properties 无副作用。
+set(BREEZE_TEST_ENV "")
+if(BREEZE_SANITIZE MATCHES "thread")
+  set(BREEZE_TEST_ENV "TSAN_OPTIONS=suppressions=${CMAKE_SOURCE_DIR}/tsan.supp")
+endif()
+
 find_package(Threads REQUIRED)
 find_package(CLI11 CONFIG REQUIRED)
+find_package(concurrentqueue CONFIG REQUIRED)
+find_package(readerwriterqueue CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
 find_package(yaml-cpp CONFIG REQUIRED)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)  # configgen 是 Python 脚本
@@ -37,6 +52,8 @@ set(CONFIG_SCHEMA_ROOT ${CMAKE_SOURCE_DIR}/../../config/schema)  # 真实 schema
 set(BREEZE_GEN_DIR ${CMAKE_SOURCE_DIR}/gen)  # 生成代码根目录，不进版本库；include 路径以它为根
 set(LOGGER_DIR base/logger)
 set(KERNEL_DIR framework/kernel)
+set(QUEUE_DIR base/queue)
+set(NET_DIR base/net)
 
 # CLI11 只 PRIVATE 链接：公开头文件不含它，使用方看不到这个依赖。
 # internal/ 里的 args_impl.h 含 CLI11，必须 PRIVATE，不能并入公开目录。
@@ -102,6 +119,39 @@ add_library(breeze_logger ${LOGGER_DIR}/logger.cpp)
 target_include_directories(breeze_logger PUBLIC ${LOGGER_DIR} PRIVATE ${LOGGER_DIR}/internal)
 target_link_libraries(breeze_logger PRIVATE spdlog::spdlog)
 target_compile_options(breeze_logger PRIVATE -Wall -Wextra)
+
+# 无锁队列：模板必须在头文件里，所以 moodycamel 经 INTERFACE 传给使用方（与上面 PRIVATE 的 CLI11 不同）。
+# 公开 API 不出现 moodycamel 的类型，以后换实现使用方不动。
+add_library(breeze_queue INTERFACE)
+target_include_directories(breeze_queue INTERFACE ${QUEUE_DIR})
+target_link_libraries(breeze_queue INTERFACE
+  concurrentqueue::concurrentqueue readerwriterqueue::readerwriterqueue Threads::Threads)
+
+# 网络库只支持 Linux（epoll、UDS、SO_PEERCRED），其它平台不构建。
+set(BREEZE_BUILD_NET OFF)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set(BREEZE_BUILD_NET ON)
+endif()
+
+if(BREEZE_BUILD_NET)
+  # internal/ 是 PRIVATE：公开头不含它。日志同理只 PRIVATE，使用方看不到这个依赖；测试要直接用 internal/ 时自己加路径。
+  add_library(breeze_net
+    ${NET_DIR}/endpoint.cpp
+    ${NET_DIR}/shared_buffer.cpp
+    ${NET_DIR}/buffer.cpp
+    ${NET_DIR}/length_prefix_codec.cpp
+    ${NET_DIR}/connection.cpp
+    ${NET_DIR}/internal/thread.cpp
+    ${NET_DIR}/internal/socket.cpp
+    ${NET_DIR}/internal/event_loop.cpp
+    ${NET_DIR}/internal/acceptor.cpp
+    ${NET_DIR}/internal/loop_server.cpp)
+  target_include_directories(breeze_net PUBLIC ${NET_DIR} PRIVATE ${NET_DIR}/internal)
+  # breeze_queue 是 PUBLIC：internal/event_loop.h 里有 MpscQueue，要用 internal/ 的测试也得看得到它。
+  target_link_libraries(breeze_net PUBLIC Threads::Threads breeze_queue PRIVATE breeze_logger)
+  target_compile_options(breeze_net PRIVATE -Wall -Wextra)
+  breeze_apply_log_level(breeze_net)
+endif()
 
 add_library(breeze_app
   ${APP_DIR}/app.cpp
@@ -192,3 +242,71 @@ target_link_libraries(common_config_test PRIVATE breeze_config_schemas)
 # 测试读仓库里真实的 config/common.yaml 与 config/env/*.yaml
 target_compile_definitions(common_config_test PRIVATE BREEZE_CONFIG_DIR="${CONFIG_SCHEMA_ROOT}/..")
 add_test(NAME common_config_test COMMAND common_config_test)
+
+# 队列只有头文件，测试 TU 就是编译它们的地方，所以这里开 -Wall -Wextra。
+add_executable(queue_test ${QUEUE_DIR}/queue_test.cpp)
+target_link_libraries(queue_test PRIVATE breeze_queue)
+target_compile_options(queue_test PRIVATE -Wall -Wextra)
+add_test(NAME queue_test COMMAND queue_test)
+set_tests_properties(queue_test PROPERTIES ENVIRONMENT "${BREEZE_TEST_ENV}")
+
+if(BREEZE_BUILD_NET)
+  # breeze_net_test(<名> [INTERNAL])：${NET_DIR}/<名>.cpp 编成同名测试。INTERNAL = 测试要直接用 internal/ 里的头。
+  function(breeze_net_test name)
+    cmake_parse_arguments(A "INTERNAL" "" "" ${ARGN})
+    add_executable(${name} ${NET_DIR}/${name}.cpp)
+    target_link_libraries(${name} PRIVATE breeze_net)
+    if(A_INTERNAL)
+      target_include_directories(${name} PRIVATE ${NET_DIR}/internal)
+    endif()
+    target_compile_options(${name} PRIVATE -Wall -Wextra)
+    add_test(NAME ${name} COMMAND ${name})
+  endfunction()
+
+  breeze_net_test(endpoint_test)
+  breeze_net_test(buffer_test)
+  breeze_net_test(shared_buffer_test)
+  breeze_net_test(codec_test)
+  breeze_net_test(thread_test INTERNAL)
+  breeze_net_test(socket_test INTERNAL)
+  breeze_net_test(event_loop_test INTERNAL)
+  breeze_net_test(echo_test INTERNAL)
+
+  # net 库内不抛、不 catch（设计 §4.11）。framework/net 还没有时 check 脚本会跳过它。
+  add_test(NAME net_no_exceptions_test
+    COMMAND Python3::Interpreter -I ${CMAKE_SOURCE_DIR}/${NET_DIR}/check_no_exceptions.py
+            ${CMAKE_SOURCE_DIR}/${NET_DIR} ${CMAKE_SOURCE_DIR}/framework/net)
+endif()
+
+# 基线 bench：-DBREEZE_BUILD_BENCH=ON 才构建，默认关闭（要联网拉 muduo 源码）。
+# 用 Release 预设跑：cmake --preset release -DBREEZE_BUILD_BENCH=ON
+option(BREEZE_BUILD_BENCH "构建 net_bench（含 muduo 基线，需联网拉取源码）" OFF)
+if(BREEZE_BUILD_BENCH AND BREEZE_BUILD_NET)
+  include(FetchContent)
+  # muduo 自己的 CMake 强制要求 Boost，还带 -Werror -Wconversion -std=c++11，所以只取源码：
+  # SOURCE_SUBDIR 指向一个不存在的目录，FetchContent 就不会执行它的 CMakeLists。核心的 base/ 与 net/ 自己编。
+  FetchContent_Declare(muduo
+    GIT_REPOSITORY https://github.com/chenshuo/muduo.git
+    GIT_TAG f1fc77e0c13b80e5086ff457362c8a86d1b609d4
+    SOURCE_SUBDIR breeze-no-cmake)
+  FetchContent_MakeAvailable(muduo)
+  file(GLOB MUDUO_SRCS
+    ${muduo_SOURCE_DIR}/muduo/base/*.cc
+    ${muduo_SOURCE_DIR}/muduo/net/*.cc
+    ${muduo_SOURCE_DIR}/muduo/net/poller/*.cc)
+  # AsyncLogging 用 Boost 的 circular_buffer，bench 用不到异步日志，直接排除。
+  list(FILTER MUDUO_SRCS EXCLUDE REGEX "/AsyncLogging\\.cc$")
+  add_library(muduo_bench STATIC ${MUDUO_SRCS})
+  # bench/muduo_shim 提供 boost/any.hpp（映射到 std::any），不引入 Boost。
+  target_include_directories(muduo_bench PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/bench/muduo_shim ${muduo_SOURCE_DIR})
+  target_link_libraries(muduo_bench PUBLIC Threads::Threads)
+  set_target_properties(muduo_bench PROPERTIES CXX_STANDARD 17)
+  # muduo 的 Timestamp.cc 没有自己 include <ctime>（以前靠 Boost 间接带进来），强制补上。别人的代码，不看它的警告。
+  target_compile_options(muduo_bench PRIVATE -w -include ctime)
+
+  add_executable(net_bench bench/net_bench.cpp)
+  target_include_directories(net_bench PRIVATE ${NET_DIR}/internal)
+  target_link_libraries(net_bench PRIVATE breeze_net breeze_logger muduo_bench)
+  target_compile_definitions(net_bench PRIVATE BREEZE_BENCH_MUDUO=1)
+  target_compile_options(net_bench PRIVATE -Wall -Wextra)
+endif()

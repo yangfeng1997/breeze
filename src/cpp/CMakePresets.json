@@ -23,6 +23,18 @@
       "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
     },
     {
+      "name": "tsan",
+      "inherits": "debug",
+      "binaryDir": "${sourceDir}/../../build/cpp-tsan",
+      "cacheVariables": { "BREEZE_SANITIZE": "thread" }
+    },
+    {
+      "name": "asan",
+      "inherits": "debug",
+      "binaryDir": "${sourceDir}/../../build/cpp-asan",
+      "cacheVariables": { "BREEZE_SANITIZE": "address,undefined" }
+    },
+    {
       "name": "default",
       "inherits": "debug"
     }
@@ -30,11 +42,15 @@
   "buildPresets": [
     { "name": "debug", "configurePreset": "debug" },
     { "name": "release", "configurePreset": "release" },
+    { "name": "tsan", "configurePreset": "tsan" },
+    { "name": "asan", "configurePreset": "asan" },
     { "name": "default", "configurePreset": "default" }
   ],
   "testPresets": [
     { "name": "debug", "configurePreset": "debug", "output": { "outputOnFailure": true } },
     { "name": "release", "configurePreset": "release", "output": { "outputOnFailure": true } },
+    { "name": "tsan", "configurePreset": "tsan", "output": { "outputOnFailure": true } },
+    { "name": "asan", "configurePreset": "asan", "output": { "outputOnFailure": true } },
     { "name": "default", "configurePreset": "default", "output": { "outputOnFailure": true } }
   ]
 }

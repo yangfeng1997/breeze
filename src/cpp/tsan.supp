@@ -1,0 +1,8 @@
+# TSAN 的压制清单。ctest 在 tsan 预设下自动带上（见 CMakeLists.txt 的 BREEZE_TEST_ENV）；
+# 手动运行：TSAN_OPTIONS=suppressions=src/cpp/tsan.supp build/cpp-tsan/<test>
+#
+# moodycamel::ConcurrentQueue 靠 atomic_thread_fence 同步（如 Block::is_empty），TSAN 不建模 fence，
+# 对"生产者复用已被消费者读完的槽位"误报数据竞争。作者在 concurrentqueue.h 里承认这点，
+# ReaderWriterQueue 也给全部函数标了 no_sanitize("thread")。功能正确性由 queue_test 的"每生产者连续、不丢"断言保证。
+# 只压制带 moodycamel 帧的报告；本项目自己代码里的竞态照常报出。
+race:moodycamel::ConcurrentQueue

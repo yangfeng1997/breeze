@@ -4,6 +4,8 @@
   "builtin-baseline": "9eec002df1cd109f8f104cd966a763daf9751489",
   "dependencies": [
     "cli11",
+    "concurrentqueue",
+    "readerwriterqueue",
     "spdlog",
     "yaml-cpp"
   ]

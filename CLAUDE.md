@@ -16,7 +16,14 @@
   `go.mod` 在 `src/go/`，import 路径不带 `src/go` 前缀（`project/core/app`）；
   Go 命令要在 `src/go/` 下跑，或用 `go -C src/go ...`
 - `src/cpp` — C++ 侧，`CMakeLists.txt` 在此。`framework/app` 对照 Go 版
-  `src/go/core/app` 实现，语义以后者的 CLAUDE.md 为准
+  `src/go/core/app` 实现，语义以后者的 CLAUDE.md 为准。
+  `base/queue` 是 SPSC/MPSC 无锁队列（包 moodycamel，公开 API 不暴露其类型），网络库的底座；
+  `base/net` 是 Reactor 网络库（仅 Linux），目前有 `Endpoint` / `SharedBuffer` / `Buffer` / `FrameCodec` 等基础件，
+  `EventLoop` / `Connection` / `Acceptor` 已有（单 loop，`ConnectionHandle` 与 `EventLoopGroup` 起在建中）；
+  `base/net/internal/` 是不公开的实现，测试按需加私有 include 路径；
+  基线 bench 默认不构建：`cmake --preset release -DBREEZE_BUILD_BENCH=ON`（联网拉 muduo 源码），跑 `src/cpp/bench/run_baseline.sh`；
+  `tsan` / `asan` 预设跑消毒器（`cmake --preset tsan`），`tsan.supp` 只压制 moodycamel 的 fence 误报。
+  **本机没有 `protoc` 时不要跑全量构建**（`breeze_config_schemas` 要它），按 target 构建：`cmake --build build/cpp --target <名>`
 - `src/*/gen/<类别>/` — 生成代码输出目录，不进版本库；一类生成物一个子目录（现有 `config/`，策划表等以后各占一个）。
   C++ 的 include 根是 `src/cpp/gen`：`#include "config/common_config.h"`。`python3 scripts/configure.py` 一次生成全部
   并配置 cmake；C++ 构建在 schema 变动时也会自动重生成自己那份
@@ -30,7 +37,9 @@
   用法与 schema 格式见 [tools/configgen/CLAUDE.md](tools/configgen/CLAUDE.md)。目前只有 `common.proto`
   （cluster / etcd / redis / mongo）；生成器自带样例在 `tools/configgen/testdata/schema/`
 - `docs/` — 设计文档。服务间通信的基线是
-  [docs/Actor模型与RPC设计.md](docs/Actor模型与RPC设计.md)：实现 RPC 或 actor 层前先读它
+  [docs/Actor模型与RPC设计.md](docs/Actor模型与RPC设计.md)：实现 RPC 或 actor 层前先读它。
+  C++ 网络库（`base/queue` / `base/net` / `framework/net`）的设计基线是
+  [docs/网络库设计.md](docs/网络库设计.md)：动网络库前先读它
 - `scripts/` — `configure.py`（生成代码 + 配置 cmake，只用标准库）与 Windows 环境脚本（**目录名拼写如此，勿"修正"**）
 - `build/`、`run/` — 构建产物，不进版本库
 
