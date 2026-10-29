@@ -53,6 +53,8 @@ set(BREEZE_GEN_DIR ${CMAKE_SOURCE_DIR}/gen)  # 生成代码根目录，不进版
 set(LOGGER_DIR base/logger)
 set(KERNEL_DIR framework/kernel)
 set(QUEUE_DIR base/queue)
+set(BUFFER_DIR base/buffer)
+set(THREAD_DIR base/thread)
 set(NET_DIR base/net)
 set(NET_MODULE_DIR framework/net)
 
@@ -128,6 +130,14 @@ target_include_directories(breeze_queue INTERFACE ${QUEUE_DIR})
 target_link_libraries(breeze_queue INTERFACE
   concurrentqueue::concurrentqueue readerwriterqueue::readerwriterqueue Threads::Threads)
 
+# 通用字节缓冲：SharedBuffer（引用计数的不可变字节块上的切片）与 Buffer（带读写游标的缓冲）。不认识网络，业务也能直接用；
+# 只依赖标准库，不限平台。shared_buffer.cpp 用日志报编程错误，所以 breeze_logger 只 PRIVATE，使用方看不到这个依赖。
+add_library(breeze_buffer ${BUFFER_DIR}/shared_buffer.cpp ${BUFFER_DIR}/buffer.cpp)
+target_include_directories(breeze_buffer PUBLIC ${BUFFER_DIR})
+target_link_libraries(breeze_buffer PRIVATE breeze_logger)
+target_compile_options(breeze_buffer PRIVATE -Wall -Wextra)
+breeze_apply_log_level(breeze_buffer)
+
 # 网络库只支持 Linux（epoll、UDS、SO_PEERCRED），其它平台不构建。
 set(BREEZE_BUILD_NET OFF)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -135,18 +145,28 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 
 if(BREEZE_BUILD_NET)
+  # 线程基础库：Thread（创建失败返回 errno、不抛异常）、this_thread（缓存 tid / 线程名 / 是否主线程）、WaitGroup、SpinLock、
+  # ThreadPool。用到 pthread 命名、亲和性与 gettid，只支持 Linux，所以与网络库同一个开关。
+  # breeze_logger 只 PRIVATE：thread.cpp 等用日志报编程错误，使用方看不到这个依赖。
+  add_library(breeze_thread
+    ${THREAD_DIR}/thread.cpp
+    ${THREAD_DIR}/current_thread.cpp
+    ${THREAD_DIR}/wait_group.cpp
+    ${THREAD_DIR}/thread_pool.cpp)
+  target_include_directories(breeze_thread PUBLIC ${THREAD_DIR})
+  target_link_libraries(breeze_thread PUBLIC Threads::Threads PRIVATE breeze_logger)
+  target_compile_options(breeze_thread PRIVATE -Wall -Wextra)
+  breeze_apply_log_level(breeze_thread)
+
   # internal/ 是 PRIVATE：公开头不含它。日志同理只 PRIVATE，使用方看不到这个依赖；测试要直接用 internal/ 时自己加路径。
   add_library(breeze_net
     ${NET_DIR}/endpoint.cpp
-    ${NET_DIR}/shared_buffer.cpp
-    ${NET_DIR}/buffer.cpp
     ${NET_DIR}/length_prefix_codec.cpp
     ${NET_DIR}/connection.cpp
     ${NET_DIR}/connection_handle.cpp
     ${NET_DIR}/event_loop_group.cpp
     ${NET_DIR}/net_server.cpp
     ${NET_DIR}/net_client.cpp
-    ${NET_DIR}/internal/thread.cpp
     ${NET_DIR}/internal/connection_table.cpp
     ${NET_DIR}/internal/group_registry.cpp
     ${NET_DIR}/internal/socket.cpp
@@ -156,8 +176,9 @@ if(BREEZE_BUILD_NET)
     ${NET_DIR}/internal/transport.cpp
     ${NET_DIR}/internal/connector.cpp)
   target_include_directories(breeze_net PUBLIC ${NET_DIR} PRIVATE ${NET_DIR}/internal)
-  # breeze_queue 是 PUBLIC：internal/event_loop.h 里有 MpscQueue，要用 internal/ 的测试也得看得到它。
-  target_link_libraries(breeze_net PUBLIC Threads::Threads breeze_queue PRIVATE breeze_logger)
+  # breeze_queue 是 PUBLIC：internal/event_loop.h 里有 MpscQueue，要用 internal/ 的测试也得看得到它；
+  # breeze_buffer 同理：公开头里有 SharedBuffer / Buffer。breeze_thread：internal/loop_thread.h 里有 Thread，测试与 bench 要用。
+  target_link_libraries(breeze_net PUBLIC Threads::Threads breeze_queue breeze_buffer breeze_thread PRIVATE breeze_logger)
   target_compile_options(breeze_net PRIVATE -Wall -Wextra)
   breeze_apply_log_level(breeze_net)
 endif()
@@ -269,6 +290,16 @@ target_compile_options(queue_test PRIVATE -Wall -Wextra)
 add_test(NAME queue_test COMMAND queue_test)
 set_tests_properties(queue_test PROPERTIES ENVIRONMENT "${BREEZE_TEST_ENV}")
 
+add_executable(buffer_test ${BUFFER_DIR}/buffer_test.cpp)
+target_link_libraries(buffer_test PRIVATE breeze_buffer)
+target_compile_options(buffer_test PRIVATE -Wall -Wextra)
+add_test(NAME buffer_test COMMAND buffer_test)
+
+add_executable(shared_buffer_test ${BUFFER_DIR}/shared_buffer_test.cpp)
+target_link_libraries(shared_buffer_test PRIVATE breeze_buffer Threads::Threads)
+target_compile_options(shared_buffer_test PRIVATE -Wall -Wextra)
+add_test(NAME shared_buffer_test COMMAND shared_buffer_test)
+
 if(BREEZE_BUILD_NET)
   # breeze_net_test(<名> [INTERNAL])：${NET_DIR}/<名>.cpp 编成同名测试。INTERNAL = 测试要直接用 internal/ 里的头。
   function(breeze_net_test name)
@@ -284,11 +315,23 @@ if(BREEZE_BUILD_NET)
     set_tests_properties(${name} PROPERTIES ENVIRONMENT "${BREEZE_TEST_ENV}")
   endfunction()
 
+  # base/thread 的测试：只依赖 breeze_thread。
+  function(breeze_thread_test name)
+    add_executable(${name} ${THREAD_DIR}/${name}.cpp)
+    target_link_libraries(${name} PRIVATE breeze_thread)
+    target_compile_options(${name} PRIVATE -Wall -Wextra)
+    add_test(NAME ${name} COMMAND ${name})
+    set_tests_properties(${name} PROPERTIES ENVIRONMENT "${BREEZE_TEST_ENV}")
+  endfunction()
+
+  breeze_thread_test(thread_test)
+  breeze_thread_test(current_thread_test)
+  breeze_thread_test(spin_lock_test)
+  breeze_thread_test(wait_group_test)
+  breeze_thread_test(thread_pool_test)
+
   breeze_net_test(endpoint_test)
-  breeze_net_test(buffer_test)
-  breeze_net_test(shared_buffer_test)
   breeze_net_test(codec_test)
-  breeze_net_test(thread_test INTERNAL)
   breeze_net_test(socket_test INTERNAL)
   breeze_net_test(event_loop_test INTERNAL)
   breeze_net_test(connection_table_test INTERNAL)
@@ -316,10 +359,11 @@ if(BREEZE_BUILD_NET)
   # NetModule(app) 的用例读仓库里真实的 config/common.yaml（net 段）
   target_compile_definitions(net_module_test PRIVATE BREEZE_CONFIG_DIR="${CONFIG_SCHEMA_ROOT}/..")
 
-  # net 库内不抛、不 catch（设计 §4.11）。framework/net 还没有时 check 脚本会跳过它。
+  # net 库内不抛、不 catch（设计 §4.11）。base/buffer 与 base/thread 是 net 的依赖（SharedBuffer 在 IO 线程分配、Thread 创建失败不抛），一并扫。
   add_test(NAME net_no_exceptions_test
     COMMAND Python3::Interpreter -I ${CMAKE_SOURCE_DIR}/${NET_DIR}/check_no_exceptions.py
-            ${CMAKE_SOURCE_DIR}/${NET_DIR} ${CMAKE_SOURCE_DIR}/framework/net)
+            ${CMAKE_SOURCE_DIR}/${NET_DIR} ${CMAKE_SOURCE_DIR}/${BUFFER_DIR} ${CMAKE_SOURCE_DIR}/${THREAD_DIR}
+            ${CMAKE_SOURCE_DIR}/framework/net)
 endif()
 
 # 基线 bench：-DBREEZE_BUILD_BENCH=ON 才构建，默认关闭（要联网拉 muduo 源码）。

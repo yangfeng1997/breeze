@@ -18,6 +18,8 @@
 - `src/cpp` — C++ 侧，`CMakeLists.txt` 在此。`framework/app` 对照 Go 版
   `src/go/core/app` 实现，语义以后者的 CLAUDE.md 为准。
   `base/queue` 是 SPSC/MPSC 无锁队列（包 moodycamel，公开 API 不暴露其类型），网络库的底座；
+  `base/buffer` 是 `SharedBuffer`（引用计数的不可变字节块切片，业务回调的消息类型）与 `Buffer`（带读写游标的缓冲），只依赖标准库，网络库与业务都用；
+  `base/thread`（仅 Linux）是 `Thread` / `this_thread` / `WaitGroup` / `SpinLock` / `ThreadPool`，创建失败返回 errno、库内不抛异常，设计与来源见 [docs/线程基础库.md](docs/线程基础库.md)（**tsan 同样没在本机跑过**）；
   `base/net` 是 Reactor 网络库（仅 Linux）：`Endpoint` / `SharedBuffer` / `Buffer` / `FrameCodec` 等基础件，
   `EventLoop` / `Connection` / `ConnectionHandle` / `EventLoopGroup` / `NetServer` / `NetClient`（含重连）已完整，
   `framework/net` 有 `MainLoopExecutor`（IO 线程事件回投 App 主循环，带入口背压）与 `NetModule`；
