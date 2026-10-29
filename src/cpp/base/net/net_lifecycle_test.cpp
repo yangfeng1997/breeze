@@ -335,6 +335,97 @@ void TestShutdownStopsRetryingClient()
     CHECK(rec.connected_count() == 0);
 }
 
+// Shutdown 等待期间调用方线程每轮调一次 idle：框架层借它在停机期间继续消费事件。
+// 对端一直不关，直到 idle 被调过几次——证明等待期间确实在调它，且 Shutdown 一直等到对端关闭才返回（没有提前、也没等满
+// deadline）。
+void TestShutdownCallsIdleHookWhileWaiting()
+{
+    const LeakCheck leak;
+    Fixture f(*Endpoint::Tcp("127.0.0.1", 0));
+    TestClient c(f.server.endpoint());
+    f.rec.WaitConnected(0);
+
+    int calls = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    f.group.Shutdown(5s,
+                     [&]
+                     {
+                         if (++calls == 5)
+                             c.Close(); // idle 在调用 Shutdown 的线程上执行，所以可以直接操作本线程的客户端
+                         return false;
+                     });
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    CHECK(calls >= 5);
+    CHECK(elapsed < 3s); // 对端关闭就结束，没等到 deadline
+    CHECK(f.rec.closed_count() == 1 && f.rec.WaitClosed(0).reason == CloseReason::LocalClose);
+}
+
+// idle 返回 true（做了事）时不睡，立即再来。
+void TestShutdownIdleHookReturningTrueDoesNotSleep()
+{
+    const LeakCheck leak;
+    Fixture f(*Endpoint::Tcp("127.0.0.1", 0));
+    TestClient c(f.server.endpoint());
+    f.rec.WaitConnected(0);
+    int calls = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    f.group.Shutdown(5s,
+                     [&]
+                     {
+                         if (++calls == 2000)
+                             c.Close();
+                         return true;
+                     });
+    CHECK(calls >= 2000);
+    CHECK(std::chrono::steady_clock::now() - t0 < 1500ms); // 返回 false 时每轮至少睡 1ms，2000 轮会超过 2s
+}
+
+// group 已经在停机 / 已停机：NetServer / NetClient 的 Start 返回 ESHUTDOWN，不是编程错误（回调里 Start()
+// 恰好撞上停机）。
+void TestStartAfterShutdownReturnsEshutdown()
+{
+    const LeakCheck leak;
+    EventRecorder rec;
+    LengthPrefixCodecFactory factory(kMaxFrame);
+    EventLoopGroup group({1, 8});
+    CHECK(group.Start() == 0);
+    NetServer server(group, *Endpoint::Tcp("127.0.0.1", 0), {}, rec, factory);
+    NetClient client(group, *Endpoint::Tcp("127.0.0.1", 1), {}, ReconnectPolicy{}, rec, factory);
+    CHECK(!group.stopping());
+    group.Shutdown(100ms);
+    CHECK(group.stopping() && !group.running());
+    CHECK(server.Start() == ESHUTDOWN);
+    CHECK(client.Start() == ESHUTDOWN);
+}
+
+// 停机期间，在 Stopping 阶段里从另一个线程调 NetClient::Start（模拟 on_connect_failed 回调里的 Start() 撞上停机）：
+// 不崩，返回 ESHUTDOWN 或 0（赶在状态翻转之前）。
+void TestStartRacingShutdownNeverCrashes()
+{
+    for (int round = 0; round < 20; ++round)
+    {
+        EventRecorder rec;
+        LengthPrefixCodecFactory factory(kMaxFrame);
+        EventLoopGroup group({1, 8});
+        CHECK(group.Start() == 0);
+        NetClient client(
+            group, *Endpoint::Tcp("127.0.0.1", 1), {}, ReconnectPolicy{20ms, 100ms, 2.0, 0.0}, rec, factory);
+        std::atomic<bool> go{false};
+        std::atomic<int> rc{-1};
+        std::thread t(
+            [&]
+            {
+                while (!go.load())
+                    std::this_thread::yield();
+                rc = client.Start();
+            });
+        go = true;
+        group.Shutdown(50ms);
+        t.join();
+        CHECK(rc.load() == 0 || rc.load() == ESHUTDOWN);
+    }
+}
+
 } // namespace
 
 int main()
@@ -352,6 +443,10 @@ int main()
     TestShutdownRacesWithAccepts();
     TestServerAndClientInOneGroupShutDownTogether();
     TestShutdownStopsRetryingClient();
+    TestShutdownCallsIdleHookWhileWaiting();
+    TestShutdownIdleHookReturningTrueDoesNotSleep();
+    TestStartAfterShutdownReturnsEshutdown();
+    TestStartRacingShutdownNeverCrashes();
     std::puts("net_lifecycle_test: ok");
     return 0;
 }

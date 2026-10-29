@@ -183,7 +183,9 @@ void NetModule::Shutdown()
     if (phase_ != Phase::Started)
         return;
     phase_ = Phase::ShutDown;
-    group_->Shutdown(options_.shutdown_deadline);
+    // 等连接关闭期间继续消费事件：连接进入优雅关闭后暂停读不再生效（要读到对端的 FIN 与最后几条消息），
+    // 对端还在灌数据的话，主线程只阻塞等着，事件就无界地堆在队列里。
+    group_->Shutdown(options_.shutdown_deadline, [this] { return executor_.Drain(options_.wake_budget); });
     // IO 线程都已 join，不会再有新事件；把剩下的（含每条连接的 OnClosed）交给业务。
     while (executor_.Drain(options_.wake_budget))
     {

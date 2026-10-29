@@ -91,22 +91,26 @@ namespace
 constexpr std::chrono::milliseconds kForceCloseWait{2000};
 } // namespace
 
-bool EventLoopGroup::WaitDrained(std::chrono::steady_clock::time_point until) const
+bool EventLoopGroup::WaitDrained(std::chrono::steady_clock::time_point until,
+                                 std::move_only_function<bool()>& idle) const
 {
     for (;;)
     {
+        // 还要求每个 loop 的 BeginShutdown 都跑完：否则连接表暂时为空只是因为 loop 还没处理到停机任务，
+        // 它的 Acceptor 还在接新连接，这时 Quit 出去就会让投给已退出 loop 的连接没人服务。
         bool drained = true;
         for (const auto& w : workers_)
-            drained = drained && w->loop.table().Live() == 0;
+            drained = drained && w->loop.shutdown_started() && w->loop.table().Live() == 0;
         if (drained)
             return true;
         if (std::chrono::steady_clock::now() >= until)
             return false;
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (!(idle && idle()))
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
 
-void EventLoopGroup::DrainConnections(std::chrono::milliseconds deadline)
+void EventLoopGroup::DrainConnections(std::chrono::milliseconds deadline, std::move_only_function<bool()>& idle)
 {
     const auto limit = std::chrono::steady_clock::now() + deadline;
     // 各 loop 先停自己的 Acceptor / Connector，再对连接优雅关闭，此后的新连接任务一律丢弃。
@@ -115,7 +119,7 @@ void EventLoopGroup::DrainConnections(std::chrono::milliseconds deadline)
         EventLoop* l = &w->loop;
         l->Post([l, deadline] { l->BeginShutdown(deadline); });
     }
-    if (WaitDrained(limit))
+    if (WaitDrained(limit, idle))
         return;
     LOG_WARN("EventLoopGroup 停机：{}ms 内连接没有走完，强关剩余连接", deadline.count());
     for (auto& w : workers_)
@@ -123,16 +127,16 @@ void EventLoopGroup::DrainConnections(std::chrono::milliseconds deadline)
         EventLoop* l = &w->loop;
         l->Post([l] { l->CloseAllConnections(); });
     }
-    if (!WaitDrained(std::chrono::steady_clock::now() + kForceCloseWait))
+    if (!WaitDrained(std::chrono::steady_clock::now() + kForceCloseWait, idle))
         LOG_ERROR("EventLoopGroup 停机：强关之后连接仍未清空，直接停 loop");
 }
 
-void EventLoopGroup::Shutdown(std::chrono::milliseconds deadline)
+void EventLoopGroup::Shutdown(std::chrono::milliseconds deadline, std::move_only_function<bool()> idle)
 {
     if (state_ != State::Running)
         return;
     state_ = State::Stopping;
-    DrainConnections(deadline);
+    DrainConnections(deadline, idle);
     StopWorkers(workers_.size());
     GroupRegistry::Global().Unregister(id_); // 之后本 group 的句柄解析不到
     state_ = State::Stopped;

@@ -71,8 +71,12 @@ int NetClient::Start()
 {
     Impl& m = *impl_;
     if (!m.group.running())
-        LOG_FATAL("NetClient::Start 之前必须已 EventLoopGroup::Start() 成功（且尚未 Shutdown）endpoint={}",
-                  endpoint_.ToString());
+    {
+        // 回调里 Start()（文档允许）可能恰好撞上停机：返回 ESHUTDOWN，不是编程错误。
+        if (m.group.stopping())
+            return ESHUTDOWN;
+        LOG_FATAL("NetClient::Start 之前必须已 EventLoopGroup::Start() 成功 endpoint={}", endpoint_.ToString());
+    }
     if (m.connector == nullptr)
     {
         if (m.options.connect_timeout.count() <= 0 || !m.policy.Valid())

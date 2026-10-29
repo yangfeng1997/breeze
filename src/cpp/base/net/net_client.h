@@ -60,7 +60,8 @@ public:
     // 任意线程；group 必须已 Start（否则是编程错误，LOG_FATAL）。投递到所属 loop 串行处理，所以先 Stop 再 Start
     // 的顺序有保证， 先 Stop 再 Start 也不会并存两条连接（旧连接的 OnClosed 先于新连接的 OnConnected）。
     // 只返回参数类错误：选项不合法 EINVAL（connect_timeout ≤ 0、ReconnectPolicy::Valid() 为假）；
-    // 连接建立失败走 on_connect_failed。
+    // 连接建立失败走 on_connect_failed。group 正在 / 已经停机返回 ESHUTDOWN（回调里 Start()
+    // 恰好撞上停机时不会让进程中止）。
     [[nodiscard]] int Start();
 
     // 任意线程。停止重连并关闭当前连接（等价 Close()；要优雅关闭，业务先对句柄调 CloseGracefully），回到 Idle，不等待。

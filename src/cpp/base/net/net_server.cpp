@@ -1,5 +1,6 @@
 #include "net_server.h"
 
+#include <cerrno>
 #include <chrono>
 #include <utility>
 
@@ -159,8 +160,11 @@ int NetServer::Start()
 {
     Impl& m = *impl_;
     if (!m.group.running())
-        LOG_FATAL("NetServer::Start 之前必须已 EventLoopGroup::Start() 成功（且尚未 Shutdown）endpoint={}",
-                  m.endpoint.ToString());
+    {
+        if (m.group.stopping())
+            return ESHUTDOWN; // group 正在 / 已经停机
+        LOG_FATAL("NetServer::Start 之前必须已 EventLoopGroup::Start() 成功 endpoint={}", m.endpoint.ToString());
+    }
     if (m.acceptor)
         LOG_FATAL("NetServer 重复 Start endpoint={}", m.endpoint.ToString());
 

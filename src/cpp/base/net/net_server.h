@@ -50,7 +50,7 @@ public:
     NetServer& operator=(const NetServer&) = delete;
 
     // group 必须已 Start（否则是编程错误，LOG_FATAL）；只能调用一次。阻塞到 bind / listen 在 IO 线程上完成。
-    // 0 = 成功，否则 errno（EADDRINUSE、EACCES、ENAMETOOLONG……），失败时已回滚。
+    // 0 = 成功，否则 errno（EADDRINUSE、EACCES、ENAMETOOLONG……），失败时已回滚；group 正在 / 已经停机返回 ESHUTDOWN。
     [[nodiscard]] int Start();
 
     // 只停 accept，已接受的连接继续服务，由 EventLoopGroup::Shutdown 收尾。异步；对没 Start 过的对象是空操作。

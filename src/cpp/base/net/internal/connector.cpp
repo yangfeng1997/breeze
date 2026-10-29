@@ -264,7 +264,15 @@ void Connector::OnConnectionClosed(Connection& c, CloseReason reason, int sys_er
     if (start_when_closed_)
     {
         start_when_closed_ = false;
-        Attempt(); // Stop 之后马上又 Start：不走退避
+        // Stop 之后马上又 Start：不走退避。但不能在这里直接 Attempt：旧连接的槽要到本轮回收才释放，
+        // 连接表恰好满时 TryReserve 会失败、误报 ENOMEM 并退避。定时器下一轮才触发，那时槽已经回收。
+        phase_ = Phase::Backoff;
+        retry_timer_ = loop_.RunAfter(std::chrono::milliseconds::zero(),
+                                      [this]
+                                      {
+                                          retry_timer_ = 0;
+                                          Attempt();
+                                      });
         return;
     }
     ScheduleRetry(); // 断开立即已经发了 OnClosed；退避之后重连，连接成功才重置退避

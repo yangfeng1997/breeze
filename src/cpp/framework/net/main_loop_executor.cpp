@@ -194,6 +194,12 @@ void MainLoopExecutor::MaybePause(Connection& c, const std::shared_ptr<ConnState
 {
     if (st->paused.load(std::memory_order_relaxed))
         return;
+    // 物理上还暂停着、标志却已被主线程清掉：主线程的 ResumeRead 已经投递、还没执行。此刻翻转标志再 PauseRead 是空操作
+    // （物理上本来就是暂停的），随后那个过期的 ResumeRead 生效，连接物理上恢复读而标志仍是 true——之后这里直接返回，
+    // 这条连接的在途量就不再受限了。所以等恢复生效再判断：这次 read 剩下的帧照常入队（≤64KB），下一次 read
+    // 的消息再暂停。
+    if (c.IsPaused())
+        return;
     const bool global_over = global_bytes_.load() > limits_.global_budget_bytes;
     if (!global_over && !ConnOver(*st, /*low=*/false))
         return;
@@ -201,8 +207,10 @@ void MainLoopExecutor::MaybePause(Connection& c, const std::shared_ptr<ConnState
         return;
     pauses_.fetch_add(1, std::memory_order_relaxed);
     c.PauseRead();
-    if (global_over)
-        AddWaiter(st); // 全局预算降下来时由主线程统一恢复；本连接可能没有在途消息，没人会为它触发 Release
+    // 全局预算还没降到低水位就要排队（不只是"超过高水位"时）：本连接可能没有在途消息，没有 Release 会为它触发，
+    // 要靠 ResumeGlobalWaiters 在全局降下来时恢复；"高于低水位、低于高水位"同样阻止恢复。
+    if (global_bytes_.load() > GlobalLow())
+        AddWaiter(st);
     if (!StillOver(*st) && st->paused.exchange(false))
         c.ResumeRead(); // 已经降下来了
 }

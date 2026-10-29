@@ -146,7 +146,11 @@ public:
     // 强关所有连接（BeginShutdown 的优雅期到了还没走完时用）。
     void CloseAllConnections();
     // false = 正在停机：跨线程投递来的"新连接"任务要丢弃，归还预留名额。
-    bool accepting() const noexcept { return !shutting_down_; }
+    bool accepting() const noexcept { return !shutting_down_.load(std::memory_order_relaxed); }
+    // BeginShutdown 已经跑完（钩子执行过、Acceptor / Connector 已停、现有连接已开始关闭）。任意线程可读：
+    // EventLoopGroup 要等所有 loop 都到了这一步才停 loop，否则某个 loop 的 Acceptor 还在接新连接、
+    // 投给已经退出的 loop，那个连接就永远没人服务。
+    bool shutdown_started() const noexcept { return shutdown_started_.load(std::memory_order_acquire); }
 
     // 已预留 + 已建立的连接数，任意线程可读。
     std::size_t ConnectionCount() const noexcept { return table_->Live(); }
@@ -247,7 +251,8 @@ private:
     TimerId idle_timer_ = 0;
     Clock::time_point cached_now_{};
 
-    bool shutting_down_ = false;
+    std::atomic<bool> shutting_down_{false};    // BeginShutdown 一开始就置位：之后不再接受新连接
+    std::atomic<bool> shutdown_started_{false}; // BeginShutdown 结束时置位
     std::vector<std::pair<HookId, std::move_only_function<void()>>> hooks_;
     HookId next_hook_id_ = 1;
 };

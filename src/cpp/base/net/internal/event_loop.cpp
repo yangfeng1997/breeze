@@ -354,7 +354,7 @@ void EventLoop::RemoveShutdownHook(HookId id)
 void EventLoop::BeginShutdown(std::chrono::milliseconds grace)
 {
     AssertInLoopThread();
-    shutting_down_ = true;
+    shutting_down_.store(true, std::memory_order_relaxed);
     // 钩子先搬出来再跑：钩子里调 RemoveShutdownHook 不会破坏正在遍历的容器。
     auto hooks = std::move(hooks_);
     hooks_.clear();
@@ -368,6 +368,7 @@ void EventLoop::BeginShutdown(std::chrono::milliseconds grace)
             else
                 c.CloseGracefully(grace);
         });
+    shutdown_started_.store(true, std::memory_order_release);
 }
 
 void EventLoop::CloseAllConnections()

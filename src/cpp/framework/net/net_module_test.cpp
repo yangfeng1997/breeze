@@ -385,6 +385,58 @@ void TestShutdownDrainsEveryClosed()
     net->Shutdown();            // 重复调用是空操作
 }
 
+// 停机等待期间事件继续被消费：对端在宽限期里还在发的消息，在 Shutdown 返回之前就交给了业务。
+// 连接进入优雅关闭后暂停读不再生效，如果主线程只阻塞等着，这些数据只会堆在事件队列里；
+// 这里对端要等业务"收到"它的消息才肯关——没有边等边消费的话，只能等到 shutdown_deadline 被强关。
+void TestShutdownKeepsDrainingWhileWaiting()
+{
+    const LeakCheck leak;
+    Biz biz;
+    biz.echo = false;
+    App app("net-test");
+    NetModule* net = nullptr;
+    app.RegisterModule(
+        [&](App& a)
+        {
+            auto m = std::make_unique<NetModule>(a, SmallOptions()); // shutdown_deadline = 2s
+            net = m.get();
+            return m;
+        });
+    BizModule* bm = nullptr;
+    app.RegisterModule(
+        [&](App& a)
+        {
+            auto m = std::make_unique<BizModule>(a, biz, "tcp://127.0.0.1:0");
+            bm = m.get();
+            return m;
+        });
+    constexpr int kLate = 50;
+    std::stop_source ss;
+    std::thread driver(
+        [&]
+        {
+            CHECK(WaitUntil([&] { return bm != nullptr && bm->ready(); }));
+            TestClient c(bm->bound());
+            c.SendFrame("hi");
+            CHECK(WaitUntil([&] { return biz.messages() == 1; }));
+            ss.request_stop();                                         // Run 返回，main 随即调 Shutdown
+            CHECK(WaitUntil([&] { return !net->group().running(); })); // 停机开始：服务端的连接进入优雅关闭
+            for (int i = 0; i < kLate; ++i)
+                c.SendFrame("late" + std::to_string(i));
+            // 业务要在 Shutdown 还在等的时候就收到这些消息，我们才关闭连接
+            CHECK(WaitUntil([&] { return biz.messages() == 1 + kLate; }, 1500ms));
+        });
+    const auto r = app.Run(ss.get_token());
+    CHECK(r);
+    const auto t0 = std::chrono::steady_clock::now();
+    net->Shutdown();
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    driver.join(); // 客户端随之析构、关闭
+    CHECK(biz.messages() == 1 + kLate);
+    CHECK(biz.closed() == 1);
+    CHECK(elapsed < 1800ms); // 没有等到 shutdown_deadline（2s）被强关
+}
+
 // ---- Start 失败：自清理，Run 返回带 endpoint 与 strerror 的错误 ----
 
 void TestStartFailureRollsBackAndReportsEndpoint()
@@ -521,6 +573,7 @@ int main()
     TestAssemblyAfterStartIsPhaseError();
     TestClientThroughModule();
     TestShutdownDrainsEveryClosed();
+    TestShutdownKeepsDrainingWhileWaiting();
     TestStartFailureRollsBackAndReportsEndpoint();
     TestAssemblyErrors();
     TestOptionsFromConfig();

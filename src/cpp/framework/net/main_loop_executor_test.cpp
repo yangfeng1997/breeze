@@ -433,6 +433,99 @@ void TestHysteresisBetweenHighAndLowWater()
     CHECK(f.handler.Count('M') == 20);
 }
 
+// 过期的 ResumeRead 不能让暂停标志与物理状态脱节（独立审查指出的交错）：
+//   1. IO 线程在一次 read 的第 9 帧处暂停（标志 true、物理暂停）；
+//   2. 主线程这时把积压消费光 → 标志清掉、投递 ResumeRead（还没执行：IO 线程还在分发同一次 read 剩下的帧）；
+//   3. IO 线程继续分发，在途又超过高水位：此时物理上仍是暂停，翻转标志再 PauseRead 是空操作，随后过期的 ResumeRead
+//      生效——连接物理上恢复读，标志却是 true，MaybePause 从此直接返回，这条连接的入站不再受限。
+// 用一个"门"把 IO 线程卡在第 9 帧之后，让 2 在 3 之前确定发生。之后主线程不再消费，客户端继续灌：
+// 在途必须被钉住（再次暂停），而不是无界增长。
+class Gate final : public ConnectionHandler
+{
+public:
+    Gate(ConnectionHandler& inner, int block_at)
+        : inner_(inner)
+        , block_at_(block_at)
+    {
+    }
+    void OnConnected(Connection& c) noexcept override { inner_.OnConnected(c); }
+    void OnMessage(Connection& c, std::span<const std::byte> payload) noexcept override
+    {
+        inner_.OnMessage(c, payload);
+        if (seen_.fetch_add(1) + 1 == block_at_)
+        {
+            blocked_ = true;
+            while (!release_.load())
+                std::this_thread::sleep_for(100us);
+        }
+    }
+    void OnClosed(Connection& c, CloseReason r, int e) noexcept override { inner_.OnClosed(c, r, e); }
+
+    bool blocked() const { return blocked_.load(); }
+    void Release() { release_ = true; }
+
+private:
+    ConnectionHandler& inner_;
+    const int block_at_;
+    std::atomic<int> seen_{0};
+    std::atomic<bool> blocked_{false};
+    std::atomic<bool> release_{false};
+};
+
+void TestStaleResumeDoesNotDisableBackpressure()
+{
+    const LeakCheck leak;
+    constexpr std::size_t kFrame = 100;
+    App app("exec-test");
+    MainLoopExecutor executor(app, Limits(8, 1ull << 30, 1ull << 30));
+    Recorder handler;
+    Gate gate(executor.Wrap(handler), /*block_at=*/9);
+    LengthPrefixCodecFactory factory(kMaxFrame);
+    EventLoopGroup group({1, 8});
+    NetServer server(group, *Endpoint::Tcp("127.0.0.1", 0), BigWater(), gate, factory);
+    CHECK(group.Start() == 0);
+    CHECK(server.Start() == 0);
+
+    TestClient c(server.endpoint());
+    std::vector<std::byte> batch; // 40 帧拼成一次 send：服务端一次 read 全部读进来
+    for (int i = 0; i < 40; ++i)
+    {
+        const auto fr = TestClient::Frame(std::string(kFrame, 'a'));
+        batch.insert(batch.end(), fr.begin(), fr.end());
+    }
+    c.SendAll(batch);
+
+    CHECK(WaitUntil([&] { return gate.blocked(); })); // IO 线程停在第 9 帧之后，已经暂停
+    CHECK(WaitUntil([&] { return group.GetStats().paused_connections == 1; }));
+    const auto drain_until = [&](std::size_t messages)
+    {
+        const auto deadline = std::chrono::steady_clock::now() + kWait;
+        while (handler.Count('M') < messages)
+        {
+            CHECK(std::chrono::steady_clock::now() < deadline);
+            if (!executor.Drain(256))
+                std::this_thread::sleep_for(200us);
+        }
+    };
+    drain_until(9); // 主线程消费光：标志清掉，ResumeRead 已投递（IO 线程被卡着，执行不了）
+    gate.Release(); // IO 线程继续分发剩下的 31 帧，在途又超过高水位；之后才执行那个过期的 ResumeRead
+
+    // 之后主线程不再消费，客户端继续灌 2MB：在途必须被钉住，连接必须再次物理暂停
+    std::thread flood(
+        [&]
+        {
+            for (int i = 0; i < 20000; ++i)
+                c.SendFrame(std::string(kFrame, 'b'));
+        });
+    CHECK(WaitUntil([&] { return group.GetStats().paused_connections == 1; }));
+    std::this_thread::sleep_for(200ms);
+    CHECK(group.GetStats().paused_connections == 1);
+    // 一次 read ≤ 64KB（≈ 600 帧），加上刚才那批剩下的 31 帧：远小于 2MB
+    CHECK(executor.GetStats().inflight_bytes <= 100 * 1024);
+    drain_until(40 + 20000); // 消费之后恢复，flood 才能发完
+    flood.join();
+}
+
 // ---- 析构 ----
 
 // 未消费的事件随 executor 销毁，不回调业务；连接状态（shared_ptr）不泄漏（asan 下检查）。
@@ -468,6 +561,7 @@ int main()
     TestPerConnectionBackpressure();
     TestGlobalBudgetPausesAllAndResumesAll();
     TestHysteresisBetweenHighAndLowWater();
+    TestStaleResumeDoesNotDisableBackpressure();
     TestBackpressureStress();
     TestDestroyWithPendingEvents();
     std::puts("main_loop_executor_test: ok");
