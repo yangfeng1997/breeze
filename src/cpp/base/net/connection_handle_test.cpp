@@ -336,28 +336,22 @@ void TestSendRacingClose()
     TestClient c(s.ep());
     const ConnectionHandle h = rec.WaitHandle(0);
 
-    // 每个线程发送条数有上限：生产者不设限的话，一个 loop 线程消费不过来，任务队列会无限涨。
     constexpr int kThreads = 4;
-    constexpr int kMaxPerThread = 5000;
     std::vector<std::thread> ths;
     for (int t = 0; t < kThreads; ++t)
     {
         ths.emplace_back(
             [&]
             {
-                for (int i = 0; i < kMaxPerThread; ++i)
+                while (h.Send(Buf("x")) == SendResult::Ok)
                 {
-                    if (h.Send(Buf("x")) == SendResult::Closed)
-                        return; // Close 生效之后返回 Closed
-                    if (i % 64 == 0)
-                        std::this_thread::yield();
                 }
             });
     }
-    std::this_thread::sleep_for(1ms);
+    std::this_thread::sleep_for(5ms);
     h.Close();
     for (auto& th : ths)
-        th.join();
+        th.join(); // Close 生效之后 Send 返回 Closed，线程自然退出
     CHECK(c.WaitClosed());
     const auto done = rec.WaitClosed(1);
     CHECK(done[0].second == CloseReason::LocalClose);
