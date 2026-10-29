@@ -20,7 +20,11 @@ class LoopServer
 {
 public:
     // handler 与 factory 只持引用，调用方保证它们比 LoopServer 与它的连接活得久。
-    LoopServer(EventLoop& loop, Endpoint endpoint, ConnectionHandler& handler, const FrameCodecFactory& factory);
+    LoopServer(EventLoop& loop,
+               Endpoint endpoint,
+               ConnectionHandler& handler,
+               const FrameCodecFactory& factory,
+               ConnectionOptions options = {});
 
     // 在 loop 线程上调用（loop 开始运行之前的装配阶段不限）。返回 errno，失败时已回滚。
     [[nodiscard]] int Start() { return acceptor_.Listen(); }
@@ -36,6 +40,7 @@ private:
     EventLoop& loop_;
     ConnectionHandler& handler_;
     const FrameCodecFactory& factory_;
+    ConnectionOptions options_;
     Acceptor acceptor_; // 声明在最后：先于上面的成员销毁，销毁时 Stop 仍可用
 };
 

@@ -16,9 +16,9 @@ namespace breeze
 class LoopThread
 {
 public:
-    LoopThread()
+    explicit LoopThread(const LoopOptions& options = {})
     {
-        if (loop.Init() != 0)
+        if (loop.Init(options) != 0)
         {
             std::fprintf(stderr, "LoopThread: EventLoop::Init 失败\n");
             std::abort();

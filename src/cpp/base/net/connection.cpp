@@ -47,13 +47,24 @@ ssize_t SendIov(int fd, iovec* iov, int cnt)
 
 } // namespace
 
-Connection::Connection(
-    EventLoop& loop, Fd fd, PeerInfo peer, ConnectionHandler& handler, std::unique_ptr<FrameCodec> codec)
+Connection::Connection(EventLoop& loop,
+                       Fd fd,
+                       PeerInfo peer,
+                       ConnectionHandler& handler,
+                       std::unique_ptr<FrameCodec> codec,
+                       const ConnectionOptions& options,
+                       ConnectionTable::Slot& slot,
+                       std::uint32_t slot_index,
+                       ConnectionHandle handle)
     : loop_(loop)
     , fd_(std::move(fd))
     , peer_(std::move(peer))
     , handler_(handler)
     , codec_(std::move(codec))
+    , slot_(slot)
+    , slot_index_(slot_index)
+    , handle_(handle)
+    , high_water_(options.high_water_mark)
 {
 }
 
@@ -66,6 +77,7 @@ bool Connection::Establish()
     {
         LOG_WARN("epoll_ctl(ADD) 失败 fd={} errno={}，只关闭这条新连接", fd_.get(), err);
         state_ = State::Disconnected;
+        slot_.state.store(ConnectionTable::State::Disconnected, std::memory_order_release);
         loop_.QueueClose(this); // 没回调过 OnConnected，回收时也就不会有 OnClosed
         return false;
     }
@@ -170,7 +182,7 @@ namespace
 
 // 把 p 还没写出的部分填进 iov，返回填了几个。
 int FillIov(
-    const std::byte* header, std::size_t header_len, const SharedBuffer& payload, std::size_t offset, iovec* iov)
+    const std::byte* header, std::size_t header_len, std::span<const std::byte> payload, std::size_t offset, iovec* iov)
 {
     int n = 0;
     std::size_t off = offset;
@@ -190,7 +202,19 @@ int FillIov(
 
 } // namespace
 
-SendResult Connection::Send(SharedBuffer payload)
+SendResult Connection::Send(SharedBuffer payload) { return SendImpl(payload.bytes(), &payload, false); }
+
+SendResult Connection::Send(std::span<const std::byte> payload) { return SendImpl(payload, nullptr, false); }
+
+void Connection::SendFromTask(SharedBuffer payload)
+{
+    if (state_ != State::Connected)
+        return; // 连接已标记关闭：槽回收时 pending_bytes 会清零，这里不用减
+    (void)SendImpl(payload.bytes(), &payload, true);
+}
+
+// owned 非空：调用方交来的 SharedBuffer，入队时直接接管；为空：payload 只是个视图，入队时才拷贝。
+SendResult Connection::SendImpl(std::span<const std::byte> payload, SharedBuffer* owned, bool counted)
 {
     loop_.AssertInLoopThread();
     if (state_ != State::Connected)
@@ -219,15 +243,31 @@ SendResult Connection::Send(SharedBuffer payload)
             return SendResult::Closed;
         }
         if (static_cast<std::size_t>(n) == header_len + payload.size())
+        {
+            if (counted)
+                slot_.pending_bytes.fetch_sub(payload.size(), std::memory_order_relaxed);
             return SendResult::Ok;
+        }
         written = static_cast<std::size_t>(n);
     }
 
     // 已有积压（排在后面保序，EPOLLOUT 已经注册），或没写完：入队，剩下的靠 EPOLLOUT 排空。
+    // 直写整帧成功的快路径不碰 pending_bytes；只有入队才计入，超水位就是慢消费者。
+    if (!counted)
+    {
+        const std::uint64_t pending =
+            slot_.pending_bytes.fetch_add(payload.size(), std::memory_order_relaxed) + payload.size();
+        if (pending > high_water_)
+        {
+            LOG_WARN("发送积压 {} 字节超过水位 {}，按慢消费者关闭连接", pending, high_water_);
+            CloseWith(CloseReason::SlowConsumer, 0);
+            return SendResult::Closed;
+        }
+    }
     Pending& p = out_.emplace_back();
     p.header = header;
     p.header_len = static_cast<std::uint8_t>(header_len);
-    p.payload = std::move(payload);
+    p.payload = owned != nullptr ? std::move(*owned) : SharedBuffer::CopyFrom(payload);
     p.offset = written;
     if (!want_write_)
         SetWriteInterest(true);
@@ -243,7 +283,7 @@ void Connection::HandleWrite()
         std::size_t offered = 0;
         for (auto it = out_.begin(); it != out_.end() && cnt + 2 <= kMaxIov; ++it)
         {
-            cnt += FillIov(it->header.data(), it->header_len, it->payload, it->offset, iov + cnt);
+            cnt += FillIov(it->header.data(), it->header_len, it->payload.bytes(), it->offset, iov + cnt);
             offered += it->Total() - it->offset;
         }
 
@@ -262,6 +302,7 @@ void Connection::HandleWrite()
             if (left >= remain)
             {
                 left -= remain;
+                slot_.pending_bytes.fetch_sub(f.payload.size(), std::memory_order_relaxed);
                 out_.pop_front();
             }
             else
@@ -293,6 +334,7 @@ void Connection::CloseWith(CloseReason reason, int sys_errno)
     if (state_ == State::Disconnected)
         return;
     state_ = State::Disconnected;
+    slot_.state.store(ConnectionTable::State::Disconnected, std::memory_order_release); // 跨线程 Send 从此得到 Closed
     close_reason_ = reason;
     close_errno_ = sys_errno;
     if (registered_)

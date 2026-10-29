@@ -20,12 +20,14 @@ EventLoop::EventLoop(NowFn now)
 {
 }
 
-// 在这里定义（而不是头文件里默认）：销毁 connections_ 需要 Connection 是完整类型。
+// 在这里定义（而不是头文件里默认）：销毁连接表需要 Connection 是完整类型。
 // 没有走正常关闭流程就析构时，剩下的连接直接销毁（fd 随之关闭），不再回调 OnClosed。
 EventLoop::~EventLoop() = default;
 
-int EventLoop::Init()
+int EventLoop::Init(const LoopOptions& options)
 {
+    if (options.max_connections == 0 || options.max_connections > ConnectionTable::kMaxCapacity)
+        return EINVAL;
     Fd ep(::epoll_create1(EPOLL_CLOEXEC));
     if (!ep.valid())
         return errno;
@@ -37,6 +39,8 @@ int EventLoop::Init()
     ev.data.ptr = &wake_handler_;
     if (::epoll_ctl(ep.get(), EPOLL_CTL_ADD, wake.get(), &ev) != 0)
         return errno;
+    options_ = options;
+    table_ = std::make_unique<ConnectionTable>(options.max_connections);
     epfd_ = std::move(ep);
     wakefd_ = std::move(wake);
     return 0;
@@ -81,14 +85,31 @@ void EventLoop::AssertInLoopThread() const
 
 void EventLoop::Post(std::move_only_function<void()> fn)
 {
-    tasks_.Enqueue(Task{Task::Op::Call, std::make_unique<std::move_only_function<void()>>(std::move(fn))});
+    Task t;
+    t.kind = Task::Kind::Call;
+    t.fn = std::make_unique<std::move_only_function<void()>>(std::move(fn));
+    tasks_.Enqueue(std::move(t));
+    Wake();
+}
+
+void EventLoop::PostOp(Op op, ConnectionHandle handle, std::uint32_t arg, SharedBuffer payload)
+{
+    Task t;
+    t.kind = Task::Kind::Conn;
+    t.op = op;
+    t.arg = arg;
+    t.handle = handle;
+    t.payload = std::move(payload);
+    tasks_.Enqueue(std::move(t));
     Wake();
 }
 
 void EventLoop::Quit()
 {
     // 走任务队列而不是改标志位：标志位不受"睡前复查"保护，会丢唤醒。
-    tasks_.Enqueue(Task{Task::Op::Quit, nullptr});
+    Task t;
+    t.kind = Task::Kind::Quit;
+    tasks_.Enqueue(std::move(t));
     Wake();
 }
 
@@ -199,10 +220,22 @@ void EventLoop::RunTimers()
 
 // ---- 连接持有与回收 ----
 
-Connection* EventLoop::Adopt(std::unique_ptr<Connection> conn)
+Connection* EventLoop::NewConnection(Fd fd,
+                                     PeerInfo peer,
+                                     ConnectionHandler& handler,
+                                     std::unique_ptr<FrameCodec> codec,
+                                     const ConnectionOptions& options)
 {
+    AssertInLoopThread();
+    const std::uint32_t slot = table_->Allocate(options.high_water_mark);
+    const std::uint32_t generation = table_->slot(slot).generation.load(std::memory_order_relaxed);
+    const ConnectionHandle handle = options_.group_id == LoopOptions::kNoGroup
+                                        ? ConnectionHandle{}
+                                        : ConnectionHandle::Make(options_.group_id, options_.index, slot, generation);
+    std::unique_ptr<Connection> conn(
+        new Connection(*this, std::move(fd), std::move(peer), handler, std::move(codec), options, table_->slot(slot), slot, handle));
     Connection* raw = conn.get();
-    connections_.emplace(raw, std::move(conn));
+    table_->Install(slot, std::move(conn));
     return raw;
 }
 
@@ -218,11 +251,36 @@ void EventLoop::ProcessClosing()
         for (Connection* c : batch)
             c->NotifyClosed();
         for (Connection* c : batch)
-            connections_.erase(c); // 销毁连接，fd 随之关闭
+            table_->Reclaim(c->slot_index_); // 销毁连接（fd 随之关闭），槽的 generation + 1
     }
 }
 
 // ---- 主循环 ----
+
+void EventLoop::RunTask(Task& t)
+{
+    switch (t.kind)
+    {
+        case Task::Kind::Call:
+            (*t.fn)();
+            break;
+        case Task::Kind::Quit:
+            quit_ = true;
+            break;
+        case Task::Kind::Conn:
+        {
+            // 第二道校验：句柄在投递之后、执行之前可能已经换代，迟到的任务丢弃（payload 随 t 释放）。
+            Connection* c = table_->Current(t.handle.slot(), t.handle.generation());
+            if (c == nullptr)
+                break;
+            if (t.op == Op::Send)
+                c->SendFromTask(std::move(t.payload));
+            else
+                c->CloseFromTask(static_cast<CloseReason>(t.arg));
+            break;
+        }
+    }
+}
 
 void EventLoop::RunTasks(std::size_t n)
 {
@@ -233,10 +291,7 @@ void EventLoop::RunTasks(std::size_t n)
         for (std::size_t i = 0; i < n; ++i)
         {
             Task t = std::move(batch_[i]);
-            if (t.op == Task::Op::Quit)
-                quit_ = true;
-            else
-                (*t.fn)();
+            RunTask(t);
         }
         if (round >= kMaxTaskRounds)
             return;

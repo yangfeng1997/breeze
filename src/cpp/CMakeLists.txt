@@ -141,7 +141,11 @@ if(BREEZE_BUILD_NET)
     ${NET_DIR}/buffer.cpp
     ${NET_DIR}/length_prefix_codec.cpp
     ${NET_DIR}/connection.cpp
+    ${NET_DIR}/connection_handle.cpp
+    ${NET_DIR}/event_loop_group.cpp
     ${NET_DIR}/internal/thread.cpp
+    ${NET_DIR}/internal/connection_table.cpp
+    ${NET_DIR}/internal/group_registry.cpp
     ${NET_DIR}/internal/socket.cpp
     ${NET_DIR}/internal/event_loop.cpp
     ${NET_DIR}/internal/acceptor.cpp
@@ -270,6 +274,10 @@ if(BREEZE_BUILD_NET)
   breeze_net_test(thread_test INTERNAL)
   breeze_net_test(socket_test INTERNAL)
   breeze_net_test(event_loop_test INTERNAL)
+  breeze_net_test(connection_table_test INTERNAL)
+  breeze_net_test(group_registry_test INTERNAL)
+  breeze_net_test(event_loop_group_test INTERNAL)
+  breeze_net_test(connection_handle_test INTERNAL)
   breeze_net_test(echo_test INTERNAL)
 
   # net 库内不抛、不 catch（设计 §4.11）。framework/net 还没有时 check 脚本会跳过它。

@@ -87,13 +87,19 @@ struct ConnLog
 class RecordingHandler : public ConnectionHandler
 {
 public:
-    std::string close_trigger;     // 收到这个 payload：先回显，再 Close，再试着 Send
-    std::string flood_trigger;     // 收到这个 payload：连发 kFloodFrames 个大帧
-    std::string oversize_trigger;  // 收到这个 payload：发一个超过 codec 上限的帧
-    bool close_on_connect = false; // OnConnected 里直接 Close
+    std::string close_trigger;        // 收到这个 payload：先回显，再 Close，再试着 Send
+    std::string flood_trigger;        // 收到这个 payload：连发 kFloodFrames 个大帧
+    std::string oversize_trigger;     // 收到这个 payload：发一个超过 codec 上限的帧
+    std::string view_big_trigger;     // 收到这个 payload：用视图版 Send 发一个大帧，返回前立刻改写原内存
+    std::string view_backlog_trigger; // 同上，但先连发 kFloodFrames 个大帧造成积压，视图版 Send 必须排在它们后面
+    bool close_on_connect = false;    // OnConnected 里直接 Close
+    bool echo_copy = false;           // 默认回显走视图版 Send（不拷贝）；设为 true 则先拷成 SharedBuffer 再发
 
     static constexpr int kFloodFrames = 200;
     static constexpr std::size_t kFloodFrameSize = 50 * 1024;
+    static constexpr std::size_t kViewBigSize = 3 * 1024 * 1024; // 小于服务端的 max_frame（4MB）
+
+    static char ViewBigByte(std::size_t i) { return static_cast<char>('A' + (i * 7) % 26); }
 
     void OnConnected(Connection& c) noexcept override
     {
@@ -127,24 +133,48 @@ public:
         }
         if (!flood_trigger.empty() && text == flood_trigger)
         {
-            for (int i = 0; i < kFloodFrames; ++i)
-            {
-                SharedBuffer b = SharedBuffer::Create(kFloodFrameSize);
-                std::memset(b.MutableBytes().data(), 'a' + i % 26, kFloodFrameSize);
-                CHECK(c.Send(std::move(b)) == SendResult::Ok); // 排队也是 Ok
-            }
+            Flood(c);
             return;
         }
-        CHECK(c.Send(SharedBuffer::CopyFrom(payload)) == SendResult::Ok);
+        if ((!view_big_trigger.empty() && text == view_big_trigger) ||
+            (!view_backlog_trigger.empty() && text == view_backlog_trigger))
+        {
+            if (text == view_backlog_trigger)
+                Flood(c); // 先造成积压：之后的视图版 Send 不能直接写，必须拷贝后排在积压之后
+            std::vector<std::byte> big(kViewBigSize);
+            for (std::size_t i = 0; i < big.size(); ++i)
+                big[i] = static_cast<std::byte>(ViewBigByte(i));
+            CHECK(c.Send(std::span<const std::byte>(big)) == SendResult::Ok);
+            // 返回之后视图指向的内存可以立刻改写或释放：库对没能写出去的部分必须已经拷走了。这里把它整个毁掉，
+            // 客户端收到的还得是原来的内容。
+            std::memset(big.data(), 0xEE, big.size());
+            return;
+        }
+        if (echo_copy)
+            CHECK(c.Send(SharedBuffer::CopyFrom(payload)) == SendResult::Ok);
+        else
+            CHECK(c.Send(payload) == SendResult::Ok); // 视图版：直接从读缓冲写回，写不完才拷贝
         if (!close_trigger.empty() && text == close_trigger)
         {
             c.Close();
-            const bool closed = c.Send(SharedBuffer::CopyFrom(payload)) == SendResult::Closed;
+            // 两个重载在关闭之后都返回 Closed
+            const bool closed =
+                c.Send(SharedBuffer::CopyFrom(payload)) == SendResult::Closed && c.Send(payload) == SendResult::Closed;
             const bool connected = c.IsConnected();
             c.Close(); // 重复 Close 是空操作
             const std::lock_guard lk(mu_);
             active_[&c].send_after_close_closed = closed;
             active_[&c].connected_after_close = connected;
+        }
+    }
+
+    static void Flood(Connection& c)
+    {
+        for (int i = 0; i < kFloodFrames; ++i)
+        {
+            SharedBuffer b = SharedBuffer::Create(kFloodFrameSize);
+            std::memset(b.MutableBytes().data(), 'a' + i % 26, kFloodFrameSize);
+            CHECK(c.Send(std::move(b)) == SendResult::Ok); // 排队也是 Ok
         }
     }
 
@@ -204,9 +234,10 @@ private:
 
 struct Server
 {
+    // 水位放到 1GB：这里的用例会故意制造 10MB 级别的写积压，水位本身由 connection_handle_test 覆盖。
     Server(ConnectionHandler& handler, const Endpoint& ep, std::size_t max_frame = kServerMaxFrame)
         : factory(max_frame)
-        , srv(lt.loop, ep, handler, factory)
+        , srv(lt.loop, ep, handler, factory, ConnectionOptions{1ull << 30})
     {
         CHECK(srv.Start() == 0);
         lt.Start();
@@ -569,6 +600,60 @@ void TestWriteBacklogKeepsOrder(const Target& t)
     CHECK(c.RecvFrame() == "tail");
 }
 
+// 视图版 Send：返回后原内存被立刻毁掉，客户端收到的仍是原内容（没写出去的部分已被库拷走）。
+// 3MB 的帧在内核缓冲里通常写不完，覆盖"直接写了一部分、剩下的拷贝入队"的路径。
+void TestViewSendCopiesWhatItCannotWrite(const Target& t)
+{
+    const FdLeakCheck leak;
+    RecordingHandler h;
+    h.view_big_trigger = "viewbig";
+    Server s(h, t.make());
+    Client c(s.ep());
+    c.SendFrame("viewbig");
+    const std::string got = c.RecvFrame();
+    CHECK(got.size() == RecordingHandler::kViewBigSize);
+    for (std::size_t i = 0; i < got.size(); ++i)
+        CHECK(got[i] == RecordingHandler::ViewBigByte(i));
+    c.SendFrame("after"); // 之后连接照常
+    CHECK(c.RecvFrame() == "after");
+}
+
+// 已经有积压时，视图版 Send 不能直接写（会插队）：必须拷贝后排在积压之后，且内容无损、顺序不乱。
+void TestViewSendBehindBacklogKeepsOrder(const Target& t)
+{
+    const FdLeakCheck leak;
+    RecordingHandler h;
+    h.view_backlog_trigger = "viewbacklog";
+    Server s(h, t.make());
+    Client c(s.ep());
+    c.SendFrame("viewbacklog");
+    for (int i = 0; i < RecordingHandler::kFloodFrames; ++i)
+    {
+        const std::string f = c.RecvFrame();
+        CHECK(f.size() == RecordingHandler::kFloodFrameSize);
+        CHECK(f.front() == 'a' + i % 26 && f.back() == 'a' + i % 26);
+    }
+    const std::string big = c.RecvFrame(); // 排在所有积压帧之后
+    CHECK(big.size() == RecordingHandler::kViewBigSize);
+    for (std::size_t i = 0; i < big.size(); ++i)
+        CHECK(big[i] == RecordingHandler::ViewBigByte(i));
+}
+
+// 默认回显走视图版；这里单独把"先拷成 SharedBuffer 再发"那条路也过一遍，两个重载都有覆盖。
+void TestEchoViaSharedBuffer(const Target& t)
+{
+    const FdLeakCheck leak;
+    RecordingHandler h;
+    h.echo_copy = true;
+    Server s(h, t.make());
+    Client c(s.ep());
+    for (const std::string& p : {std::string("hello"), std::string(), std::string(1000, 'x'), std::string(70000, 'y')})
+    {
+        c.SendFrame(p);
+        CHECK(c.RecvFrame() == p);
+    }
+}
+
 void TestPeerInfo(const Target& t)
 {
     const FdLeakCheck leak;
@@ -695,6 +780,9 @@ int main()
         TestProtocolError(t);
         TestOversizeSend(t);
         TestWriteBacklogKeepsOrder(t);
+        TestViewSendCopiesWhatItCannotWrite(t);
+        TestViewSendBehindBacklogKeepsOrder(t);
+        TestEchoViaSharedBuffer(t);
         TestPeerInfo(t);
     }
     TestPeerReset();

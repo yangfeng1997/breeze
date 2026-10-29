@@ -12,11 +12,15 @@
 #include <memory>
 
 #include "buffer.h"
+#include "connection_handle.h"
 #include "connection_handler.h"
+#include "connection_options.h"
 #include "frame_codec.h"
+#include "internal/connection_table.h"
 #include "internal/pollable.h"
 #include "internal/socket.h"
 #include "peer_info.h"
+#include "send_result.h"
 #include "shared_buffer.h"
 
 namespace breeze
@@ -24,16 +28,9 @@ namespace breeze
 
 class EventLoop;
 
-enum class SendResult : std::uint8_t
-{
-    Ok,     // 网络层已接收，不表示送达
-    Closed, // 连接已关闭或正在关闭，原因见 OnClosed
-};
-
 class Connection final : private Pollable
 {
 public:
-    Connection(EventLoop& loop, Fd fd, PeerInfo peer, ConnectionHandler& handler, std::unique_ptr<FrameCodec> codec);
     ~Connection();
 
     Connection(const Connection&) = delete;
@@ -43,6 +40,13 @@ public:
     // IO 线程内写队列为空时先直接写，写不完才入队并注册 EPOLLOUT；已有积压则排在后面，保序。
     SendResult Send(SharedBuffer payload);
 
+    // 视图版本：不拿走所有权，也不要求调用方先拷成 SharedBuffer。尽量直接从 payload
+    // 写出（写队列为空时整帧写完就一次拷贝都没有）， 写不完的部分（或前面已有积压、必须排队保序时）才把 payload 拷成
+    // SharedBuffer 入队——所以返回之后 payload 指向的内存可以立刻改写或释放。 给在 IO 线程里立即回包的 handler
+    // 用（echo、小的应答、栈上拼出来的响应）：OnMessage 的 payload 只在回调内有效， 以前只能先 CopyFrom 再
+    // Send，每条消息白白多一次分配与拷贝。已经有 SharedBuffer（要跨连接共享、要入队）时用上面那个。
+    SendResult Send(std::span<const std::byte> payload);
+
     // 立即关闭。连接上不再有读写，OnClosed 在本轮分发之后回调（不在当前调用栈里），对象此后才销毁。
     // 重复调用、对已关闭的连接调用都是空操作。
     void Close();
@@ -50,12 +54,26 @@ public:
     bool IsConnected() const noexcept { return state_ == State::Connected; }
     const PeerInfo& peer() const noexcept { return peer_; }
 
-    // 装配代码（LoopServer）在把连接交给 loop 持有之后调用：登记到 epoll 并回调 OnConnected。
+    // 可复制、可跨线程使用的句柄（ConnectionHandle::Send / Close）。独立 loop（不属于任何 group）上的连接没有句柄，
+    // 此时返回无效句柄（raw == 0）。
+    ConnectionHandle handle() const noexcept { return handle_; }
+
+    // 装配代码（NetServer / NetClient）在 EventLoop::NewConnection 之后调用：登记到 epoll 并回调 OnConnected。
     // 登记失败（新 fd 的 epoll_ctl 遇到 ENOSPC / ENOMEM）返回 false：只关这一条，没有任何回调，进程继续。
     [[nodiscard]] bool Establish();
 
 private:
-    friend class EventLoop;
+    friend class EventLoop; // 唯一的创建者与任务执行者
+
+    Connection(EventLoop& loop,
+               Fd fd,
+               PeerInfo peer,
+               ConnectionHandler& handler,
+               std::unique_ptr<FrameCodec> codec,
+               const ConnectionOptions& options,
+               ConnectionTable::Slot& slot,
+               std::uint32_t slot_index,
+               ConnectionHandle handle);
 
     enum class State : std::uint8_t
     {
@@ -64,6 +82,7 @@ private:
     };
 
     // 待发送的一帧：内联帧头 + 共享的 payload；offset 是已经写出的字节数（帧头 + payload 合计）。
+    // 队列里每一项的 payload.size() 都已计入槽的 pending_bytes，整条写完（或连接回收）时才减。
     struct Pending
     {
         std::array<std::byte, kMaxFrameHeaderSize> header{};
@@ -75,6 +94,11 @@ private:
     };
 
     void OnEvents(std::uint32_t events) override;
+    // counted：发送方（跨线程的 ConnectionHandle::Send）已经把 payload.size() 计入 pending_bytes，并做过水位检查。
+    SendResult SendImpl(std::span<const std::byte> payload, SharedBuffer* owned, bool counted);
+    // 只由 EventLoop 在执行跨线程任务时调用。
+    void SendFromTask(SharedBuffer payload);
+    void CloseFromTask(CloseReason reason) { CloseWith(reason, 0); }
     void HandleRead();
     std::size_t DecodeAll(std::span<const std::byte> data);
     void HandleWrite();
@@ -87,6 +111,10 @@ private:
     PeerInfo peer_;
     ConnectionHandler& handler_;
     std::unique_ptr<FrameCodec> codec_;
+    ConnectionTable::Slot& slot_; // 热字段（状态、pending_bytes）在连接表里，别的线程不碰本对象就能读
+    const std::uint32_t slot_index_;
+    const ConnectionHandle handle_;
+    const std::uint64_t high_water_;
 
     Buffer in_;
     std::deque<Pending> out_;

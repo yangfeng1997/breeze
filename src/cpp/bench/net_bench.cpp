@@ -4,13 +4,14 @@
 //   raw    裸 epoll echo：性能上限，没有任何抽象
 //   raw-iov  诊断用：同 raw，但系统调用形状与 breeze 相同（readv 2 个 iovec + sendmsg 2 个 iovec）
 //   muduo  muduo 的 TcpServer echo（只支持 TCP）
-//   breeze 本库的 ConnectionHandler 直接回调（LoopServer + LengthPrefixCodec）
-//   breeze-fixed  诊断用：同 breeze，但回复预先建好的固定 payload（不分配、不拷贝），用来把框架开销与 echo 里的拷贝分开
+//   breeze 本库的 ConnectionHandler 直接回调（LoopServer + LengthPrefixCodec），echo 用视图版 Send，不拷贝（与 muduo
+//   同一方案） breeze-copy  同 breeze，但 echo 先拷成 SharedBuffer 再发（旧写法，留作参照） breeze-fixed  诊断用：同
+//   breeze，但回复预先建好的固定 payload（不分配、不拷贝），用来把框架开销与 echo 里的拷贝分开
 // raw 与 muduo 把收到的字节原样写回；breeze 先分帧、再把 payload 拷成 SharedBuffer 发回——这是框架多出来的真实成本，
 // 所以对比里 breeze 比 raw / muduo 多做了分帧与一次拷贝。
 //
 // 压测方式：每条连接闭环 ping-pong（发一帧、等完整回包、再发下一帧），预热后计时。
-// 用法：net_bench --impl raw|raw-iov|muduo|breeze|breeze-fixed --transport tcp|uds --size 64 --conns 64
+// 用法：net_bench --impl raw|raw-iov|muduo|breeze|breeze-copy|breeze-fixed --transport tcp|uds --size 64 --conns 64
 //                 [--duration 3] [--warmup 1] [--client-threads 4] [--server-cpu 2] [--client-cpus 4,6,8,10]
 
 #include <poll.h>
@@ -284,8 +285,16 @@ private:
     std::thread thread_;
 };
 
-// 本库：LoopServer + LengthPrefixCodec，回调里把 payload 拷成 SharedBuffer 发回。
+// 本库：LoopServer + LengthPrefixCodec，回调里用视图版 Send 把 payload 直接从读缓冲写回——不分配、不拷贝，
+// 与 muduo 的 echo（send(Buffer*) 直接交换数据）是同一方案。
 class BenchHandler final : public ConnectionHandler
+{
+public:
+    void OnMessage(Connection& c, std::span<const std::byte> payload) noexcept override { (void)c.Send(payload); }
+};
+
+// 旧写法留作参照（breeze-copy）：先拷成 SharedBuffer 再发，每条消息多一次分配与拷贝。
+class CopyEchoHandler final : public ConnectionHandler
 {
 public:
     void OnMessage(Connection& c, std::span<const std::byte> payload) noexcept override
@@ -336,7 +345,7 @@ public:
 
 private:
     std::unique_ptr<ConnectionHandler> handler_;
-    LoopThread lt_;
+    LoopThread lt_{LoopOptions{LoopOptions::kNoGroup, 0, 1u << 16}}; // 连接表要装得下 10k 连接
     std::unique_ptr<LengthPrefixCodecFactory> factory_;
     std::unique_ptr<LoopServer> srv_;
 };
@@ -412,6 +421,8 @@ std::unique_ptr<EchoServer> MakeServer(const std::string& impl, std::size_t size
     }
     if (impl == "breeze")
         return std::make_unique<BreezeServer>(std::make_unique<BenchHandler>());
+    if (impl == "breeze-copy")
+        return std::make_unique<BreezeServer>(std::make_unique<CopyEchoHandler>());
     if (impl == "breeze-fixed")
         return std::make_unique<BreezeServer>(std::make_unique<FixedReplyHandler>(size));
 #ifdef BREEZE_BENCH_MUDUO
