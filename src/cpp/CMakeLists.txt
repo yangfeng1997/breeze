@@ -69,6 +69,7 @@ set(EVENT_DIR base/event)
 set(HASH_DIR base/hash)
 set(TIME_RECORD_DIR base/time_record)
 set(VARTYPE_DIR base/vartype)
+set(URI_DIR base/uri)
 set(FSM_DIR base/fsm)
 set(NET_DIR base/net)
 set(NET_MODULE_DIR framework/net)
@@ -194,6 +195,11 @@ target_include_directories(breeze_hash INTERFACE ${HASH_DIR})
 # 有限状态机（fsm::Machine）：只有头文件，只依赖标准库（用 cxxabi 给状态名 demangle），不限平台。
 add_library(breeze_fsm INTERFACE)
 target_include_directories(breeze_fsm INTERFACE ${FSM_DIR})
+
+# URI 解析（RFC 3986）与百分号编解码：只依赖标准库，不限平台。
+add_library(breeze_uri ${URI_DIR}/uri.cpp)
+target_include_directories(breeze_uri PUBLIC ${URI_DIR})
+target_compile_options(breeze_uri PRIVATE -Wall -Wextra)
 
 # 弱类型值（VarType）：字符串存放、按需转数字 / 布尔。只有头文件，依赖 breeze_string 的严格数字解析。
 add_library(breeze_vartype INTERFACE)
@@ -469,6 +475,12 @@ target_link_libraries(var_type_test PRIVATE breeze_vartype Threads::Threads)
 target_compile_options(var_type_test PRIVATE -Wall -Wextra)
 add_test(NAME var_type_test COMMAND var_type_test)
 set_tests_properties(var_type_test PROPERTIES ENVIRONMENT "${BREEZE_TEST_ENV}")
+
+add_executable(uri_test ${URI_DIR}/uri_test.cpp)
+target_link_libraries(uri_test PRIVATE breeze_uri)
+target_compile_options(uri_test PRIVATE -Wall -Wextra)
+add_test(NAME uri_test COMMAND uri_test)
+set_tests_properties(uri_test PROPERTIES ENVIRONMENT "${BREEZE_TEST_ENV}")
 
 add_executable(string_util_test ${STRING_DIR}/string_util_test.cpp)
 target_link_libraries(string_util_test PRIVATE breeze_string)
