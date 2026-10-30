@@ -22,12 +22,15 @@
   `base/thread`（仅 Linux）是 `Thread` / `this_thread` / `WaitGroup` / `SpinLock` / `ThreadPool`，创建失败返回 errno、库内不抛异常，设计与来源见 [docs/线程基础库.md](docs/线程基础库.md)（**tsan 同样没在本机跑过**）；
   `base/assert`（仅 Linux）是 `ASSERT_*` 防御式断言（Debug 失败 abort，Release 走防御式控制流并按调用点限流记日志），`base/backtrace`（仅 Linux）是 `Backtrace` 调用栈文本化（独立库，不依赖日志与断言）；
   `base/defer`（`DEFER`）、`base/singleton`（`Singleton` / `ThreadLocalSingleton`）、`base/noncopyable`（`NonCopyable`）各一个目录；`base/string` 是字符串工具；`base/random` 是 xoshiro256**（有可复现的 `Random` 对象与线程局部的全局生成器），
-  `base/hash` 是 `MurmurHash64A`（**结果稳定**的字节哈希，分片 / 路由用，种子是强类型 `MurmurSeed`）、`base/vartype` 是 `VarType`（字符串存放、按需转数字 / 布尔，转换是严格的、失败不会悄悄得 0）、`base/time_record` 是 `TimeRecord` / `TIME_RECORD`（秒表，析构时可选地写日志，支持慢操作阈值），
+  `base/hash` 是 `MurmurHash64A`（**结果稳定**的字节哈希，分片 / 路由用，种子是强类型 `MurmurSeed`）、`base/vartype` 是 `VarType`（字符串存放、按需转数字 / 布尔，转换是严格的、失败不会悄悄得 0；带单槽转换缓存，**const 方法也会写缓存，不能多线程同时读同一个对象**；`TryAsVector` / `TryAsMap` 拆 `"1|2|3"`、`"12=34|45=78"`，默认分隔符 `|` 与 `=`、可用宏覆盖）、`base/time_record` 是 `TimeRecord` / `TIME_RECORD`（秒表，析构时可选地写日志，支持慢操作阈值），
   `base/uri` 是 `Uri`（RFC 3986 的 URI 引用解析与还原，"没有"与"空"分开，不做规范化）与 `PercentEncode` / `PercentDecode` / `ParseQuery`，
   设计与来源见 [docs/基础工具库.md](docs/基础工具库.md)；
   `base/fsm` 是 `fsm::Machine`（编译期状态机：转移与事件都是延迟执行、先进先出，**状态的成员函数要定义在所有状态之后**），见 [docs/状态机.md](docs/状态机.md)；
-  `base/time` 是 `TimeUtil`（纯函数日期计算，支持"每天凌晨 5 点刷新"的游戏日）与 `Now`（帧缓存时钟、GM 偏移 / 冻结），
+  `base/time` 是 `TimeUtil`（纯函数日期计算，支持"每天凌晨 5 点刷新"的游戏日）、`Now`（帧缓存时钟、GM 偏移 / 冻结）
+  与 `PeriodicWindow`（周期开放窗口：从 start 起每隔 interval 开一次、持续 duration，半开区间，纯函数、`now` 传 `Now::Sec()`；
+  **`duration == 0` 是空窗口不是"无限"，永久开放写 `kForever`**），
   `base/timer` 是 `TimerWheel`（分层时间轮，O(1) 添加 / 取消 / 重置、空转跳过），**定时器要用单调时钟 `Now::SteadyMs()` 驱动，别用墙钟**，见 [docs/时间与定时器.md](docs/时间与定时器.md)；
+  `base/metrics` 是 `MessageStats`（按消息 id / 名字统计条数与字节、周期写日志，**非线程安全，一线程一实例**，`Tick` 传单调时钟），见 [docs/指标统计.md](docs/指标统计.md)；
   `base/event` 是 `EventBus`（类型安全的**同步**发布 / 订阅，回调里可以随意订阅 / 退订 / `Clear` / 嵌套发布，非线程安全）与 `ScopedSubscription`，见 [docs/事件总线.md](docs/事件总线.md)；
   `base/container` 是 `FlatHashMap` / `FlatHashSet`（Swiss table）与 `LinkedHashMap` / `LinkedHashSet`（保持插入顺序，可当 LRU），
   **插入可能让迭代器 / 引用失效、元素的移动构造必须 noexcept、`at()` 找不到键就 abort**，见 [docs/基础容器库.md](docs/基础容器库.md)；

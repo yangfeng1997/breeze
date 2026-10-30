@@ -351,11 +351,21 @@ void TestStatsAddUp()
             CHECK(c->RecvFrame() == "0123456789");
         }
     }
+    // 客户端收到最后一条回包时，IO 线程可能还没把计数记上：messages_in 在 OnMessage 返回之后才记，messages_out 与
+    // bytes_out 在 write 返回之后才记（NetStats 各计数本来就不是同一时刻的快照，见 net_stats.h）。先等到位再取快照。
+    // connections / accepted / bytes_in 不用等：前两个在这条连接的第一个读事件之前就记了，
+    // bytes_in 在 read 之后、分发之前记。
+    CHECK(WaitUntil(
+        [&]
+        {
+            const NetStats s = f.group.GetStats();
+            return s.messages_in == kClients * kMsgs && s.messages_out == kClients * kMsgs &&
+                   s.bytes_out == kClients * kMsgs * 14u;
+        }));
     const NetStats mid = f.group.GetStats();
     CHECK(mid.connections == kClients && mid.accepted == kClients);
     CHECK(mid.messages_in == kClients * kMsgs && mid.messages_out == kClients * kMsgs);
-    CHECK(mid.bytes_in == kClients * kMsgs * 14u);
-    CHECK(WaitUntil([&] { return f.group.GetStats().bytes_out == kClients * kMsgs * 14u; }));
+    CHECK(mid.bytes_in == kClients * kMsgs * 14u && mid.bytes_out == kClients * kMsgs * 14u);
     CHECK(mid.max_loop_lag.count() > 0);
 
     cs.clear();

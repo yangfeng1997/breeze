@@ -68,6 +68,7 @@ set(CONTAINER_DIR base/container)
 set(EVENT_DIR base/event)
 set(HASH_DIR base/hash)
 set(TIME_RECORD_DIR base/time_record)
+set(METRICS_DIR base/metrics)
 set(VARTYPE_DIR base/vartype)
 set(URI_DIR base/uri)
 set(FSM_DIR base/fsm)
@@ -168,7 +169,8 @@ target_include_directories(breeze_singleton INTERFACE ${SINGLETON_DIR})
 add_library(breeze_noncopyable INTERFACE)
 target_include_directories(breeze_noncopyable INTERFACE ${NONCOPYABLE_DIR})
 
-# 时间：TimeUtil（纯函数的日期计算）与 Now（帧缓存时钟、可模拟的逻辑时间）。用 localtime_r（POSIX），不限 Linux。
+# 时间：TimeUtil（纯函数的日期计算）、Now（帧缓存时钟、可模拟的逻辑时间）与 PeriodicWindow（周期开放窗口，只有头文件）。
+# 用 localtime_r（POSIX），不限 Linux。
 add_library(breeze_time ${TIME_DIR}/time_util.cpp ${TIME_DIR}/now.cpp)
 target_include_directories(breeze_time PUBLIC ${TIME_DIR})
 target_compile_options(breeze_time PRIVATE -Wall -Wextra)
@@ -187,6 +189,13 @@ target_compile_options(breeze_timer PRIVATE -Wall -Wextra)
 # 容器：FlatHashMap / FlatHashSet（Swiss table）、LinkedHashMap / LinkedHashSet（保持插入顺序）。只有头文件，只依赖标准库。
 add_library(breeze_container INTERFACE)
 target_include_directories(breeze_container INTERFACE ${CONTAINER_DIR})
+
+# 消息统计（MessageStats）：按 id / 名字统计条数与字节，周期写日志。非线程安全。
+# 公开头含 flat_hash_map.h，所以 breeze_container 是 PUBLIC；logger 只 PRIVATE：公开头不含它。
+add_library(breeze_metrics ${METRICS_DIR}/message_stats.cpp)
+target_include_directories(breeze_metrics PUBLIC ${METRICS_DIR})
+target_link_libraries(breeze_metrics PUBLIC breeze_container PRIVATE breeze_logger)
+target_compile_options(breeze_metrics PRIVATE -Wall -Wextra)
 
 # 稳定的字节哈希（MurmurHash64A）：只有头文件，只依赖标准库，不限平台。
 add_library(breeze_hash INTERFACE)
@@ -422,10 +431,22 @@ foreach(t time_util_test now_test)
   set_tests_properties(${t} PROPERTIES ENVIRONMENT "${BREEZE_TEST_ENV}")
 endforeach()
 
+# 与 Now 配合的用例会冻结 / 偏移 Now（进程级状态），所以独立成进程。
+add_executable(periodic_window_test ${TIME_DIR}/periodic_window_test.cpp)
+target_link_libraries(periodic_window_test PRIVATE breeze_time)
+target_compile_options(periodic_window_test PRIVATE -Wall -Wextra)
+add_test(NAME periodic_window_test COMMAND periodic_window_test)
+set_tests_properties(periodic_window_test PROPERTIES ENVIRONMENT "${BREEZE_TEST_ENV}")
+
 add_executable(time_record_test ${TIME_RECORD_DIR}/time_record_test.cpp)
 target_link_libraries(time_record_test PRIVATE breeze_time_record)
 target_compile_options(time_record_test PRIVATE -Wall -Wextra)
 add_test(NAME time_record_test COMMAND time_record_test)
+
+add_executable(message_stats_test ${METRICS_DIR}/message_stats_test.cpp)
+target_link_libraries(message_stats_test PRIVATE breeze_metrics)
+target_compile_options(message_stats_test PRIVATE -Wall -Wextra)
+add_test(NAME message_stats_test COMMAND message_stats_test)
 
 foreach(t timer_wheel_test timer_wheel_model_test)
   add_executable(${t} ${TIMER_DIR}/${t}.cpp)
@@ -471,7 +492,7 @@ target_compile_options(fsm_test PRIVATE -Wall -Wextra)
 add_test(NAME fsm_test COMMAND fsm_test)
 
 add_executable(var_type_test ${VARTYPE_DIR}/var_type_test.cpp)
-target_link_libraries(var_type_test PRIVATE breeze_vartype Threads::Threads)
+target_link_libraries(var_type_test PRIVATE breeze_vartype)
 target_compile_options(var_type_test PRIVATE -Wall -Wextra)
 add_test(NAME var_type_test COMMAND var_type_test)
 set_tests_properties(var_type_test PROPERTIES ENVIRONMENT "${BREEZE_TEST_ENV}")

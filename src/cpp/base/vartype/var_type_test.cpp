@@ -1,9 +1,15 @@
 // VarType：构造（所有整数宽度、浮点最短往返、被拒绝的类型）、严格转换与整数的"小数写法"、布尔、与数字 / 字符串的比较、
-// 与原版行为的差别（精度丢失、垃圾得 0、并发读缓存竞争）、格式化与哈希。无测试框架依赖：失败即 abort。
+// 与原版行为的差别（精度丢失、垃圾得 0）、转换缓存（标签、命中、失败、跨类型、拷贝 / 移动 / 赋值）、容器（列表 / 映射的
+// 格式、严格性、分隔符、随机往返）、格式化与哈希。
+// 无测试框架依赖：失败即 abort。
+
+// 测试按默认分隔符写：工程如果用宏覆盖了默认值，这里先取消，免得默认值相关的用例对不上。
+#undef BREEZE_VARTYPE_ITEM_SEP
+#undef BREEZE_VARTYPE_KV_SEP
 
 #include "var_type.h"
 
-#include <atomic>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -11,26 +17,110 @@
 #include <cstring>
 #include <format>
 #include <limits>
+#include <map>
 #include <random>
 #include <string>
-#include <thread>
 #include <unordered_map>
 #include <vector>
 
 using namespace breeze;
 
-#define CHECK(cond)                                                                                                    \
+#define CHECK(...)                                                                                                     \
     do                                                                                                                 \
     {                                                                                                                  \
-        if (!(cond))                                                                                                   \
+        if (!(__VA_ARGS__))                                                                                            \
         {                                                                                                              \
-            std::fprintf(stderr, "%s:%d: CHECK failed: %s\n", __FILE__, __LINE__, #cond);                              \
+            std::fprintf(stderr, "%s:%d: CHECK failed: %s\n", __FILE__, __LINE__, #__VA_ARGS__);                       \
             std::abort();                                                                                              \
         }                                                                                                              \
     } while (0)
 
+// VarType 声明的友元：白盒地看缓存的状态，并能直接往缓存里写值，证明"命中"确实没有重新解析。
+namespace breeze
+{
+struct VarTypeTestPeer
+{
+    static std::uint8_t Tag(const VarType& v) { return v.cache_.tag; }
+    static bool Ok(const VarType& v) { return v.cache_.ok; }
+    template <typename T>
+    static constexpr std::uint8_t TagOf()
+    {
+        return VarType::CacheTag<T>();
+    }
+    // 伪造一条缓存：下一次 TryAs<T> 应该原样返回它，而不是去解析文本。
+    template <typename T>
+    static void Poison(const VarType& v, std::optional<T> r)
+    {
+        v.cache_.Store<T>(TagOf<T>(), r);
+    }
+};
+} // namespace breeze
+
 namespace
 {
+
+using Peer = VarTypeTestPeer;
+
+// 缓存标签：各类型互不相同且非零（串了就会拿 int 的缓存当 uint32_t 的结果），同宽同符号的共用，long double 不缓存。
+constexpr std::uint8_t kAllTags[] = {Peer::TagOf<bool>(),
+                                     Peer::TagOf<std::int8_t>(),
+                                     Peer::TagOf<std::uint8_t>(),
+                                     Peer::TagOf<std::int16_t>(),
+                                     Peer::TagOf<std::uint16_t>(),
+                                     Peer::TagOf<std::int32_t>(),
+                                     Peer::TagOf<std::uint32_t>(),
+                                     Peer::TagOf<std::int64_t>(),
+                                     Peer::TagOf<std::uint64_t>(),
+                                     Peer::TagOf<float>(),
+                                     Peer::TagOf<double>()};
+constexpr bool TagsDistinctAndNonZero()
+{
+    for (std::size_t i = 0; i < std::size(kAllTags); ++i)
+    {
+        if (kAllTags[i] == 0)
+            return false;
+        for (std::size_t j = i + 1; j < std::size(kAllTags); ++j)
+            if (kAllTags[i] == kAllTags[j])
+                return false;
+    }
+    return true;
+}
+static_assert(TagsDistinctAndNonZero());
+static_assert(Peer::TagOf<long>() == Peer::TagOf<long long>() &&
+              Peer::TagOf<unsigned long>() == Peer::TagOf<unsigned long long>() &&
+              Peer::TagOf<int>() == Peer::TagOf<std::int32_t>() && Peer::TagOf<const int>() == Peer::TagOf<int>());
+static_assert(Peer::TagOf<long double>() == 0);
+
+// 默认分隔符：常量与 var_detail::ValidSeparator 的判定（运行时的用例见 TestVectorSeparators / TestMapSeparators）
+static_assert(kVarItemSep == "|" && kVarKvSep == "=");
+static_assert(var_detail::ValidSeparator("|") && var_detail::ValidSeparator("=>") && var_detail::ValidSeparator("·") &&
+              var_detail::ValidSeparator(";") && var_detail::ValidSeparator("x"));
+static_assert(!var_detail::ValidSeparator("") && !var_detail::ValidSeparator("1") && !var_detail::ValidSeparator("-") &&
+              !var_detail::ValidSeparator("+") && !var_detail::ValidSeparator(".") &&
+              !var_detail::ValidSeparator("e") && !var_detail::ValidSeparator("E") &&
+              !var_detail::ValidSeparator(" ") && !var_detail::ValidSeparator("\t") &&
+              !var_detail::ValidSeparator("a b") && !var_detail::ValidSeparator("x9"));
+
+constexpr bool EveryDigitIsInvalidSeparator()
+{
+    for (char c = '0'; c <= '9'; ++c)
+        if (var_detail::ValidSeparator(std::string_view(&c, 1)))
+            return false;
+    return true;
+}
+static_assert(EveryDigitIsInvalidSeparator());
+
+// 容器的元素：数字、bool、std::string 可以；字符类、string_view（会悬空）、容器本身不行
+template <typename T>
+concept CanVector = requires(const VarType& v) { v.template TryAsVector<T>(); };
+template <typename K, typename V>
+concept CanMap = requires(const VarType& v) { v.template TryAsMap<K, V>(); };
+static_assert(CanVector<int> && CanVector<std::uint8_t> && CanVector<double> && CanVector<bool> &&
+              CanVector<std::string>);
+static_assert(!CanVector<char> && !CanVector<wchar_t> && !CanVector<std::string_view> && !CanVector<const char*> &&
+              !CanVector<std::vector<int>>);
+static_assert(CanMap<int, int> && CanMap<std::string, double> && CanMap<std::string, std::string>);
+static_assert(!CanMap<char, int> && !CanMap<int, std::string_view> && !CanMap<std::vector<int>, int>);
 
 enum Plain
 {
@@ -334,32 +424,403 @@ void TestCopyMoveAndAssignment()
     CHECK(a == 5);
 }
 
-// 原版的转换缓存是 mutable 的：多个线程同时读同一个 const VarType 是数据竞争（tsan 会报；非 tsan
-// 下也可能读到撕裂的值）。 现在对象不可变，各线程读到的值必须一致。
-void TestConcurrentConstReads()
+// 缓存的填充、命中、覆盖、失败。命中用 Poison 证明：往缓存里塞一个和文本对不上的值，转换必须原样取出它。
+void TestCacheFillHitAndFailure()
 {
-    const VarType v("123456789");
-    const VarType d("2.5");
-    std::atomic<int> bad{0};
-    std::vector<std::thread> ts;
-    for (int t = 0; t < 8; ++t)
+    const VarType v = "42";
+    CHECK(Peer::Tag(v) == 0);
+    CHECK(v.As<int>() == 42);
+    CHECK(Peer::Tag(v) == Peer::TagOf<int>() && Peer::Ok(v));
+
+    Peer::Poison<int>(v, 7);
+    CHECK(v.As<int>() == 7 && v.TryAs<int>() == 7 && v == 7); // 命中：没有重新解析
+    Peer::Poison<int>(v, std::nullopt);
+    CHECK(!v.TryAs<int>() && v.As<int>(-1) == -1 && !(v == 42)); // 失败的结果也命中
+    CHECK(Peer::Tag(v) == Peer::TagOf<int>() && !Peer::Ok(v));
+
+    // 换类型：单槽被覆盖，文本没变，所以新类型按文本解析；转回来再按文本解析
+    CHECK(v.As<double>() == 42.0);
+    CHECK(Peer::Tag(v) == Peer::TagOf<double>() && Peer::Ok(v));
+    CHECK(v.As<int>() == 42); // 之前毒化的失败已被覆盖
+    CHECK(Peer::Tag(v) == Peer::TagOf<int>());
+
+    // 真实的失败：转换失败时记下失败，再转仍然失败，也不影响别的类型
+    const VarType bad = "abc";
+    CHECK(!bad.TryAs<int>());
+    CHECK(Peer::Tag(bad) == Peer::TagOf<int>() && !Peer::Ok(bad));
+    CHECK(!bad.TryAs<int>() && bad.As<int>(-1) == -1 && !bad.TryAs<double>());
+    const VarType t = "true";
+    CHECK(!t.TryAs<int>() && t.As<bool>() && !t.TryAs<int>() && t.As<bool>());
+
+    // 不缓存的类型：long double 每次都解析，缓存槽不动
+    const VarType w = "2.5";
+    CHECK(w.As<int>() == 2 || !w.TryAs<int>()); // 先占住槽
+    const auto tag_before = Peer::Tag(w);
+    CHECK(w.As<long double>() == 2.5L && w.As<long double>() == 2.5L);
+    CHECK(Peer::Tag(w) == tag_before);
+
+    // 命中走的是 const 对象的 mutable 缓存：对 const 引用转换也能填充
+    const VarType& cref = w;
+    CHECK(cref.As<double>() == 2.5 && Peer::Tag(w) == Peer::TagOf<double>());
+}
+
+// 缓存永远不能把一个类型的结果当成另一个类型的：任意两个类型先后转换，结果都等于全新对象的转换结果。
+template <typename A, typename B>
+void ExpectCrossType(const char* s)
+{
+    const VarType warm(s);
+    (void)warm.TryAs<A>();
+    CHECK(warm.TryAs<B>() == VarType(s).TryAs<B>());
+    CHECK(warm.TryAs<B>() == VarType(s).TryAs<B>()); // 第二次是命中
+    CHECK(warm.TryAs<A>() == VarType(s).TryAs<A>());
+    CHECK(warm.TryAs<A>() == VarType(s).TryAs<A>());
+}
+template <typename A, typename... Bs>
+void ExpectFrom(const char* s)
+{
+    (ExpectCrossType<A, Bs>(s), ...);
+}
+template <typename... Ts>
+void ExpectAllPairs(const char* s)
+{
+    (ExpectFrom<Ts, Ts...>(s), ...);
+}
+
+void TestCacheNeverServesWrongType()
+{
+    const char* samples[] = {"0",
+                             "1",
+                             "-1",
+                             "42",
+                             "255",
+                             "256",
+                             "-128",
+                             "-129",
+                             "300",
+                             "65535",
+                             "70000",
+                             "2147483647",
+                             "3000000000",
+                             "-3000000000",
+                             "5000000000",
+                             "9007199254740993",
+                             "18446744073709551615",
+                             "0.1",
+                             "2.5",
+                             "1e3",
+                             "5.0",
+                             " 42 ",
+                             "+7",
+                             "true",
+                             "off",
+                             "abc",
+                             ""};
+    for (const char* s : samples)
     {
-        ts.emplace_back(
-            [&]
-            {
-                for (int i = 0; i < 20000; ++i)
-                {
-                    if (v.As<std::int64_t>() != 123456789 || v.As<double>() != 123456789.0 || d.As<double>() != 2.5 ||
-                        !(v == 123456789) || !(d == 2.5) || v.As<bool>() != true)
-                    {
-                        ++bad;
-                    }
-                }
-            });
+        ExpectAllPairs<bool,
+                       std::int8_t,
+                       std::uint8_t,
+                       std::int16_t,
+                       std::uint16_t,
+                       std::int32_t,
+                       std::uint32_t,
+                       std::int64_t,
+                       std::uint64_t,
+                       float,
+                       double,
+                       long double>(s);
     }
-    for (auto& t : ts)
-        t.join();
-    CHECK(bad.load() == 0);
+    // 同宽同符号共用一个标签：long 与 long long，转一个再转另一个，值对得上
+    const VarType v = "-9000000000";
+    CHECK(v.As<long>() == -9000000000L && v.As<long long>() == -9000000000LL && v.As<std::int64_t>() == -9000000000LL);
+    CHECK(Peer::Tag(v) == Peer::TagOf<long>());
+}
+
+// 拷贝带着缓存走；移动后源对象的缓存清空（它的文本被搬走了，缓存不能还报着旧值）；赋值用新对象的缓存覆盖旧的。
+void TestCacheFollowsCopyMoveAssign()
+{
+    VarType a = "42";
+    CHECK(a.As<int>() == 42);
+
+    VarType b = a; // 拷贝构造
+    CHECK(Peer::Tag(b) == Peer::TagOf<int>() && Peer::Tag(a) == Peer::TagOf<int>());
+    CHECK(b.As<int>() == 42 && a.As<int>() == 42);
+
+    VarType c = std::move(a); // 移动构造：目标保留，源清空
+    CHECK(Peer::Tag(c) == Peer::TagOf<int>() && c.As<int>() == 42);
+    CHECK(Peer::Tag(a) == 0);                                            // NOLINT
+    CHECK(a.TryAs<int>() == VarType(std::string(a.str())).TryAs<int>()); // NOLINT 与它现在的文本一致
+
+    VarType d = "1";
+    CHECK(d.As<int>() == 1);
+    d = VarType("7"); // 移动赋值：被覆盖，不能留着旧值
+    CHECK(Peer::Tag(d) == 0 && d.As<int>() == 7);
+
+    VarType e = "8";
+    CHECK(e.As<int>() == 8);
+    VarType f = "9";
+    CHECK(f.As<double>() == 9.0);
+    f = e; // 拷贝赋值：缓存跟着 e 走
+    CHECK(Peer::Tag(f) == Peer::TagOf<int>() && f.As<int>() == 8);
+    VarType g = "5";
+    CHECK(g.As<int>() == 5);
+    VarType h = "6"; // 来源没有缓存
+    g = h;
+    CHECK(Peer::Tag(g) == 0 && g.As<int>() == 6);
+
+    VarType m = "11";
+    CHECK(m.As<int>() == 11);
+    VarType n = "12";
+    n = std::move(m); // 移动赋值：目标得到缓存，源清空
+    CHECK(Peer::Tag(n) == Peer::TagOf<int>() && n.As<int>() == 11 && Peer::Tag(m) == 0); // NOLINT
+
+    // 自赋值（拷贝）后仍然对；自移动赋值后与文本一致（缓存可以被清掉）
+    VarType s = "21";
+    CHECK(s.As<int>() == 21);
+    VarType& alias = s;
+    s = alias;
+    CHECK(s.As<int>() == 21 && Peer::Tag(s) == Peer::TagOf<int>());
+    s = std::move(alias);
+    CHECK(s.TryAs<int>() == VarType(std::string(s.str())).TryAs<int>());
+}
+
+// 缓存只是加速：==、hash、format、NumericEqual 都只看文本。
+void TestCacheDoesNotAffectComparison()
+{
+    const VarType a = "42";
+    const VarType b = "42";
+    CHECK(a.As<int>() == 42 && b.As<double>() == 42.0); // 两边缓存不同
+    CHECK(a == b && a == "42" && std::hash<VarType>{}(a) == std::hash<VarType>{}(b));
+    CHECK(std::format("{}", a) == "42" && std::format("{}", b) == "42");
+    CHECK(a.NumericEqual(b) && b.NumericEqual(a));
+    const VarType c = "42.0";
+    CHECK(c.As<int>() == 42 && !(a == c) && a.NumericEqual(c));
+}
+
+// ---- 容器：TryAsVector / TryAsMap ----
+
+void TestVectorFormatAndElementRules()
+{
+    using IV = std::vector<int>;
+    CHECK(VarType("1|2|3").TryAsVector<int>() == IV({1, 2, 3}));
+    CHECK(VarType("5").TryAsVector<int>() == IV({5}));
+    // 元素规则与 TryAs 一致：正负号、整数的小数写法、科学计数法
+    CHECK(VarType("-1|+2|3.0|1e2").TryAsVector<int>() == IV({-1, 2, 3, 100}));
+    CHECK(VarType("1.5|-2|3e-1").TryAsVector<double>() == std::vector<double>({1.5, -2.0, 0.3}));
+    CHECK(VarType("true|0|YES|off").TryAsVector<bool>() == std::vector<bool>({true, false, true, false}));
+    CHECK(VarType("a|b c|d").TryAsVector<std::string>() == std::vector<std::string>({"a", "b c", "d"}));
+    // 元素两端的空白去掉（数字、字符串一样）
+    CHECK(VarType(" 1 |\t2\n| 3 ").TryAsVector<int>() == IV({1, 2, 3}));
+    CHECK(VarType(" a | b ").TryAsVector<std::string>() == std::vector<std::string>({"a", "b"}));
+
+    // 整串为空或只有空白：空容器，不是失败
+    for (const char* s : {"", "   ", "\t\n"})
+    {
+        const auto r = VarType(s).TryAsVector<int>();
+        CHECK(r.has_value() && r->empty());
+    }
+
+    // 任何一个元素转换失败，整体失败
+    for (const char* s : {"1|a|3", "1|2.5|3", "1|2 3", "abc", "1,2", "1|0x10"})
+        CHECK(!VarType(s).TryAsVector<int>());
+    CHECK(VarType("1|255").TryAsVector<std::uint8_t>().has_value() && !VarType("1|256").TryAsVector<std::uint8_t>());
+    CHECK(!VarType("0|-1").TryAsVector<std::uint32_t>() && !VarType("1|x").TryAsVector<bool>());
+}
+
+void TestVectorEmptyItems()
+{
+    using IV = std::vector<int>;
+    // 空项默认失败：尾部多一个分隔符几乎一定是笔误；只有空白的项也算空
+    for (const char* s : {"1||3", "1|2|", "|1", "|", "||", "1| |3", " |1"})
+        CHECK(!VarType(s).TryAsVector<int>());
+    CHECK(!VarType("a||b").TryAsVector<std::string>() && !VarType("a|").TryAsVector<std::string>());
+
+    // skip_empty：跳过空项，但不放过真正的坏元素
+    CHECK(VarType("1||3").TryAsVector<int>("|", true) == IV({1, 3}));
+    CHECK(VarType("1|2|").TryAsVector<int>("|", true) == IV({1, 2}));
+    CHECK(VarType("|1").TryAsVector<int>("|", true) == IV({1}));
+    CHECK(VarType("1| |3").TryAsVector<int>("|", true) == IV({1, 3}));
+    const auto none = VarType("|||").TryAsVector<int>("|", true);
+    CHECK(none.has_value() && none->empty());
+    CHECK(!VarType("1|x|3").TryAsVector<int>("|", true));
+}
+
+void TestVectorSeparators()
+{
+    using IV = std::vector<int>;
+    using SV = std::vector<std::string>;
+    CHECK(VarType("1:2:3").TryAsVector<int>(":") == IV({1, 2, 3}));
+    CHECK(VarType("1;2;3").TryAsVector<int>(";") == IV({1, 2, 3}));
+    CHECK(VarType("1,2,3").TryAsVector<int>(",") == IV({1, 2, 3}));
+    CHECK(VarType("1x2x3").TryAsVector<int>("x") == IV({1, 2, 3}));
+    CHECK(VarType("1::2::3").TryAsVector<int>("::") == IV({1, 2, 3}));
+    CHECK(VarType("1=>2=>3").TryAsVector<int>("=>") == IV({1, 2, 3}));
+    CHECK(!VarType("1::2").TryAsVector<int>(":")); // 单个分隔符切出空项
+
+    // 整串匹配：多字符分隔符里的单个字符不算；多字节分隔符不会按字节切
+    // （'·' 是 C2 B7，"路" 是 E8 B7 AF，里面有 B7 字节）
+    CHECK(VarType("1|2").TryAsVector<std::string>("||") == SV({"1|2"}));
+    CHECK(VarType("1||2").TryAsVector<int>("||") == IV({1, 2}));
+    CHECK(VarType("路·x·中").TryAsVector<std::string>("·") == SV({"路", "x", "中"}));
+
+    // 非法分隔符：空、含数字或 "+-.eE"、含空白。无论元素类型、文本是否为空，一律失败
+    for (const char* sep : {"", "1", "9", "-", "+", ".", "e", "E", " ", "\t", "|1", "a e", "x-y", "12", "\n"})
+    {
+        CHECK(!VarType("1|2").TryAsVector<int>(sep));
+        CHECK(!VarType("a|b").TryAsVector<std::string>(sep));
+        CHECK(!VarType("").TryAsVector<std::string>(sep));
+    }
+}
+
+void TestVectorRoundTripRandom()
+{
+    std::mt19937_64 rng(20240607);
+    for (int round = 0; round < 3000; ++round)
+    {
+        std::vector<std::int64_t> ints(rng() % 8); // 可能为空
+        std::vector<double> doubles(rng() % 6);
+        std::string itext;
+        std::string dtext;
+        for (std::size_t i = 0; i < ints.size(); ++i)
+        {
+            ints[i] = static_cast<std::int64_t>(rng()) >> (rng() % 64); // 大小各种量级、正负都有
+            itext += (i != 0 ? (rng() % 2 ? "|" : " | ") : "") + std::to_string(ints[i]);
+        }
+        for (std::size_t i = 0; i < doubles.size(); ++i)
+        {
+            double d;
+            do
+                d = std::bit_cast<double>(rng());
+            while (!std::isfinite(d));
+            doubles[i] = d;
+            dtext += (i != 0 ? "|" : "") + VarType(d).str();
+        }
+        CHECK(VarType(itext).TryAsVector<std::int64_t>() == ints);
+        CHECK(VarType(dtext).TryAsVector<double>() == doubles);
+    }
+}
+
+void TestMapFormatAndElementRules()
+{
+    using II = std::map<int, int>;
+    CHECK(VarType("12=34|45=78").TryAsMap<int, int>() == II({{12, 34}, {45, 78}}));
+    CHECK(VarType("7=8").TryAsMap<int, int>() == II({{7, 8}}));
+    // std::map 是有序的，与输入顺序无关
+    const auto m = VarType("45=1|12=2|30=3").TryAsMap<int, int>();
+    CHECK(m.has_value() && m->begin()->first == 12 && m->rbegin()->first == 45 && m->size() == 3);
+    // 键、值两端的空白去掉
+    CHECK(VarType(" 12 = 34 | 45=78 ").TryAsMap<int, int>() == II({{12, 34}, {45, 78}}));
+    // 键与值可以是不同类型
+    CHECK(VarType("atk=100|def=50").TryAsMap<std::string, int>() ==
+          std::map<std::string, int>({{"atk", 100}, {"def", 50}}));
+    CHECK(VarType("a=x y|b=z").TryAsMap<std::string, std::string>() ==
+          std::map<std::string, std::string>({{"a", "x y"}, {"b", "z"}}));
+    CHECK(VarType("1=0.5|2=1e1").TryAsMap<int, double>() == std::map<int, double>({{1, 0.5}, {2, 10.0}}));
+    CHECK(VarType("1=true|2=off").TryAsMap<int, bool>() == std::map<int, bool>({{1, true}, {2, false}}));
+    // 键按元素类型比较：int 的 "1" 与 "01" 是同一个键，字符串的不是
+    CHECK(VarType("1=1|01=2").TryAsMap<std::string, int>() == std::map<std::string, int>({{"01", 2}, {"1", 1}}));
+
+    for (const char* s : {"", "   ", "\t\n"})
+    {
+        const auto r = VarType(s).TryAsMap<int, int>();
+        CHECK(r.has_value() && r->empty());
+    }
+}
+
+void TestMapStrictness()
+{
+    // 缺键值分隔符、多于一个、键或值为空、元素转换失败、键重复（含 "1" 与 "01"）、空项
+    for (const char* s : {"12|45=78",
+                          "12=34=5",
+                          "1==2",
+                          "=34",
+                          "12=",
+                          "= ",
+                          "a=1",
+                          "1=x",
+                          "1=1|1=2",
+                          "1=1|01=2",
+                          "1=2|",
+                          "|1=2",
+                          "1=2||3=4",
+                          "1=2| |3=4",
+                          "1.5=2"})
+        CHECK(!VarType(s).TryAsMap<int, int>());
+    CHECK(!VarType("a=|b=2").TryAsMap<std::string, std::string>() &&
+          !VarType("=a|b=2").TryAsMap<std::string, std::string>());
+    // 值是字符串时，多一个键值分隔符不会被当成值的一部分
+    CHECK(!VarType("a=b=c").TryAsMap<std::string, std::string>() &&
+          !VarType("a==b").TryAsMap<std::string, std::string>());
+
+    // skip_empty 只跳过整个空项，缺分隔符与键重复照样失败
+    using II = std::map<int, int>;
+    CHECK(VarType("1=2||3=4").TryAsMap<int, int>("|", "=", true) == II({{1, 2}, {3, 4}}));
+    CHECK(VarType("1=2|").TryAsMap<int, int>("|", "=", true) == II({{1, 2}}));
+    CHECK(VarType("| 1=2").TryAsMap<int, int>("|", "=", true) == II({{1, 2}}));
+    CHECK(VarType("1=2| |3=4").TryAsMap<int, int>("|", "=", true) == II({{1, 2}, {3, 4}}));
+    CHECK(!VarType("1|3=4").TryAsMap<int, int>("|", "=", true) &&
+          !VarType("1=2|1=3").TryAsMap<int, int>("|", "=", true));
+}
+
+void TestMapSeparators()
+{
+    using II = std::map<int, int>;
+    using SI = std::map<std::string, int>;
+    CHECK(VarType("12:34,45:78").TryAsMap<int, int>(",", ":") == II({{12, 34}, {45, 78}}));
+    CHECK(VarType("a=>1&b=>2").TryAsMap<std::string, int>("&", "=>") == SI({{"a", 1}, {"b", 2}}));
+    CHECK(VarType("a·1|b·2").TryAsMap<std::string, int>("|", "·") == SI({{"a", 1}, {"b", 2}}));
+    CHECK(VarType("路·1;中·2").TryAsMap<std::string, int>(";", "·") == SI({{"中", 2}, {"路", 1}}));
+    CHECK(!VarType("a=1").TryAsMap<std::string, int>("|", "=>")); // 整串匹配：单个 '=' 不是 "=>"
+    // 项分隔符同样整串匹配：多字符的 "||" 不会按单个 '|' 切；多字节的 "·" 不会按字节切（"路" 里有 B7 字节）
+    CHECK(VarType("a=1||b=2").TryAsMap<std::string, int>("||", "=") == SI({{"a", 1}, {"b", 2}}));
+    // 单个 '|' 不是 "||"：整串是一项，里面有两个 '='，失败
+    CHECK(!VarType("a=1|b=2").TryAsMap<std::string, std::string>("||", "="));
+    CHECK(VarType("路=1·中=2").TryAsMap<std::string, int>("·", "=") == SI({{"中", 2}, {"路", 1}}));
+    // 多字符键值分隔符：重叠出现也算多个（"a===b" 里 "==" 出现在位置 1 和 2），有歧义，失败
+    CHECK(VarType("a==b").TryAsMap<std::string, std::string>("|", "==") ==
+          std::map<std::string, std::string>({{"a", "b"}}));
+    CHECK(!VarType("a===b").TryAsMap<std::string, std::string>("|", "=="));
+
+    // 两级分隔符相同：无法区分，失败
+    CHECK(!VarType("1=2").TryAsMap<int, int>("|", "|") && !VarType("1=2").TryAsMap<int, int>("=", "="));
+    CHECK(!VarType("").TryAsMap<int, int>("|", "|") && !VarType("|").TryAsMap<int, int>("|", "|", true));
+    // 非法分隔符：任何一级、任何文本（包括空文本）都失败
+    for (const char* bad : {"", "1", "-", "+", ".", "e", "E", " ", "x1"})
+    {
+        CHECK(!VarType("1=2").TryAsMap<int, int>(bad, "="));
+        CHECK(!VarType("1=2").TryAsMap<int, int>("|", bad));
+        CHECK(!VarType("").TryAsMap<int, int>(bad, "="));
+        CHECK(!VarType("").TryAsMap<int, int>("|", bad));
+    }
+}
+
+void TestMapRoundTripRandom()
+{
+    std::mt19937_64 rng(7654321);
+    for (int round = 0; round < 3000; ++round)
+    {
+        std::map<std::int32_t, std::int32_t> src;
+        const std::size_t n = rng() % 8;
+        for (std::size_t i = 0; i < n; ++i)
+            src[static_cast<std::int32_t>(rng()) >> (rng() % 32)] = static_cast<std::int32_t>(rng());
+        std::string text;
+        for (const auto& [k, v] : src)
+            text += (text.empty() ? "" : "|") + std::to_string(k) + "=" + std::to_string(v);
+        CHECK((VarType(text).TryAsMap<std::int32_t, std::int32_t>() == src));
+    }
+}
+
+// 容器转换不碰转换缓存：缓存里的标量结果原样保留。
+void TestContainersDoNotTouchCache()
+{
+    const VarType v = "1|2";
+    CHECK(!v.TryAs<int>() && Peer::Tag(v) == Peer::TagOf<int>() && !Peer::Ok(v));
+    CHECK(v.TryAsVector<int>() == std::vector<int>({1, 2}));
+    CHECK(Peer::Tag(v) == Peer::TagOf<int>() && !Peer::Ok(v));
+    const VarType m = "1=2";
+    CHECK(m.As<double>(-1.0) == -1.0 && Peer::Tag(m) == Peer::TagOf<double>());
+    CHECK(m.TryAsMap<int, int>() == std::map<int, int>({{1, 2}}));
+    CHECK(Peer::Tag(m) == Peer::TagOf<double>() && !Peer::Ok(m));
 }
 
 void TestFormatAndHash()
@@ -394,7 +855,19 @@ int main()
     TestComparisonWithStringsAndVarType();
     TestNumericEqual();
     TestCopyMoveAndAssignment();
-    TestConcurrentConstReads();
+    TestCacheFillHitAndFailure();
+    TestCacheNeverServesWrongType();
+    TestCacheFollowsCopyMoveAssign();
+    TestCacheDoesNotAffectComparison();
+    TestVectorFormatAndElementRules();
+    TestVectorEmptyItems();
+    TestVectorSeparators();
+    TestVectorRoundTripRandom();
+    TestMapFormatAndElementRules();
+    TestMapStrictness();
+    TestMapSeparators();
+    TestMapRoundTripRandom();
+    TestContainersDoNotTouchCache();
     TestFormatAndHash();
     std::puts("var_type_test: ok");
     return 0;
