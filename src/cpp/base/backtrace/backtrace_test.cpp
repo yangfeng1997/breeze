@@ -4,13 +4,22 @@
 #include "backtrace.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <sstream>
 #include <string>
 #include <vector>
 
-#include "assert_test_util.h"
-
 using namespace breeze;
+
+#define CHECK(cond)                                                                                                    \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        if (!(cond))                                                                                                   \
+        {                                                                                                              \
+            std::fprintf(stderr, "%s:%d: CHECK failed: %s\n", __FILE__, __LINE__, #cond);                              \
+            std::abort();                                                                                              \
+        }                                                                                                              \
+    } while (0)
 
 namespace bt_test
 {

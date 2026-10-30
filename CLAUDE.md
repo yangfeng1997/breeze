@@ -20,11 +20,14 @@
   `base/queue` 是 SPSC/MPSC 无锁队列（包 moodycamel，公开 API 不暴露其类型），网络库的底座；
   `base/buffer` 是 `SharedBuffer`（引用计数的不可变字节块切片，业务回调的消息类型）与 `Buffer`（带读写游标的缓冲），只依赖标准库，网络库与业务都用；
   `base/thread`（仅 Linux）是 `Thread` / `this_thread` / `WaitGroup` / `SpinLock` / `ThreadPool`，创建失败返回 errno、库内不抛异常，设计与来源见 [docs/线程基础库.md](docs/线程基础库.md)（**tsan 同样没在本机跑过**）；
-  `base/assert`（仅 Linux）是 `ASSERT_*` 防御式断言（Debug 失败 abort，Release 走防御式控制流并按调用点限流记日志）与 `Backtrace`；
-  `base/util` 是 `DEFER` 与 `Singleton`；`base/string` 是字符串工具；`base/random` 是 xoshiro256**（有可复现的 `Random` 对象与线程局部的全局生成器），
+  `base/assert`（仅 Linux）是 `ASSERT_*` 防御式断言（Debug 失败 abort，Release 走防御式控制流并按调用点限流记日志），`base/backtrace`（仅 Linux）是 `Backtrace` 调用栈文本化（独立库，不依赖日志与断言）；
+  `base/defer`（`DEFER`）、`base/singleton`（`Singleton` / `ThreadLocalSingleton`）、`base/noncopyable`（`NonCopyable`）各一个目录；`base/string` 是字符串工具；`base/random` 是 xoshiro256**（有可复现的 `Random` 对象与线程局部的全局生成器），
+  `base/hash` 是 `MurmurHash64A`（**结果稳定**的字节哈希，分片 / 路由用，种子是强类型 `MurmurSeed`）、`base/vartype` 是 `VarType`（字符串存放、按需转数字 / 布尔，转换是严格的、失败不会悄悄得 0）、`base/time_record` 是 `TimeRecord` / `TIME_RECORD`（秒表，析构时可选地写日志，支持慢操作阈值），
   设计与来源见 [docs/基础工具库.md](docs/基础工具库.md)；
+  `base/fsm` 是 `fsm::Machine`（编译期状态机：转移与事件都是延迟执行、先进先出，**状态的成员函数要定义在所有状态之后**），见 [docs/状态机.md](docs/状态机.md)；
   `base/time` 是 `TimeUtil`（纯函数日期计算，支持"每天凌晨 5 点刷新"的游戏日）与 `Now`（帧缓存时钟、GM 偏移 / 冻结），
   `base/timer` 是 `TimerWheel`（分层时间轮，O(1) 添加 / 取消 / 重置、空转跳过），**定时器要用单调时钟 `Now::SteadyMs()` 驱动，别用墙钟**，见 [docs/时间与定时器.md](docs/时间与定时器.md)；
+  `base/event` 是 `EventBus`（类型安全的**同步**发布 / 订阅，回调里可以随意订阅 / 退订 / `Clear` / 嵌套发布，非线程安全）与 `ScopedSubscription`，见 [docs/事件总线.md](docs/事件总线.md)；
   `base/container` 是 `FlatHashMap` / `FlatHashSet`（Swiss table）与 `LinkedHashMap` / `LinkedHashSet`（保持插入顺序，可当 LRU），
   **插入可能让迭代器 / 引用失效、元素的移动构造必须 noexcept、`at()` 找不到键就 abort**，见 [docs/基础容器库.md](docs/基础容器库.md)；
   这几个库的 **tsan 同样没在本机跑过**，容器 bench 默认不构建：`cmake --preset release -DBREEZE_BUILD_CONTAINER_BENCH=ON`；
