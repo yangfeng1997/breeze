@@ -78,7 +78,7 @@ void AssertReport(std::atomic<std::uint32_t>& hits, std::source_location loc, co
     }
 
 #define ASSERT(expr) BREEZE_ASSERT_DO_(expr, (void)0)
-#define ASSERT_RET_VOID(expr) BREEZE_ASSERT_DO_(expr, return )
+#define ASSERT_RET_VOID(expr) BREEZE_ASSERT_DO_(expr, return)
 #define ASSERT_RET_VAL(expr, val) BREEZE_ASSERT_DO_(expr, return (val))
 #define ASSERT_CONTINUE(expr) BREEZE_ASSERT_LOOP_(expr, continue)
 #define ASSERT_BREAK(expr) BREEZE_ASSERT_LOOP_(expr, break)

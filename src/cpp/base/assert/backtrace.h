@@ -1,4 +1,5 @@
-// 当前线程调用栈的文本化，供断言失败、致命错误时留现场。只支持 Linux / glibc（backtrace + dladdr）。
+// 当前线程调用栈的文本化，供断言失败、致命错误时留现场。只支持 Linux / glibc（libgcc 的 _Unwind_Backtrace + dladdr）。
+// 不用 glibc 的 backtrace()：ASan 会拦截它，栈顶多出一层拦截器帧，skip 的帧数就不准了；_Unwind_Backtrace 没这个问题。
 
 #pragma once
 
@@ -19,5 +20,10 @@ namespace breeze
 // 不是 async-signal-safe（malloc、dladdr 内部加锁）：别在信号处理函数里调。
 inline constexpr std::size_t kMaxBacktraceFrames = 128;
 [[gnu::noinline]] std::string Backtrace(std::size_t max_depth = 32, std::size_t skip = 0);
+
+// 把一个返回地址格式化成上面的一行（不带换行）。返回地址、不是调用指令的地址：
+// 调用点是上一个函数的最后一条指令时（常见于 noreturn 调用），返回地址已经落进下一个函数，所以查符号用 pc-1。
+// 自己抓栈（比如崩溃处理里先存地址、事后再格式化）时用。
+std::string FormatBacktraceFrame(std::size_t index, const void* return_address);
 
 } // namespace breeze

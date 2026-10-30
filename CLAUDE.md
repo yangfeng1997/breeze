@@ -20,6 +20,14 @@
   `base/queue` 是 SPSC/MPSC 无锁队列（包 moodycamel，公开 API 不暴露其类型），网络库的底座；
   `base/buffer` 是 `SharedBuffer`（引用计数的不可变字节块切片，业务回调的消息类型）与 `Buffer`（带读写游标的缓冲），只依赖标准库，网络库与业务都用；
   `base/thread`（仅 Linux）是 `Thread` / `this_thread` / `WaitGroup` / `SpinLock` / `ThreadPool`，创建失败返回 errno、库内不抛异常，设计与来源见 [docs/线程基础库.md](docs/线程基础库.md)（**tsan 同样没在本机跑过**）；
+  `base/assert`（仅 Linux）是 `ASSERT_*` 防御式断言（Debug 失败 abort，Release 走防御式控制流并按调用点限流记日志）与 `Backtrace`；
+  `base/util` 是 `DEFER` 与 `Singleton`；`base/string` 是字符串工具；`base/random` 是 xoshiro256**（有可复现的 `Random` 对象与线程局部的全局生成器），
+  设计与来源见 [docs/基础工具库.md](docs/基础工具库.md)；
+  `base/time` 是 `TimeUtil`（纯函数日期计算，支持"每天凌晨 5 点刷新"的游戏日）与 `Now`（帧缓存时钟、GM 偏移 / 冻结），
+  `base/timer` 是 `TimerWheel`（分层时间轮，O(1) 添加 / 取消 / 重置、空转跳过），**定时器要用单调时钟 `Now::SteadyMs()` 驱动，别用墙钟**，见 [docs/时间与定时器.md](docs/时间与定时器.md)；
+  `base/container` 是 `FlatHashMap` / `FlatHashSet`（Swiss table）与 `LinkedHashMap` / `LinkedHashSet`（保持插入顺序，可当 LRU），
+  **插入可能让迭代器 / 引用失效、元素的移动构造必须 noexcept、`at()` 找不到键就 abort**，见 [docs/基础容器库.md](docs/基础容器库.md)；
+  这几个库的 **tsan 同样没在本机跑过**，容器 bench 默认不构建：`cmake --preset release -DBREEZE_BUILD_CONTAINER_BENCH=ON`；
   `base/net` 是 Reactor 网络库（仅 Linux）：`Endpoint` / `SharedBuffer` / `Buffer` / `FrameCodec` 等基础件，
   `EventLoop` / `Connection` / `ConnectionHandle` / `EventLoopGroup` / `NetServer` / `NetClient`（含重连）已完整，
   `framework/net` 有 `MainLoopExecutor`（IO 线程事件回投 App 主循环，带入口背压）与 `NetModule`；

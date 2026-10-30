@@ -55,6 +55,13 @@ set(KERNEL_DIR framework/kernel)
 set(QUEUE_DIR base/queue)
 set(BUFFER_DIR base/buffer)
 set(THREAD_DIR base/thread)
+set(ASSERT_DIR base/assert)
+set(UTIL_DIR base/util)
+set(STRING_DIR base/string)
+set(RANDOM_DIR base/random)
+set(TIME_DIR base/time)
+set(TIMER_DIR base/timer)
+set(CONTAINER_DIR base/container)
 set(NET_DIR base/net)
 set(NET_MODULE_DIR framework/net)
 
@@ -142,6 +149,47 @@ breeze_apply_log_level(breeze_buffer)
 set(BREEZE_BUILD_NET OFF)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   set(BREEZE_BUILD_NET ON)
+endif()
+
+# 小工具（DEFER、Singleton）：只有头文件，只依赖标准库，不限平台。
+add_library(breeze_util INTERFACE)
+target_include_directories(breeze_util INTERFACE ${UTIL_DIR})
+
+# 时间：TimeUtil（纯函数的日期计算）与 Now（帧缓存时钟、可模拟的逻辑时间）。用 localtime_r（POSIX），不限 Linux。
+add_library(breeze_time ${TIME_DIR}/time_util.cpp ${TIME_DIR}/now.cpp)
+target_include_directories(breeze_time PUBLIC ${TIME_DIR})
+target_compile_options(breeze_time PRIVATE -Wall -Wextra)
+
+# 分层时间轮（TimerWheel）：只依赖标准库，不限平台。
+add_library(breeze_timer ${TIMER_DIR}/timer_wheel.cpp)
+target_include_directories(breeze_timer PUBLIC ${TIMER_DIR})
+target_compile_options(breeze_timer PRIVATE -Wall -Wextra)
+
+# 容器：FlatHashMap / FlatHashSet（Swiss table）、LinkedHashMap / LinkedHashSet（保持插入顺序）。只有头文件，只依赖标准库。
+add_library(breeze_container INTERFACE)
+target_include_directories(breeze_container INTERFACE ${CONTAINER_DIR})
+
+# 字符串工具（Split / Join / Trim / 数字解析……）：只依赖标准库，不限平台。
+add_library(breeze_string ${STRING_DIR}/string_util.cpp)
+target_include_directories(breeze_string PUBLIC ${STRING_DIR})
+target_compile_options(breeze_string PRIVATE -Wall -Wextra)
+
+# 伪随机数（xoshiro256**）：getrandom 取熵、pthread_atfork 让 fork 后重新播种，只支持 Linux，与网络库同一个开关。
+if(BREEZE_BUILD_NET)
+  add_library(breeze_random ${RANDOM_DIR}/random_util.cpp)
+  target_include_directories(breeze_random PUBLIC ${RANDOM_DIR})
+  target_compile_options(breeze_random PRIVATE -Wall -Wextra)
+endif()
+
+# 防御式断言（ASSERT_*）与调用栈文本化（Backtrace）。backtrace 用 glibc 的 execinfo / dladdr，只支持 Linux，
+# 所以与网络库同一个开关。日志只 PRIVATE：公开头不含它；assert_macros.cpp 经默认 logger 写失败信息。
+# 断言库自己不分 Debug / Release：模式由使用方翻译单元的 NDEBUG（或 BREEZE_ASSERT_FATAL）在宏展开时决定。
+if(BREEZE_BUILD_NET)
+  add_library(breeze_assert ${ASSERT_DIR}/backtrace.cpp ${ASSERT_DIR}/assert_macros.cpp)
+  target_include_directories(breeze_assert PUBLIC ${ASSERT_DIR})
+  target_link_libraries(breeze_assert PUBLIC ${CMAKE_DL_LIBS} PRIVATE breeze_logger)
+  target_compile_options(breeze_assert PRIVATE -Wall -Wextra)
+  breeze_apply_log_level(breeze_assert)
 endif()
 
 if(BREEZE_BUILD_NET)
@@ -290,6 +338,67 @@ target_compile_options(queue_test PRIVATE -Wall -Wextra)
 add_test(NAME queue_test COMMAND queue_test)
 set_tests_properties(queue_test PROPERTIES ENVIRONMENT "${BREEZE_TEST_ENV}")
 
+# 头文件库，测试 TU 就是编译它们的地方，所以这里开 -Wall -Wextra。singleton_test 要 fork，只在 Linux 上构建。
+add_executable(defer_test ${UTIL_DIR}/defer_test.cpp)
+target_link_libraries(defer_test PRIVATE breeze_util)
+target_compile_options(defer_test PRIVATE -Wall -Wextra)
+add_test(NAME defer_test COMMAND defer_test)
+
+if(BREEZE_BUILD_NET)
+  add_executable(random_util_test ${RANDOM_DIR}/random_util_test.cpp)
+  target_link_libraries(random_util_test PRIVATE breeze_random Threads::Threads)
+  target_compile_options(random_util_test PRIVATE -Wall -Wextra)
+  add_test(NAME random_util_test COMMAND random_util_test)
+  set_tests_properties(random_util_test PROPERTIES ENVIRONMENT "${BREEZE_TEST_ENV}")
+
+  add_executable(singleton_test ${UTIL_DIR}/singleton_test.cpp)
+  target_link_libraries(singleton_test PRIVATE breeze_util Threads::Threads)
+  target_compile_options(singleton_test PRIVATE -Wall -Wextra)
+  add_test(NAME singleton_test COMMAND singleton_test)
+  set_tests_properties(singleton_test PROPERTIES ENVIRONMENT "${BREEZE_TEST_ENV}")
+endif()
+
+# 两个测试都会改 TZ 环境变量（setenv + tzset），所以各自独立成进程，且用例里不起会读时区的线程。
+foreach(t time_util_test now_test)
+  add_executable(${t} ${TIME_DIR}/${t}.cpp)
+  target_link_libraries(${t} PRIVATE breeze_time)
+  target_compile_options(${t} PRIVATE -Wall -Wextra)
+  add_test(NAME ${t} COMMAND ${t})
+  set_tests_properties(${t} PROPERTIES ENVIRONMENT "${BREEZE_TEST_ENV}")
+endforeach()
+
+foreach(t timer_wheel_test timer_wheel_model_test)
+  add_executable(${t} ${TIMER_DIR}/${t}.cpp)
+  target_link_libraries(${t} PRIVATE breeze_timer)
+  target_compile_options(${t} PRIVATE -Wall -Wextra)
+  add_test(NAME ${t} COMMAND ${t})
+endforeach()
+
+# flat_hash_test 用 fork 测 at() 找不到键会 abort，所以只在 Linux 上构建。同一份源码再编一份强制 SWAR 的版本：
+# x86 上平时走 SSE2，没有 SSE2 的平台（如 aarch64）走 SWAR，两条路径都要测。
+if(BREEZE_BUILD_NET)
+  add_executable(flat_hash_test ${CONTAINER_DIR}/flat_hash_test.cpp)
+  target_link_libraries(flat_hash_test PRIVATE breeze_container)
+  target_compile_options(flat_hash_test PRIVATE -Wall -Wextra)
+  add_test(NAME flat_hash_test COMMAND flat_hash_test)
+
+  add_executable(flat_hash_swar_test ${CONTAINER_DIR}/flat_hash_test.cpp)
+  target_link_libraries(flat_hash_swar_test PRIVATE breeze_container)
+  target_compile_options(flat_hash_swar_test PRIVATE -Wall -Wextra)
+  target_compile_definitions(flat_hash_swar_test PRIVATE BREEZE_CONTAINER_FORCE_SWAR=1 BREEZE_EXPECT_GROUP_WIDTH=8)
+  add_test(NAME flat_hash_swar_test COMMAND flat_hash_swar_test)
+
+  add_executable(linked_hash_test ${CONTAINER_DIR}/linked_hash_test.cpp)
+  target_link_libraries(linked_hash_test PRIVATE breeze_container)
+  target_compile_options(linked_hash_test PRIVATE -Wall -Wextra)
+  add_test(NAME linked_hash_test COMMAND linked_hash_test)
+endif()
+
+add_executable(string_util_test ${STRING_DIR}/string_util_test.cpp)
+target_link_libraries(string_util_test PRIVATE breeze_string)
+target_compile_options(string_util_test PRIVATE -Wall -Wextra)
+add_test(NAME string_util_test COMMAND string_util_test)
+
 add_executable(buffer_test ${BUFFER_DIR}/buffer_test.cpp)
 target_link_libraries(buffer_test PRIVATE breeze_buffer)
 target_compile_options(buffer_test PRIVATE -Wall -Wextra)
@@ -330,6 +439,17 @@ if(BREEZE_BUILD_NET)
   breeze_thread_test(wait_group_test)
   breeze_thread_test(thread_pool_test)
 
+  # base/assert 的测试。符号名要 -rdynamic（ENABLE_EXPORTS），否则 dladdr 看不到可执行文件自己的函数。
+  # logger 是 breeze_assert 的 PRIVATE 依赖，测试要读日志写到 stderr 的内容，不需要直接链它。
+  foreach(t backtrace_test assert_test assert_fatal_test)
+    add_executable(${t} ${ASSERT_DIR}/${t}.cpp)
+    target_link_libraries(${t} PRIVATE breeze_assert Threads::Threads)
+    set_target_properties(${t} PROPERTIES ENABLE_EXPORTS ON)
+    target_compile_options(${t} PRIVATE -Wall -Wextra)
+    add_test(NAME ${t} COMMAND ${t})
+    set_tests_properties(${t} PROPERTIES ENVIRONMENT "${BREEZE_TEST_ENV}")
+  endforeach()
+
   breeze_net_test(endpoint_test)
   breeze_net_test(codec_test)
   breeze_net_test(socket_test INTERNAL)
@@ -364,6 +484,14 @@ if(BREEZE_BUILD_NET)
     COMMAND Python3::Interpreter -I ${CMAKE_SOURCE_DIR}/${NET_DIR}/check_no_exceptions.py
             ${CMAKE_SOURCE_DIR}/${NET_DIR} ${CMAKE_SOURCE_DIR}/${BUFFER_DIR} ${CMAKE_SOURCE_DIR}/${THREAD_DIR}
             ${CMAKE_SOURCE_DIR}/framework/net)
+endif()
+
+# 容器 bench：-DBREEZE_BUILD_CONTAINER_BENCH=ON 才构建（不联网）。用 Release 预设跑：cmake --preset release -DBREEZE_BUILD_CONTAINER_BENCH=ON
+option(BREEZE_BUILD_CONTAINER_BENCH "构建 container_bench（FlatHashMap / LinkedHashMap 对比 std::unordered_map，用到 glibc 的 mallinfo2）" OFF)
+if(BREEZE_BUILD_CONTAINER_BENCH AND BREEZE_BUILD_NET)
+  add_executable(container_bench bench/container_bench.cpp)
+  target_link_libraries(container_bench PRIVATE breeze_container)
+  target_compile_options(container_bench PRIVATE -Wall -Wextra)
 endif()
 
 # 基线 bench：-DBREEZE_BUILD_BENCH=ON 才构建，默认关闭（要联网拉 muduo 源码）。
