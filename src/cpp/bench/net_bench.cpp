@@ -33,6 +33,9 @@
 //                 [--duration 3] [--warmup 1] [--client-threads 4] [--server-cpu 2] [--client-cpus 4,6,8,10]
 //                 [--mainloop-cpu 12]   breeze-mainloop 的主循环线程绑哪个核（IO 线程用 --server-cpu）
 //                 [--active K]          共 --conns 条连接，只让其中 K 条 ping-pong，其余连上后空闲
+//                 [--delay-ms D]        UDP：压测客户端给收和发各加 D 毫秒延迟（往返 2D），模拟有 RTT 的网络。
+//                                       本机没有 netem 的权限，只能在客户端里排队；闭环下负载由往返时间决定，
+//                                       所以可以在相同负载下比服务端的 CPU
 //                 [--mem-probe N]       不压测，只测建 N 条空闲连接的内存与空闲 CPU
 
 #include <poll.h>
@@ -50,6 +53,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <future>
 #include <memory>
 #include <stop_token>
@@ -119,7 +123,8 @@ struct BenchOptions
     int server_cpu = -1;
     int mainloop_cpu = -1;
     int mem_probe = 0;
-    int active = 0; // > 0：只让这么多条连接 ping-pong，其余连上之后空闲（测「会话多」对活跃连接的影响）
+    int delay_ms = 0; // UDP：客户端侧给每个方向各加这么多毫秒的延迟（往返 = 2 倍），模拟有 RTT 的网络
+    int active = 0;   // > 0：只让这么多条连接 ping-pong，其余连上之后空闲（测「会话多」对活跃连接的影响）
     std::vector<int> client_cpus;
 };
 
@@ -155,6 +160,10 @@ public:
     virtual pthread_t ExtraThread() { return 0; }
     // rudp 的服务端要凭票据握手：签发 n 张；其它实现返回空。
     virtual std::vector<RudpTicket> IssueTickets(int /*n*/) { return {}; }
+    // 服务端 loop 迄今为止单轮（分发事件 + 任务 + 定时器 + 回收）最长的耗时（微秒）；没有这个概念的实现返回 0。
+    virtual double MaxLoopLagUs() { return 0; }
+    // 服务端 loop 迄今收到的字节数（rudp 的 UdpSocket 统计）；没有这个统计的实现返回 0。
+    virtual std::uint64_t BytesIn() { return 0; }
 };
 
 // 裸 epoll：水平触发，读多少原样写回多少。
@@ -678,6 +687,12 @@ public:
     }
     pthread_t ServerThread() override { return io_thread_; }
     std::uint64_t Iterations() override { return GroupAccess::LoopAt(*group_, 0).Iterations(); }
+    std::uint64_t BytesIn() override { return group_->GetStats().bytes_in; }
+    double MaxLoopLagUs() override
+    {
+        return static_cast<double>(
+            std::chrono::duration_cast<std::chrono::microseconds>(group_->GetStats().max_loop_lag).count());
+    }
     std::vector<RudpTicket> IssueTickets(int n) override
     {
         std::vector<RudpTicket> out;
@@ -888,13 +903,16 @@ public:
               const std::vector<std::byte>& payload,
               int cpu,
               bool kcp,
-              std::vector<RudpTicket> tickets)
+              std::vector<RudpTicket> tickets,
+              int delay_ms = 0)
         : ep_(ep)
         , nconns_(conns)
         , payload_(payload)
         , cpu_(cpu)
         , kcp_(kcp)
         , tickets_(std::move(tickets))
+        , delay_(std::chrono::milliseconds(delay_ms))
+        , retry_after_(std::chrono::milliseconds(100 + 8 * delay_ms)) // 有延迟时别把正常的往返当成丢包
     {
         if (kcp_)
             REQUIRE(tickets_.size() >= static_cast<std::size_t>(conns));
@@ -908,6 +926,8 @@ public:
         for (int i = 0; i < nconns_; ++i)
         {
             Conn& c = conns_[static_cast<std::size_t>(i)];
+            c.owner = this;
+            c.index = static_cast<std::uint32_t>(i);
             REQUIRE(sock::CreateSocket(ep_, SOCK_DGRAM, c.fd) == 0);
             const int buf = 1 << 20;
             ::setsockopt(c.fd.get(), SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
@@ -925,23 +945,71 @@ public:
     {
         PinTo(cpu_);
         const int active = Active(nconns_);
-        for (int i = 0; i < active; ++i)
-            SendNext(conns_[static_cast<std::size_t>(i)]);
+        const bool delayed = delay_.count() > 0;
         std::vector<epoll_event> evs(1024);
         auto last_scan = BenchClock::now();
+        if (!delayed)
+        {
+            for (int i = 0; i < active; ++i)
+                SendNext(conns_[static_cast<std::size_t>(i)]);
+        }
+        else
+        {
+            // 有延迟时把各连接的起点在一个往返内均匀错开：闭环 + 固定延迟会让同时起步的连接一直同相，
+            // 每个往返都冲来一波突发，把服务端的接收缓冲打爆（丢包），污染要比较的 CPU。
+            const auto rtt = 2 * delay_;
+            for (int i = 0; i < active; ++i)
+                starts_.push_back({last_scan + rtt * i / std::max(active, 1), static_cast<std::uint32_t>(i)});
+        }
         while (!stop.load(std::memory_order_relaxed))
         {
-            const int n = ::epoll_wait(epfd_.get(), evs.data(), static_cast<int>(evs.size()), 10);
+            int timeout = 10;
+            if (delayed) // 睡到最近一个延迟项到期，最多 10ms
+            {
+                const auto now0 = BenchClock::now();
+                auto next = now0 + std::chrono::milliseconds(10);
+                if (!rx_.empty())
+                    next = std::min(next, rx_.front().due);
+                if (!tx_.empty())
+                    next = std::min(next, tx_.front().due);
+                if (!starts_.empty())
+                    next = std::min(next, starts_.front().first);
+                timeout = static_cast<int>(
+                    std::max<std::int64_t>(0, std::chrono::ceil<std::chrono::milliseconds>(next - now0).count()));
+            }
+            const int n = ::epoll_wait(epfd_.get(), evs.data(), static_cast<int>(evs.size()), timeout);
             for (int i = 0; i < n; ++i)
                 OnReadable(conns_[evs[static_cast<std::size_t>(i)].data.u32], measuring);
             const auto now = BenchClock::now();
+            if (delayed)
+            {
+                while (!starts_.empty() && starts_.front().first <= now)
+                {
+                    const std::uint32_t i = starts_.front().second;
+                    starts_.pop_front();
+                    SendNext(conns_[i]);
+                }
+                // 到期的收包先处理（处理里会产生新的发包，到期时刻在 now 之后，不会在这一轮里被发出）
+                while (!rx_.empty() && rx_.front().due <= now)
+                {
+                    Delayed d = std::move(rx_.front());
+                    rx_.pop_front();
+                    Process(conns_[d.conn], d.data, measuring);
+                }
+                while (!tx_.empty() && tx_.front().due <= now)
+                {
+                    Delayed d = std::move(tx_.front());
+                    tx_.pop_front();
+                    (void)::send(conns_[d.conn].fd.get(), d.data.data(), d.data.size(), MSG_NOSIGNAL);
+                }
+            }
             if (now - last_scan > std::chrono::milliseconds(20))
             {
                 last_scan = now;
                 for (int i = 0; i < active; ++i)
                 {
                     Conn& c = conns_[static_cast<std::size_t>(i)];
-                    if (now - c.last_tx > std::chrono::milliseconds(100)) // 100ms 没回包：丢了
+                    if (now - c.last_tx > retry_after_) // 很久没回包：丢了
                         Retry(c);
                 }
             }
@@ -955,15 +1023,43 @@ private:
     {
         UniqueFd fd;
         std::unique_ptr<KcpSession> kcp;
+        UdpWorker* owner = nullptr;
+        std::uint32_t index = 0;
         bool verified = false;
         BenchClock::time_point sent_at; // 这条消息第一次发出的时刻：延迟从这里算，丢包的等待也算进去
         BenchClock::time_point last_tx; // 最近一次（含重发）发出的时刻：决定什么时候重发
     };
 
+    // 一个要延迟发出 / 延迟处理的数据报；延迟固定，所以队列天然按到期时间排好序。
+    struct Delayed
+    {
+        BenchClock::time_point due;
+        std::uint32_t conn;
+        std::vector<std::byte> data;
+    };
+
+    // 发一个数据报：有延迟就排队，到期再发；没有就直接发。
+    void Transmit(Conn& c, std::span<const std::byte> data)
+    {
+        if (delay_.count() > 0)
+            tx_.push_back({BenchClock::now() + delay_, c.index, {data.begin(), data.end()}});
+        else
+            (void)::send(c.fd.get(), data.data(), data.size(), MSG_NOSIGNAL);
+    }
+
     static void Output(void* user, std::span<const std::byte> seg)
     {
         auto* c = static_cast<Conn*>(user);
         const std::byte hdr = rudp::DataHeader();
+        if (c->owner->delay_.count() > 0)
+        {
+            std::vector<std::byte> d;
+            d.reserve(seg.size() + 1);
+            d.push_back(hdr);
+            d.insert(d.end(), seg.begin(), seg.end());
+            c->owner->Transmit(*c, d);
+            return;
+        }
         iovec iov[2] = {{const_cast<std::byte*>(&hdr), 1}, {const_cast<std::byte*>(seg.data()), seg.size()}};
         msghdr mh{};
         mh.msg_iov = iov;
@@ -999,20 +1095,22 @@ private:
         c.sent_at = c.last_tx = BenchClock::now();
         if (!kcp_)
         {
-            (void)::send(c.fd.get(), payload_.data(), payload_.size(), MSG_NOSIGNAL);
+            Transmit(c, payload_);
             return;
         }
+        // 与库里 flush_on_send 的客户端同一个写法：Send 加 Flush(now)，待发的确认和数据装进同一个数据报。
+        // 以前这里先 Update：往返时间超过 KCP 的 10ms 门限时 Update 每次都会 flush，把确认单独发一个数据报，
+        // 每条消息变成两个数据报，服务端的包率翻倍（回环上两次发送间隔不到 10ms，过不了门限，所以看不出来）。
         std::uint32_t frags = 0;
-        c.kcp->Update(KcpNowMs());
         REQUIRE(c.kcp->Send(payload_, frags) == 0);
-        c.kcp->Flush();
+        c.kcp->Flush(KcpNowMs());
     }
 
     void Retry(Conn& c)
     {
         c.last_tx = BenchClock::now(); // sent_at 不动：延迟里包含这次等待，丢包的代价算在数字上
         if (!kcp_)
-            (void)::send(c.fd.get(), payload_.data(), payload_.size(), MSG_NOSIGNAL);
+            Transmit(c, payload_);
         else
             c.kcp->Update(KcpNowMs()); // 驱动 KCP 的超时重传
     }
@@ -1039,7 +1137,6 @@ private:
     void OnReadable(Conn& c, const std::atomic<bool>& measuring)
     {
         static thread_local std::byte buf[2048];
-        static thread_local std::vector<std::byte> msg(64 * 1024);
         for (;;)
         {
             const ssize_t n = ::recv(c.fd.get(), buf, sizeof(buf), MSG_DONTWAIT);
@@ -1049,22 +1146,33 @@ private:
                     return;
                 Die("压测中 UDP 连接出错");
             }
-            if (!kcp_)
-            {
-                Complete(c, {buf, static_cast<std::size_t>(n)}, measuring);
-                continue;
-            }
-            const auto pk = rudp::Parse({buf, static_cast<std::size_t>(n)});
-            if (!pk || pk->type != rudp::PacketType::Data)
-                continue;
-            if (c.kcp->Input(pk->body, KcpNowMs()) < 0)
-                continue;
-            for (int sz; (sz = c.kcp->PeekSize()) >= 0;)
-            {
-                REQUIRE(static_cast<std::size_t>(sz) <= msg.size());
-                REQUIRE(c.kcp->Recv({msg.data(), static_cast<std::size_t>(sz)}) == sz);
-                Complete(c, {msg.data(), static_cast<std::size_t>(sz)}, measuring);
-            }
+            const std::span<const std::byte> data{buf, static_cast<std::size_t>(n)};
+            if (delay_.count() > 0) // 排队，到期再处理
+                rx_.push_back({BenchClock::now() + delay_, c.index, {data.begin(), data.end()}});
+            else
+                Process(c, data, measuring);
+        }
+    }
+
+    // 处理一个收到的数据报。
+    void Process(Conn& c, std::span<const std::byte> data, const std::atomic<bool>& measuring)
+    {
+        static thread_local std::vector<std::byte> msg(64 * 1024);
+        if (!kcp_)
+        {
+            Complete(c, data, measuring);
+            return;
+        }
+        const auto pk = rudp::Parse(data);
+        if (!pk || pk->type != rudp::PacketType::Data)
+            return;
+        if (c.kcp->Input(pk->body, KcpNowMs()) < 0)
+            return;
+        for (int sz; (sz = c.kcp->PeekSize()) >= 0;)
+        {
+            REQUIRE(static_cast<std::size_t>(sz) <= msg.size());
+            REQUIRE(c.kcp->Recv({msg.data(), static_cast<std::size_t>(sz)}) == sz);
+            Complete(c, {msg.data(), static_cast<std::size_t>(sz)}, measuring);
         }
     }
 
@@ -1074,13 +1182,18 @@ private:
     int cpu_;
     bool kcp_;
     std::vector<RudpTicket> tickets_;
+    std::chrono::milliseconds delay_;
+    std::chrono::milliseconds retry_after_;
+    std::deque<Delayed> rx_, tx_;
+    std::deque<std::pair<BenchClock::time_point, std::uint32_t>> starts_; // 各连接开始发第一条的时刻（有延迟时才用）
     UniqueFd epfd_;
     std::vector<Conn> conns_;
     WorkerResult result_;
 };
 
-// /proc/net/snmp 里 UDP 的 RcvbufErrors（接收缓冲满而丢的数据报数，全系统累计）；读不到返回 0。
-std::uint64_t UdpRcvbufErrors()
+// /proc/net/snmp 里 UDP 的某个计数（全系统累计，只有压测在跑，可以当作本进程的）；读不到返回 0。
+// RcvbufErrors：接收缓冲满而丢的数据报；InDatagrams / OutDatagrams：交给 / 发出的数据报数（含压测客户端的 socket）。
+std::uint64_t UdpSnmp(const char* field)
 {
     FILE* f = std::fopen("/proc/net/snmp", "r");
     if (f == nullptr)
@@ -1101,12 +1214,43 @@ std::uint64_t UdpRcvbufErrors()
             continue;
         }
         for (std::size_t i = 0; i < names.size() && i < toks.size(); ++i)
-            if (names[i] == "RcvbufErrors")
+            if (names[i] == field)
                 result = std::strtoull(toks[i].c_str(), nullptr, 10);
         break;
     }
     std::fclose(f);
     return result;
+}
+
+std::uint64_t UdpRcvbufErrors() { return UdpSnmp("RcvbufErrors"); }
+
+// /proc/net/udp 里本地端口为 port 的 socket 的 drops（这个 socket 因接收缓冲满而丢的数据报数）。
+// 与 UdpRcvbufErrors 的区别：后者是全系统（含压测客户端的 10000 个 socket），这个只看服务端自己的。找不到返回 0。
+std::uint64_t UdpSocketDrops(std::uint16_t port)
+{
+    FILE* f = std::fopen("/proc/net/udp", "r");
+    if (f == nullptr)
+        return 0;
+    char line[512];
+    char want[16];
+    std::snprintf(want, sizeof(want), ":%04X ", port);
+    std::uint64_t total = 0;
+    while (std::fgets(line, sizeof(line), f) != nullptr)
+    {
+        // 本地地址是第二列（偏移约 8–14）；对端地址在后面（偏移 > 24），客户端 socket 的对端端口就是 port，要排除。
+        const char* local = std::strstr(line, want);
+        if (local == nullptr || local - line > 24)
+            continue;
+        // 行尾是 "... ref pointer drops"：取最后一列
+        std::string row(line);
+        while (!row.empty() && (row.back() == '\n' || row.back() == ' '))
+            row.pop_back();
+        const auto sp = row.rfind(' ');
+        if (sp != std::string::npos)
+            total += std::strtoull(row.c_str() + sp + 1, nullptr, 10);
+    }
+    std::fclose(f);
+    return total;
 }
 
 // 环境变量 BENCH_VERBOSE 非空时，在 stderr 打各阶段的起止时刻（排查"为什么这一组跑得特别久"用）。
@@ -1256,6 +1400,8 @@ int main(int argc, char** argv)
             o.server_cpu = std::atoi(next().c_str());
         else if (a == "--mainloop-cpu")
             o.mainloop_cpu = std::atoi(next().c_str());
+        else if (a == "--delay-ms")
+            o.delay_ms = std::atoi(next().c_str());
         else if (a == "--active")
             o.active = std::atoi(next().c_str());
         else if (a == "--mem-probe")
@@ -1338,7 +1484,8 @@ int main(int argc, char** argv)
                     begin += o.conns / o.client_threads + (k < o.conns % o.client_threads ? 1 : 0);
                 mine.assign(tickets.begin() + begin, tickets.begin() + begin + share);
             }
-            workers.push_back(std::make_unique<UdpWorker>(target, share, payload, cpu, kcp_impl, std::move(mine)));
+            workers.push_back(
+                std::make_unique<UdpWorker>(target, share, payload, cpu, kcp_impl, std::move(mine), o.delay_ms));
             continue;
         }
         workers.push_back(std::make_unique<Worker>(target, share, frame, cpu));
@@ -1370,6 +1517,10 @@ int main(int argc, char** argv)
     const double extra0 = has_extra ? ThreadCpuSeconds(server->ExtraThread()) : 0.0;
     const std::uint64_t iter0 = server->Iterations();
     const std::uint64_t drops0 = UdpRcvbufErrors();
+    const std::uint64_t sdrops0 = o.transport == "udp" ? UdpSocketDrops(ep.port()) : 0;
+    const std::uint64_t bytes0 = server->BytesIn();
+    const std::uint64_t in0 = UdpSnmp("InDatagrams");
+    const std::uint64_t out0 = UdpSnmp("OutDatagrams");
     const auto t0 = BenchClock::now();
     measuring = true;
     std::this_thread::sleep_for(std::chrono::seconds(o.duration_s));
@@ -1379,6 +1530,11 @@ int main(int argc, char** argv)
     const double extra1 = has_extra ? ThreadCpuSeconds(server->ExtraThread()) : 0.0;
     const std::uint64_t iters = server->Iterations() - iter0;
     const std::uint64_t drops = UdpRcvbufErrors() - drops0;
+    const std::uint64_t sdrops = o.transport == "udp" ? UdpSocketDrops(ep.port()) - sdrops0 : 0;
+    const double max_lag_us = server->MaxLoopLagUs();
+    const std::uint64_t rx_bytes = server->BytesIn() - bytes0;
+    const std::uint64_t dgrams_in = UdpSnmp("InDatagrams") - in0;
+    const std::uint64_t dgrams_out = UdpSnmp("OutDatagrams") - out0;
     stop = true;
     for (auto& t : threads)
         t.join();
@@ -1400,7 +1556,8 @@ int main(int argc, char** argv)
     const double mps = static_cast<double>(msgs) / secs;
     std::printf(
         "RESULT impl=%s transport=%s size=%zu conns=%d active=%d msgs_per_s=%.0f mb_per_s=%.1f p50_us=%.1f "
-        "p99_us=%.1f srv_cpu_pct=%.0f msgs_per_iter=%.1f drops_per_s=%.0f\n",
+        "p99_us=%.1f srv_cpu_pct=%.0f msgs_per_iter=%.1f drops_per_s=%.0f srv_sock_drops_per_s=%.0f "
+        "max_lag_us=%.0f srv_rx_bytes_per_msg=%.1f dgram_in_per_msg=%.2f dgram_out_per_msg=%.2f delay_ms=%d\n",
         o.impl.c_str(),
         o.transport.c_str(),
         o.size,
@@ -1412,7 +1569,13 @@ int main(int argc, char** argv)
         Percentile(lat, 0.99) / 1000.0,
         (cpu1 - cpu0) / secs * 100.0,
         iters == 0 ? 0.0 : static_cast<double>(msgs) / static_cast<double>(iters),
-        static_cast<double>(drops) / secs);
+        static_cast<double>(drops) / secs,
+        static_cast<double>(sdrops) / secs,
+        max_lag_us,
+        msgs == 0 ? 0.0 : static_cast<double>(rx_bytes) / static_cast<double>(msgs),
+        msgs == 0 ? 0.0 : static_cast<double>(dgrams_in) / static_cast<double>(msgs),
+        msgs == 0 ? 0.0 : static_cast<double>(dgrams_out) / static_cast<double>(msgs),
+        o.delay_ms);
     if (has_extra) // 第二个服务端线程（主循环）的 CPU 占用，单独一行以免打乱 RESULT 的固定字段
         std::printf("EXTRA main_cpu_pct=%.0f\n", (extra1 - extra0) / secs * 100.0);
     return 0;

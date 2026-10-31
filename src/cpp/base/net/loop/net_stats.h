@@ -34,6 +34,7 @@ struct NetStats
     // rudp 的握手与数据报（字节流传输恒为 0）：
     std::uint64_t rejected_ticket = 0;   // Hello 被拒：票据不存在 / 已过期 / 已用过 / token 不对（也计入不了 accepted）
     std::uint64_t datagrams_dropped = 0; // 被丢弃的数据报：格式不对、来源没有会话、KCP 不认
+    std::uint64_t rudp_updates = 0;      // 定时器真正去推进 KCP（调了 Update）的次数；静止的、没到重传时刻的会话不计
 
     std::uint64_t bytes_in = 0;     // read 到的字节
     std::uint64_t bytes_out = 0;    // 实际写进 socket 的字节（含帧头）

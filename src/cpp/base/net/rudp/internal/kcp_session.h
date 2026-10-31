@@ -23,6 +23,19 @@ namespace breeze
 // 进程内的单调毫秒，32 位回绕（KCP 内部用差值比较，回绕无碍；约 49 天一圈）。
 std::uint32_t KcpNowMs() noexcept;
 
+// 下次什么时候需要调 Update（见 KcpSession::PlanUpdate）。
+struct UpdatePlan
+{
+    enum class Kind : std::uint8_t
+    {
+        Quiescent, // 没有事可做，不用再调（直到下一次 Input / Send）
+        Soon,      // 马上就有事（待发的确认 / 窗口通告 / 排队的数据，或已有段到了重传时刻）：下一拍就调
+        At,        // 最早在 at（KCP 的毫秒时钟）有事：最早的重传时刻，或对端窗口为 0 时的下一次探测；之前调了也是白调
+    };
+    Kind kind = Kind::Quiescent;
+    std::uint32_t at = 0;
+};
+
 class KcpSession
 {
 public:
@@ -55,7 +68,10 @@ public:
     // 推进 KCP 的时钟：到点就 flush（发数据、重传、ack、窗口探测）。每个 interval 调一次。
     void Update(std::uint32_t now) noexcept;
     // 立刻 flush，不等 Update 的节拍。必须先 Update 过一次（ikcp 的要求）。
-    void Flush() noexcept;
+    // now 必须传：ikcp_flush 用 KCP 内部的"当前时间"给段打时间戳、算重传时刻，而它只在 Update / Input 里更新；
+    // 静止了很久的会话（没人调 Update）不拨一下的话，时间戳是很久以前的，重传时刻已经过去（白白重传一次），
+    // 对端确认时算出的 RTT 还包含整段静止时间（RTO 被拉到几十秒）。
+    void Flush(std::uint32_t now) noexcept;
 
     // 已排队但还没被对端确认的段数（发送队列 + 在途）。
     std::uint32_t WaitSnd() const noexcept;
@@ -63,6 +79,11 @@ public:
     // 有待发的窗口通告 / 探测、或对端窗口为 0（要定时探测）。都没有就是静止的：Update 只会白走一遍，可以不调，
     // 直到下一次 Input / Send 打破静止（ikcp_update 对隔了很久的第一次调用会自己重置内部时钟）。
     bool NeedsUpdate() const noexcept;
+    // 精确的"下次什么时候要 Update"：比 NeedsUpdate 多回答了"是现在还是以后"。在途的段只有到了它自己的重传时刻
+    // （resendts，ikcp 公开的）才需要 flush，之前每拍调一次 Update 只是白走一遍；收到的确认会让会话被 Input 唤醒，
+    // 不靠这里算。与 NeedsUpdate 一致：Quiescent 当且仅当 !NeedsUpdate()。now 用 ikcp 的毫秒时钟（KcpNowMs）。
+    // 在途段数多时要遍历 snd_buf（≤ 发送窗口），调用方只在刚 Update 之后算。
+    UpdatePlan PlanUpdate(std::uint32_t now) const noexcept;
     // 还在发送队列里、没进发送窗口的段数（不含已发出等确认的）。队列只在 flush 时往窗口里移，且先进先出。
     std::uint32_t QueuedSegments() const noexcept;
     // 同一个段重传次数超过 dead_link：链路判死。

@@ -5,6 +5,9 @@
 // 静止的会话（没有未确认的数据、没有待发的确认、对端窗口不为 0，见 KcpSession::NeedsUpdate）不需要 Tick：
 // Tick 返回 false 就是"暂时不用再调我"，之后 Input / Send / ResumeRead 打破静止时通过 Owner::OnConnectionWake
 // 把它重新放回拥有者的活跃表。会话很多、大多空闲时，定时器只走活跃的那部分，空闲会话不占 CPU。
+// 活跃的会话也不是每拍都真调 Update：只有在途的数据时，要等到最早的重传时刻（KcpSession::PlanUpdate），
+// Tick 没到点就直接返回（仍在表里）；有待发的确认 / 排队的数据 / 新来的 Input、Send 才下一拍就推进。
+// 往返时间长（几十毫秒以上）时，每条消息的在途时间里会话都在活跃表里，这一步才省得下东西。
 //
 // 与 StreamConnection 的语义差异（都写在 Connection 接口的注释之外，因为是 rudp 特有的）：
 // - 消息自带边界，没有 codec；单条消息上限是 RudpOptions::max_message_size，
@@ -178,6 +181,8 @@ private:
     bool need_deliver_ = false; // ResumeRead 之后等 Tick 补交付
     bool idle_registered_ = false;
     bool ticking_ = false;            // 在拥有者的活跃表里
+    bool immediate_ = true;           // 下一拍就要推进（有新的 Input / Send、有待发的确认……），不看 due_ms_
+    std::uint32_t due_ms_ = 0;        // 否则要等到这个时刻（KCP 的毫秒时钟）再推进：最早的重传 / 探测时刻
     bool notified_connected_ = false; // 回调过 OnConnected 才会回调 OnClosed
 
     std::uint64_t seg_total_ = 0; // 累计排入 KCP 的段数

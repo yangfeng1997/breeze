@@ -659,6 +659,101 @@ void TestManySessions()
     }
 }
 
+// 在途的数据不用每拍都调 Update：服务端在 OnConnected 里给 40 个会话各发一条，对端（裸 socket）一直不确认。
+// 只有到了重传时刻才需要 flush：600ms 里每个会话该有几次重传（间隔 200ms 起、按 1.5 倍退避），Update 的次数
+// 只有每拍都调（40 × 60）的零头；但重传一次都不能少——调度没睡过头。
+void TestInFlightSessionsAreOnlyUpdatedWhenDue()
+{
+    Fixture f;
+    f.rec.on_connected = [](Connection& c) { CHECK(c.Send(std::as_bytes(std::span("hi", 2))) == SendResult::Ok); };
+    constexpr int kN = 40;
+    std::vector<std::unique_ptr<RawUdp>> raws;
+    for (int i = 0; i < kN; ++i)
+    {
+        raws.push_back(std::make_unique<RawUdp>());
+        SendHello(*raws.back(), f.ep(), f.Ticket());
+        CHECK(RecvReply(*raws.back())->type == rudp::PacketType::Accept);
+    }
+    CHECK(WaitUntil([&] { return f.rec.connected_count() == kN; }));
+    std::this_thread::sleep_for(100ms); // 第一次 flush 已经发出去
+    const std::uint64_t before = f.stats().rudp_updates;
+    std::this_thread::sleep_for(600ms);
+    const std::uint64_t updates = f.stats().rudp_updates - before;
+    CHECK(updates >= kN);         // 每个会话至少有一次重传到点（计数没有漏记）
+    CHECK(updates < kN * 60 / 4); // 每拍都调是 2400 次；到点才调只有零头
+    for (auto& raw : raws)        // 每个对端收到：第一次发出 + 至少一次重传
+    {
+        std::size_t datas = 0;
+        while (const auto dg = raw->Recv(0ms))
+        {
+            const auto pk = rudp::Parse(*dg);
+            datas += pk && pk->type == rudp::PacketType::Data ? 1 : 0;
+        }
+        CHECK(datas >= 2);
+    }
+}
+
+// 睡着等重传的会话被新的 Send 唤醒后，下一拍就 flush，不用等到重传时刻：
+// 服务端先发一条没人确认的消息（在途，睡到 RTO），过一会儿业务再发一条，
+// 它必须在几个 interval 内出现在对端，而不是等 200ms 之后的重传把它带出去。
+void TestSendWhileInFlightIsFlushedPromptly()
+{
+    Fixture f;
+    f.rec.on_connected = [](Connection& c) { CHECK(c.Send(std::as_bytes(std::span("first", 5))) == SendResult::Ok); };
+    RawUdp raw;
+    const RudpTicket t = f.Ticket();
+    SendHello(raw, f.ep(), t);
+    CHECK(RecvReply(raw)->type == rudp::PacketType::Accept);
+    const ConnectionHandle h = f.rec.WaitConnected(0);
+    // 第一条发出（对端是裸 socket，不确认）：收下并确认它是 Data
+    const auto first = raw.Recv(1s);
+    CHECK(first.has_value() && rudp::Parse(*first)->type == rudp::PacketType::Data);
+    std::this_thread::sleep_for(60ms); // 会话睡到第一条的重传时刻（约 200ms）
+    const auto sent_at = std::chrono::steady_clock::now();
+    CHECK(h.Send(Buf("second")) == SendResult::Ok);
+    bool seen = false;
+    while (std::chrono::steady_clock::now() - sent_at < 100ms && !seen) // 远早于第一条的重传
+    {
+        const auto dg = raw.Recv(20ms);
+        if (!dg)
+            continue;
+        const auto pk = rudp::Parse(*dg);
+        // 数据报里的段带着 "second"（KCP 头 24 字节之后就是消息内容）
+        if (pk && pk->type == rudp::PacketType::Data && pk->body.size() >= rudp::kKcpHeader + 6)
+            seen = Str(pk->body.subspan(rudp::kKcpHeader)).find("second") != std::string::npos;
+    }
+    CHECK(seen);
+}
+
+// 静止了一阵的会话（KCP 的时钟停在握手时）再发一条并立刻 flush（flush_on_send）：重传时刻要按"现在"算。
+// 时钟没拨的话，重传时刻是 RTO 之前的"过去"，下一拍就多发一个提前的重传；对端只该看到一个数据报，
+// 下一个要等 200ms 之后的真正重传。
+void TestSendAfterIdleIsNotRetransmittedPrematurely()
+{
+    RudpServerOptions o;
+    o.rudp.flush_on_send = true;
+    Fixture f(std::move(o));
+    RawUdp raw;
+    const RudpTicket t = f.Ticket();
+    SendHello(raw, f.ep(), t);
+    CHECK(RecvReply(raw)->type == rudp::PacketType::Accept);
+    const ConnectionHandle h = f.rec.WaitConnected(0);
+    std::this_thread::sleep_for(700ms); // 会话静止，不会有人去 Update 它
+    raw.Drain();
+    CHECK(h.Send(Buf("ping")) == SendResult::Ok);
+    int datas = 0;
+    const auto until = std::chrono::steady_clock::now() + 120ms; // 远短于第一次重传（约 200ms）
+    while (std::chrono::steady_clock::now() < until)
+    {
+        const auto dg = raw.Recv(20ms);
+        if (!dg)
+            continue;
+        const auto pk = rudp::Parse(*dg);
+        datas += pk && pk->type == rudp::PacketType::Data ? 1 : 0;
+    }
+    CHECK(datas == 1);
+}
+
 // 已建立会话的来源发来 conv 不对的数据：KCP 不认，丢弃并计数，消息不会交付，会话不受影响。
 void TestWrongConvDataFromPinnedSourceDropped()
 {
@@ -934,6 +1029,9 @@ int main()
     RUN(TestDestructorWithLiveSessions);
     RUN(TestGroupShutdownClosesSessions);
     RUN(TestManySessions);
+    RUN(TestInFlightSessionsAreOnlyUpdatedWhenDue);
+    RUN(TestSendWhileInFlightIsFlushedPromptly);
+    RUN(TestSendAfterIdleIsNotRetransmittedPrematurely);
     RUN(TestWrongConvDataFromPinnedSourceDropped);
     RUN(TestDataKeepsSessionAlive);
     RUN(TestAcceptPrecedesDataSentFromOnConnected);

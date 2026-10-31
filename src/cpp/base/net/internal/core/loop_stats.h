@@ -40,6 +40,7 @@ struct alignas(64) LoopStats
     Counter rejected_resource{0};
     Counter rejected_ticket{0};   // rudp：Hello 的票据不存在 / 过期 / 已用 / token 不对
     Counter datagrams_dropped{0}; // rudp：格式不对、来源未登记、KCP 不认的数据报
+    Counter rudp_updates{0};      // rudp：定时器真正去推进 KCP（调了 Update）的次数；没到点的会话不计
     Counter bytes_in{0};
     Counter bytes_out{0};
     Counter messages_in{0};
@@ -70,6 +71,7 @@ struct alignas(64) LoopStats
         out.rejected_resource += rd(rejected_resource);
         out.rejected_ticket += rd(rejected_ticket);
         out.datagrams_dropped += rd(datagrams_dropped);
+        out.rudp_updates += rd(rudp_updates);
         out.bytes_in += rd(bytes_in);
         out.bytes_out += rd(bytes_out);
         out.messages_in += rd(messages_in);

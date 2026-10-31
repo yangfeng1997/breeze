@@ -362,7 +362,7 @@ void TestFlushImmediate()
     p.a.outbox.clear();
     SendStr(*p.a.kcp, "now");
     CHECK(p.a.outbox.empty()); // Send 只排队
-    p.a.kcp->Flush();
+    p.a.kcp->Flush(p.now);
     CHECK(!p.a.outbox.empty());
 }
 
@@ -437,6 +437,194 @@ void TestNeedsUpdate()
     }
 }
 
+using Kind = UpdatePlan::Kind;
+
+// PlanUpdate：排队的数据 → Soon；在途的段 → At（最早的重传时刻，到点就是 Soon）；收到数据后有待发的确认 → Soon；
+// 确认回来、什么都不剩 → Quiescent；对端窗口为 0 → 先 Soon（起探测计时）再 At（5 秒后的探测）。
+// 并且始终与 NeedsUpdate 一致：Quiescent 当且仅当 !NeedsUpdate()。
+void TestPlanUpdate()
+{
+    {
+        Pair p;
+        CHECK(p.a.kcp->PlanUpdate(p.now).kind == Kind::Quiescent);
+        SendStr(*p.a.kcp, "x");
+        CHECK(p.a.kcp->PlanUpdate(p.now).kind == Kind::Soon); // 排队的数据，下一拍就 flush
+        p.now += 10;
+        p.a.kcp->Update(p.now); // 发出去：在途，没有别的事
+        const UpdatePlan plan = p.a.kcp->PlanUpdate(p.now);
+        CHECK(plan.kind == Kind::At);
+        CHECK(plan.at - p.now >= 30 && plan.at - p.now <= 400);   // 最早的重传时刻在将来（初始 RTO 200ms 量级）
+        CHECK(p.a.kcp->PlanUpdate(plan.at - 1).kind == Kind::At); // 差 1ms：还没到
+        CHECK(p.a.kcp->PlanUpdate(plan.at).kind == Kind::Soon);   // 正好到点：要重传了
+        CHECK(p.a.kcp->PlanUpdate(plan.at + 5).kind == Kind::Soon);
+
+        // 对端收到：有待发的确认；它 flush 之后静止；确认回来，a 也静止
+        Pair::Deliver(p.a, *p.b.kcp, p.now, false, false);
+        CHECK(p.b.kcp->PlanUpdate(p.now).kind == Kind::Soon);
+        p.b.kcp->Update(p.now);
+        CHECK(p.b.kcp->PlanUpdate(p.now).kind == Kind::Quiescent);
+        Pair::Deliver(p.b, *p.a.kcp, p.now, false, false);
+        CHECK(p.a.kcp->PlanUpdate(p.now).kind == Kind::Quiescent);
+    }
+    {
+        // 待发的窗口通告：ikcp_update 受 ts_flush 限制，调早了不 flush，通告还留着——计划必须还是 Soon，
+        // 不能因为"没有排队的数据、没有在途的段"就睡过去（对端的窗口一直是 0，要等 5 秒的探测才会再问）
+        RudpOptions o;
+        o.recv_window = 128;
+        Pair p(o);
+        for (int i = 0; i < 128; ++i)
+            SendStr(*p.a.kcp, "t" + std::to_string(i));
+        p.Run(1500);
+        CHECK(Drain(*p.b.kcp).size() == 128); // 读走消息：b 要通告窗口恢复了
+        CHECK(p.b.kcp->PlanUpdate(p.now).kind == Kind::Soon);
+        p.b.kcp->Update(p.now + 1); // 在 ts_flush 之前调：不会 flush
+        CHECK(p.b.kcp->PlanUpdate(p.now + 1).kind == Kind::Soon);
+    }
+    {
+        // 多个在途的段：取最早的重传时刻（先发的先到期），后发的不能把它推迟
+        Pair p;
+        SendStr(*p.a.kcp, "first");
+        p.now += 10;
+        p.a.kcp->Update(p.now);
+        const UpdatePlan first = p.a.kcp->PlanUpdate(p.now);
+        CHECK(first.kind == Kind::At);
+        SendStr(*p.a.kcp, "second");
+        p.now += 50;
+        p.a.kcp->Update(p.now); // 第二个段在 50ms 之后发出，它的重传时刻更晚
+        CHECK(p.a.kcp->WaitSnd() == 2);
+        const UpdatePlan both = p.a.kcp->PlanUpdate(p.now);
+        CHECK(both.kind == Kind::At && both.at == first.at);
+    }
+    {
+        // 对端窗口为 0
+        RudpOptions o;
+        o.recv_window = 128;
+        Pair p(o);
+        for (int i = 0; i < 128; ++i)
+            SendStr(*p.a.kcp, "w" + std::to_string(i));
+        p.Run(1500);
+        CHECK(p.a.kcp->WaitSnd() == 0);
+        const UpdatePlan plan = p.a.kcp->PlanUpdate(p.now);
+        CHECK(plan.kind == Kind::At); // 探测计时已经在 Run 里起来了：下一次探测在约 5 秒之后
+        CHECK(plan.at - p.now > 1000 && plan.at - p.now <= 6000);
+        CHECK(p.a.kcp->PlanUpdate(plan.at).kind == Kind::Soon);
+    }
+    {
+        // 与 NeedsUpdate 一致：丢包的链路上每一步都对一遍
+        Pair p;
+        std::uint32_t x = 777;
+        p.a.lose = [x](std::size_t) mutable
+        {
+            x = x * 1664525u + 1013904223u;
+            return (x >> 16) % 100 < 40;
+        };
+        for (int i = 0; i < 30; ++i)
+            SendStr(*p.a.kcp, "c" + std::to_string(i));
+        for (int step = 0; step < 600; ++step)
+        {
+            p.Run(10);
+            CHECK((p.a.kcp->PlanUpdate(p.now).kind == Kind::Quiescent) == !p.a.kcp->NeedsUpdate());
+            CHECK((p.b.kcp->PlanUpdate(p.now).kind == Kind::Quiescent) == !p.b.kcp->NeedsUpdate());
+        }
+    }
+}
+
+// 按 PlanUpdate 调度（只在计划到点、或被 Input / Send 唤醒时才 Update）的会话，在 30% 丢包 + 乱序下照样把消息
+// 全部按序送达，而且 Update 的次数远少于"每拍都调"——说明计划既没睡过重传时刻，也确实省了调用。
+void TestPlannedSchedulingStillDelivers()
+{
+    struct Side
+    {
+        bool immediate = true;
+        bool asleep = false;
+        std::uint32_t due = 0;
+        int updates = 0;
+    };
+    Pair p;
+    std::uint32_t x = 4242;
+    const auto lossy = [x](std::size_t) mutable
+    {
+        x = x * 1664525u + 1013904223u;
+        return (x >> 16) % 100 < 30;
+    };
+    p.a.lose = lossy;
+    p.b.lose = lossy;
+    p.reorder = true;
+    Side sa, sb;
+    const auto wake = [](Side& s)
+    {
+        s.immediate = true;
+        s.asleep = false;
+    };
+    const auto tick = [&](Peer& peer, Side& s)
+    {
+        if (s.asleep || (!s.immediate && static_cast<std::int32_t>(p.now - s.due) < 0))
+            return;
+        peer.kcp->Update(p.now);
+        ++s.updates;
+        const UpdatePlan plan = peer.kcp->PlanUpdate(p.now);
+        s.immediate = plan.kind == Kind::Soon;
+        s.asleep = plan.kind == Kind::Quiescent;
+        s.due = plan.at;
+    };
+    std::vector<std::string> want;
+    for (int i = 0; i < 100; ++i)
+    {
+        want.push_back("p" + std::to_string(i));
+        SendStr(*p.a.kcp, want.back());
+    }
+    wake(sa);
+    std::vector<std::string> got;
+    int steps = 0;
+    for (; steps < 3000 && got.size() < want.size(); ++steps) // 最多 30 秒（假时钟）
+    {
+        p.now += 10;
+        tick(p.a, sa);
+        tick(p.b, sb);
+        // 送包：谁收到包谁被唤醒（Pair::Deliver 的逻辑，加上唤醒）
+        if (!p.a.outbox.empty())
+            wake(sb);
+        if (!p.b.outbox.empty())
+            wake(sa);
+        Pair::Deliver(p.a, *p.b.kcp, p.now, p.reorder, false);
+        Pair::Deliver(p.b, *p.a.kcp, p.now, p.reorder, false);
+        for (auto& m : Drain(*p.b.kcp))
+            got.push_back(std::move(m));
+    }
+    CHECK(got == want);
+    // 收齐之后再跑一阵，让最后的确认也走完
+    for (int i = 0; i < 300; ++i)
+    {
+        p.now += 10;
+        tick(p.a, sa);
+        tick(p.b, sb);
+        if (!p.a.outbox.empty())
+            wake(sb);
+        if (!p.b.outbox.empty())
+            wake(sa);
+        Pair::Deliver(p.a, *p.b.kcp, p.now, p.reorder, false);
+        Pair::Deliver(p.b, *p.a.kcp, p.now, p.reorder, false);
+    }
+    const int naive = 2 * (steps + 300); // 每拍每个会话都调一次
+    CHECK(sa.updates + sb.updates < naive / 2);
+    CHECK(p.a.kcp->WaitSnd() == 0); // 都确认了
+}
+
+// 静止了很久的会话（没人 Update，KCP 的时钟停在很久以前）再发一条并立刻 flush：段的时间戳与重传时刻必须按"现在"算。
+// 否则 resendts = 很久以前 + RTO，已经过去了，下一拍就白白重传一次；对端确认时算出的 RTT 也包含这整段静止的时间，
+// RTO 被拉到几十秒，之后真丢包了要等很久。
+void TestFlushUsesTheCurrentClock()
+{
+    Pair p;
+    p.Run(100);
+    p.now += 60000; // 静止了一分钟，没有人调 Update / Input
+    SendStr(*p.a.kcp, "late");
+    p.a.kcp->Flush(p.now);
+    const UpdatePlan plan = p.a.kcp->PlanUpdate(p.now);
+    CHECK(plan.kind == Kind::At); // 重传时刻在将来，不是"已经过去了"
+    CHECK(plan.at - p.now >= 30 && plan.at - p.now <= 400);
+}
+
 void TestNowMs()
 {
     const std::uint32_t a = KcpNowMs();
@@ -467,6 +655,9 @@ int main()
     TestInputRejectsForeign();
     TestFlushImmediate();
     TestNeedsUpdate();
+    TestPlanUpdate();
+    TestPlannedSchedulingStillDelivers();
+    TestFlushUsesTheCurrentClock();
     TestDatagramSizeBound();
     TestNowMs();
     std::puts("kcp_session_test: ok");

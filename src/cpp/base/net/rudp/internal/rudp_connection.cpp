@@ -256,7 +256,7 @@ SendResult RudpConnection::SendImpl(std::span<const std::byte> payload, bool cou
     std::uint64_t pending = slot_.pending_bytes.load(std::memory_order_relaxed);
     if (flush_on_send_ || pending > high_water_ / 2)
     {
-        kcp_->Flush();
+        kcp_->Flush(KcpNowMs());
         ReleaseSent();
         pending = slot_.pending_bytes.load(std::memory_order_relaxed);
     }
@@ -294,6 +294,10 @@ bool RudpConnection::Tick(std::uint32_t now_ms)
         ticking_ = false;
         return false;
     }
+    // 只有在途的数据、还没到最早的重传时刻：本拍什么都不用做（Input / Send / ResumeRead 会把 immediate_ 置上）
+    if (!immediate_ && !need_deliver_ && static_cast<std::int32_t>(now_ms - due_ms_) < 0)
+        return true;
+    immediate_ = false;
     if (need_deliver_)
     {
         need_deliver_ = false;
@@ -305,6 +309,7 @@ bool RudpConnection::Tick(std::uint32_t now_ms)
         }
     }
     kcp_->Update(now_ms);
+    LoopStats::Bump(loop_.stats().rudp_updates);
     ReleaseSent();
     if (kcp_->Dead())
     {
@@ -319,15 +324,21 @@ bool RudpConnection::Tick(std::uint32_t now_ms)
         ticking_ = false;
         return false;
     }
-    // 回调里可能又 Send 了、又来了数据，所以在这里最后判断。静止了就退出活跃表。
-    ticking_ = need_deliver_ || kcp_->NeedsUpdate();
+    // 回调里可能又 Send 了、又来了数据，所以在这里最后判断：静止了就退出活跃表；马上有事就下一拍推进；
+    // 只有在途的数据就睡到最早的重传时刻。
+    const UpdatePlan plan = kcp_->PlanUpdate(now_ms);
+    due_ms_ = plan.at; // Soon 的 at 就是现在，下一拍必然到点；Quiescent 不在表里，用不到
+    ticking_ = need_deliver_ || plan.kind != UpdatePlan::Kind::Quiescent;
     return ticking_;
 }
 
 // 从静止变成有事可做：告诉拥有者把我放进活跃表。已经在表里（或已关闭）就什么都不做。
 void RudpConnection::Wake()
 {
-    if (ticking_ || state_ == State::Disconnected)
+    if (state_ == State::Disconnected)
+        return;
+    immediate_ = true; // 已经在表里、在等重传时刻的，也要提前到下一拍：新来的数据要确认，新排的要发
+    if (ticking_)
         return;
     ticking_ = true;
     owner_.OnConnectionWake(*this);
