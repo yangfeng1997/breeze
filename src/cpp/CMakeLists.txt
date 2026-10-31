@@ -318,7 +318,7 @@ if(BREEZE_BUILD_NET)
   breeze_apply_log_level(breeze_net)
 
   # rudp 单独一个库：KCP 只在这里 PRIVATE 链接，不用 rudp 的使用方（只用 TCP / UDS）不背这个依赖。
-  # 端点（RudpEndpoint）仍在 breeze_net：它只是地址类型，NetModule 解析端点字符串要用。
+  # 端点（RUdpEndpoint）仍在 breeze_net：它只是地址类型，NetModule 解析端点字符串要用。
   add_library(breeze_net_rudp
     ${NET_DIR}/rudp/rudp_protocol.cpp
     ${NET_DIR}/rudp/rudp_server.cpp

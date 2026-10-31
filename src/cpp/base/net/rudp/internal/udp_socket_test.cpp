@@ -95,7 +95,7 @@ struct Loop
 
 std::unique_ptr<UdpSocket> OpenServer(Loop& l,
                                       Recorder& rec,
-                                      const RudpOptions& o = {},
+                                      const RUdpOptions& o = {},
                                       const Endpoint& ep = Loopback())
 {
     std::unique_ptr<UdpSocket> s;
@@ -104,7 +104,7 @@ std::unique_ptr<UdpSocket> OpenServer(Loop& l,
     return s;
 }
 
-std::unique_ptr<UdpSocket> OpenClient(Loop& l, Recorder& rec, const Endpoint& peer, const RudpOptions& o = {})
+std::unique_ptr<UdpSocket> OpenClient(Loop& l, Recorder& rec, const Endpoint& peer, const RUdpOptions& o = {})
 {
     std::unique_ptr<UdpSocket> s;
     CHECK(UdpSocket::OpenClient(l.loop, peer, o, rec, s) == 0);
@@ -323,7 +323,7 @@ void TestClose()
     CHECK(rec.size() == 0); // 关了就不再收
 
     std::unique_ptr<UdpSocket> again;
-    CHECK(UdpSocket::OpenServer(l.loop, ep, RudpOptions{}, rec, again) == 0); // 端口已释放
+    CHECK(UdpSocket::OpenServer(l.loop, ep, RUdpOptions{}, rec, again) == 0); // 端口已释放
 }
 
 void TestOpenErrors()
@@ -332,11 +332,11 @@ void TestOpenErrors()
     Recorder rec;
     auto s = OpenServer(l, rec);
     std::unique_ptr<UdpSocket> second;
-    CHECK(UdpSocket::OpenServer(l.loop, s->local(), RudpOptions{}, rec, second) == EADDRINUSE);
+    CHECK(UdpSocket::OpenServer(l.loop, s->local(), RUdpOptions{}, rec, second) == EADDRINUSE);
     CHECK(second == nullptr);
     const auto tcp = Endpoint::Tcp("127.0.0.1", 0);
-    CHECK(UdpSocket::OpenServer(l.loop, *tcp, RudpOptions{}, rec, second) == EPROTONOSUPPORT);
-    CHECK(UdpSocket::OpenClient(l.loop, *tcp, RudpOptions{}, rec, second) == EPROTONOSUPPORT);
+    CHECK(UdpSocket::OpenServer(l.loop, *tcp, RUdpOptions{}, rec, second) == EPROTONOSUPPORT);
+    CHECK(UdpSocket::OpenClient(l.loop, *tcp, RUdpOptions{}, rec, second) == EPROTONOSUPPORT);
     CHECK(second == nullptr);
 }
 
@@ -353,10 +353,10 @@ void TestSocketBuffers()
 {
     Loop l;
     Recorder rec;
-    RudpOptions small;
+    RUdpOptions small;
     small.socket_recv_buffer = 4096;
     auto a = OpenServer(l, rec, small);
-    RudpOptions dflt;
+    RUdpOptions dflt;
     dflt.socket_recv_buffer = 0;
     auto b = OpenServer(l, rec, dflt);
     CHECK(RecvBuf(a->fd()) < 20000);
@@ -388,7 +388,7 @@ void TestIPv6()
     Recorder rec;
     const auto ep = Endpoint::Udp("::1", 0);
     std::unique_ptr<UdpSocket> s;
-    const int rc = UdpSocket::OpenServer(l.loop, *ep, RudpOptions{}, rec, s);
+    const int rc = UdpSocket::OpenServer(l.loop, *ep, RUdpOptions{}, rec, s);
     if (rc == EADDRNOTAVAIL || rc == EAFNOSUPPORT)
     {
         std::puts("udp_socket_test: 本机没有 IPv6，跳过 TestIPv6");

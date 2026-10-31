@@ -13,7 +13,7 @@
 namespace breeze
 {
 
-struct RudpTicket
+struct RUdpTicket
 {
     static constexpr std::size_t kTokenSize = 16;
 
@@ -21,7 +21,7 @@ struct RudpTicket
     std::array<std::byte, kTokenSize> token{};
 
     bool valid() const noexcept { return conv != 0; }
-    bool operator==(const RudpTicket&) const = default;
+    bool operator==(const RUdpTicket&) const = default;
 };
 
 } // namespace breeze

@@ -31,10 +31,10 @@ public:
     }
 
     // 生成随机 conv（非 0、表里没有）与 token 并登记。ttl ≤ 0 或表满（清扫过期项之后仍满）返回空。
-    std::optional<RudpTicket> Issue(std::chrono::milliseconds ttl, Clock::time_point now = Clock::now());
+    std::optional<RUdpTicket> Issue(std::chrono::milliseconds ttl, Clock::time_point now = Clock::now());
 
     // 登记别处（比如 login 进程）签发的票据。conv 为 0、ttl ≤ 0、conv 已有未过期的、表满返回 false。
-    bool Add(const RudpTicket& ticket, std::chrono::milliseconds ttl, Clock::time_point now = Clock::now());
+    bool Add(const RUdpTicket& ticket, std::chrono::milliseconds ttl, Clock::time_point now = Clock::now());
 
     // conv 与 token 都对、且未过期：取走并返回 true。其余返回 false（原因不区分）。
     bool Consume(std::uint32_t conv, const rudp::Token& token, Clock::time_point now = Clock::now());

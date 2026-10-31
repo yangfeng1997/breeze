@@ -15,7 +15,7 @@
 namespace breeze
 {
 
-struct RudpOptions
+struct RUdpOptions
 {
     // 整个 UDP 载荷的上限（含 1 字节包头与 KCP 24 字节头）。1400 在以太网 + 隧道下一般不会被分片；
     // 范围 [rudp::kMinMtu, rudp::kMaxMtu]。
@@ -23,7 +23,7 @@ struct RudpOptions
 
     // 窗口，单位是段（一段 ≈ mtu - 25 字节）。recv_window 至少 128（KCP 的下限，也要容得下一条最大的消息）。
     // 暂停读（PauseRead）时靠接收窗口填满让对端慢下来；send_window 限界已发出、等确认的数据量，
-    // ConnectionOptions::high_water_mark 只管还没进发送窗口的排队部分（见 RudpConnection）。
+    // ConnectionOptions::high_water_mark 只管还没进发送窗口的排队部分（见 RUdpConnection）。
     std::uint32_t send_window = 256;
     std::uint32_t recv_window = 256;
 

@@ -210,11 +210,11 @@ private:
     std::optional<Explicit> options_;
 };
 
-// 依赖 net 的 rudp 服务端业务模块：Init 里 AddRudpServer，Start 时发布实际绑定的端点。
-class RudpServerModule final : public Module
+// 依赖 net 的 rudp 服务端业务模块：Init 里 AddRUdpServer，Start 时发布实际绑定的端点。
+class RUdpServerModule final : public Module
 {
 public:
-    RudpServerModule(App& app, Biz& biz, std::optional<RudpServerOptions> options = std::nullopt)
+    RUdpServerModule(App& app, Biz& biz, std::optional<RUdpServerOptions> options = std::nullopt)
         : Module(app)
         , biz_(biz)
         , options_(std::move(options))
@@ -225,8 +225,8 @@ public:
     Result<> Init() override
     {
         auto* net = app().GetModule<NetModule>("net");
-        auto s = options_ ? net->AddRudpServer(RudpLoopback(), biz_, std::move(*options_))
-                          : net->AddRudpServer(RudpLoopback(), biz_);
+        auto s = options_ ? net->AddRUdpServer(RUdpLoopback(), biz_, std::move(*options_))
+                          : net->AddRUdpServer(RUdpLoopback(), biz_);
         if (!s)
             return std::unexpected(s.error());
         server_ = *s;
@@ -241,25 +241,25 @@ public:
 
     bool ready() const { return ready_.load(std::memory_order_acquire); }
     const Endpoint& bound() const { return bound_; }
-    RudpServer* server() const { return server_; }
+    RUdpServer* server() const { return server_; }
 
 private:
     Biz& biz_;
-    std::optional<RudpServerOptions> options_;
-    RudpServer* server_ = nullptr;
+    std::optional<RUdpServerOptions> options_;
+    RUdpServer* server_ = nullptr;
     Endpoint bound_ = *Endpoint::Udp("127.0.0.1", 1);
     std::atomic<bool> ready_{false};
 };
 
-// 依赖 net 的 rudp 客户端业务模块：Init 里 AddRudpClient（不随模块启动，业务拿到票据后自己 Start）。
-class RudpClientModule final : public Module
+// 依赖 net 的 rudp 客户端业务模块：Init 里 AddRUdpClient（不随模块启动，业务拿到票据后自己 Start）。
+class RUdpClientModule final : public Module
 {
 public:
-    RudpClientModule(App& app,
+    RUdpClientModule(App& app,
                      Biz& biz,
-                     RudpEndpoint server,
-                     std::atomic<RudpClient*>& out,
-                     std::optional<RudpClientOptions> options = std::nullopt)
+                     RUdpEndpoint server,
+                     std::atomic<RUdpClient*>& out,
+                     std::optional<RUdpClientOptions> options = std::nullopt)
         : Module(app)
         , biz_(biz)
         , server_(std::move(server))
@@ -272,7 +272,7 @@ public:
     Result<> Init() override
     {
         auto* net = app().GetModule<NetModule>("net");
-        auto c = options_ ? net->AddRudpClient(server_, biz_, std::move(*options_)) : net->AddRudpClient(server_, biz_);
+        auto c = options_ ? net->AddRUdpClient(server_, biz_, std::move(*options_)) : net->AddRUdpClient(server_, biz_);
         if (!c)
             return std::unexpected(c.error());
         out_.store(*c, std::memory_order_release);
@@ -282,9 +282,9 @@ public:
 
 private:
     Biz& biz_;
-    RudpEndpoint server_;
-    std::atomic<RudpClient*>& out_;
-    std::optional<RudpClientOptions> options_;
+    RUdpEndpoint server_;
+    std::atomic<RUdpClient*>& out_;
+    std::optional<RUdpClientOptions> options_;
 };
 
 NetModuleOptions SmallOptions(std::size_t wake_budget = 1024)
@@ -903,9 +903,9 @@ void TestAssemblyErrors()
     // Init 之前：阶段错误
     const auto early = net->AddServer("tcp://127.0.0.1:0", biz, factory);
     CHECK(!early && early.error().code == Errc::Phase);
-    const auto early_rs = net->AddRudpServer(RudpLoopback(), biz);
+    const auto early_rs = net->AddRUdpServer(RUdpLoopback(), biz);
     CHECK(!early_rs && early_rs.error().code == Errc::Phase);
-    const auto early_rc = net->AddRudpClient(RudpLoopback(1), biz);
+    const auto early_rc = net->AddRUdpClient(RUdpLoopback(1), biz);
     CHECK(!early_rc && early_rc.error().code == Errc::Phase);
     CHECK(app.Init());
     // 非法 endpoint：错误里带着原字符串
@@ -916,12 +916,12 @@ void TestAssemblyErrors()
         const auto c = net->AddClient(bad, biz, factory);
         CHECK(!c && Has(c.error().msg, std::string("'") + bad + "'"));
     }
-    // udp:// 的服务端是 rudp，装得上（factory 被忽略）；客户端要凭票据握手，不收字符串形式，错误里指向 AddRudpClient
+    // udp:// 的服务端是 rudp，装得上（factory 被忽略）；客户端要凭票据握手，不收字符串形式，错误里指向 AddRUdpClient
     {
         const auto s = net->AddServer("udp://127.0.0.1:0", biz, factory);
-        CHECK(s && dynamic_cast<RudpServer*>(*s) != nullptr);
+        CHECK(s && dynamic_cast<RUdpServer*>(*s) != nullptr);
         const auto c = net->AddClient("udp://127.0.0.1:9", biz, factory);
-        CHECK(!c && c.error().code == Errc::Module && Has(c.error().msg, "udp") && Has(c.error().msg, "AddRudpClient"));
+        CHECK(!c && c.error().code == Errc::Module && Has(c.error().msg, "udp") && Has(c.error().msg, "AddRUdpClient"));
     }
     // 合法的可以装
     CHECK(net->AddServer("tcp://127.0.0.1:0", biz, factory));
@@ -1003,17 +1003,17 @@ std::optional<rudp::Packet> ParsePacket(const std::optional<Bytes>& dg)
 
 // rudp 经模块：服务端随模块启动，客户端不随模块启动（业务拿到票据后才 Start）；
 // 双方的业务回调都在各自 App 的主循环线程。
-void TestRudpThroughModule()
+void TestRUdpThroughModule()
 {
     const LeakCheck leak;
     Biz server_biz;
     App server_app("net-server");
     server_app.RegisterModule([](App& a) { return std::make_unique<NetModule>(a, SmallOptions()); });
-    RudpServerModule* sm = nullptr;
+    RUdpServerModule* sm = nullptr;
     server_app.RegisterModule(
         [&](App& a)
         {
-            auto m = std::make_unique<RudpServerModule>(a, server_biz);
+            auto m = std::make_unique<RUdpServerModule>(a, server_biz);
             sm = m.get();
             return m;
         });
@@ -1022,12 +1022,12 @@ void TestRudpThroughModule()
 
     Biz client_biz;
     client_biz.echo = false;
-    std::atomic<RudpClient*> client{nullptr};
+    std::atomic<RUdpClient*> client{nullptr};
     App client_app("net-client");
     client_app.RegisterModule([](App& a) { return std::make_unique<NetModule>(a, SmallOptions()); });
     client_app.RegisterModule(
         [&](App& a)
-        { return std::make_unique<RudpClientModule>(a, client_biz, *RudpEndpoint::From(sm->bound()), client); });
+        { return std::make_unique<RUdpClientModule>(a, client_biz, *RUdpEndpoint::From(sm->bound()), client); });
     Runner client_run(client_app);
     CHECK(WaitUntil([&] { return client.load() != nullptr; }));
 
@@ -1048,7 +1048,7 @@ void TestRudpThroughModule()
 }
 
 // 模块的默认选项传到 rudp 服务端：NetModuleOptions::connection 的 idle_timeout 让不出声的会话以 IdleTimeout 关闭。
-void TestRudpModuleDefaultsReachServer()
+void TestRUdpModuleDefaultsReachServer()
 {
     const LeakCheck leak;
     NetModuleOptions o = SmallOptions();
@@ -1056,11 +1056,11 @@ void TestRudpModuleDefaultsReachServer()
     Biz biz;
     App app("net-server");
     app.RegisterModule([o](App& a) { return std::make_unique<NetModule>(a, o); });
-    RudpServerModule* sm = nullptr;
+    RUdpServerModule* sm = nullptr;
     app.RegisterModule(
         [&](App& a)
         {
-            auto m = std::make_unique<RudpServerModule>(a, biz);
+            auto m = std::make_unique<RUdpServerModule>(a, biz);
             sm = m.get();
             return m;
         });
@@ -1097,7 +1097,7 @@ void TestUdpAddServerStringPassesFilter()
         });
     Runner run(app);
     CHECK(WaitUntil([&] { return bm != nullptr && bm->ready(); }));
-    auto* rs = dynamic_cast<RudpServer*>(bm->server());
+    auto* rs = dynamic_cast<RUdpServer*>(bm->server());
     CHECK(rs != nullptr);
     CHECK(bm->bound().kind() == Endpoint::Kind::Udp && bm->bound().port() != 0);
 
@@ -1113,7 +1113,7 @@ void TestUdpAddServerStringPassesFilter()
 
 // rudp 的装配：模块默认的 rudp 选项不合法时，不给选项的重载（用模块默认）报错，显式给合法选项的可以；
 // 字符串形式的 udp:// 走模块默认，同样报错。
-void TestRudpAssembly()
+void TestRUdpAssembly()
 {
     const LeakCheck leak;
     Biz biz;
@@ -1132,22 +1132,22 @@ void TestRudpAssembly()
     CHECK(app.Build());
     CHECK(app.Init());
 
-    const auto s = net->AddRudpServer(RudpLoopback(), biz);
-    CHECK(!s && s.error().code == Errc::Module && Has(s.error().msg, "RudpOptions"));
-    const auto c = net->AddRudpClient(RudpLoopback(1), biz);
-    CHECK(!c && c.error().code == Errc::Module && Has(c.error().msg, "RudpOptions"));
+    const auto s = net->AddRUdpServer(RUdpLoopback(), biz);
+    CHECK(!s && s.error().code == Errc::Module && Has(s.error().msg, "RUdpOptions"));
+    const auto c = net->AddRUdpClient(RUdpLoopback(1), biz);
+    CHECK(!c && c.error().code == Errc::Module && Has(c.error().msg, "RUdpOptions"));
     const auto str = net->AddServer("udp://127.0.0.1:0", biz, factory);
-    CHECK(!str && str.error().code == Errc::Module && Has(str.error().msg, "RudpOptions"));
+    CHECK(!str && str.error().code == Errc::Module && Has(str.error().msg, "RUdpOptions"));
 
-    RudpServerOptions inv;
+    RUdpServerOptions inv;
     inv.rudp.recv_window = 10; // 低于 128
-    CHECK(!net->AddRudpServer(RudpLoopback(), biz, std::move(inv)));
-    RudpClientOptions invc;
+    CHECK(!net->AddRUdpServer(RUdpLoopback(), biz, std::move(inv)));
+    RUdpClientOptions invc;
     invc.rudp.dead_link = 1;
-    CHECK(!net->AddRudpClient(RudpLoopback(1), biz, std::move(invc)));
+    CHECK(!net->AddRUdpClient(RUdpLoopback(1), biz, std::move(invc)));
 
-    CHECK(net->AddRudpServer(RudpLoopback(), biz, RudpServerOptions{}));
-    CHECK(net->AddRudpClient(RudpLoopback(1), biz, RudpClientOptions{}));
+    CHECK(net->AddRUdpServer(RUdpLoopback(), biz, RUdpServerOptions{}));
+    CHECK(net->AddRUdpClient(RUdpLoopback(1), biz, RUdpClientOptions{}));
 }
 
 } // namespace
@@ -1174,10 +1174,10 @@ int main()
     TestShutdownKeepsDrainingWhileWaiting();
     TestStartFailureRollsBackAndReportsEndpoint();
     TestAssemblyErrors();
-    TestRudpThroughModule();
-    TestRudpModuleDefaultsReachServer();
+    TestRUdpThroughModule();
+    TestRUdpModuleDefaultsReachServer();
     TestUdpAddServerStringPassesFilter();
-    TestRudpAssembly();
+    TestRUdpAssembly();
     TestOptionsFromConfig();
     TestModuleReadsNetSectionFromConfig();
     TestDependsOn();

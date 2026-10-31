@@ -1,4 +1,4 @@
-// rudp 客户端：凭准入票据向一个 RudpServer 握手，得到一条可靠有序的消息通道。
+// rudp 客户端：凭准入票据向一个 RUdpServer 握手，得到一条可靠有序的消息通道。
 // 设计与威胁模型见 docs/网络库设计.md §4.14。
 //
 // 与 TcpClient 的区别：
@@ -36,11 +36,11 @@
 namespace breeze
 {
 
-struct RudpClientOptions
+struct RUdpClientOptions
 {
     ConnectionOptions connection; // 水位、idle_timeout
-    RudpOptions rudp;
-    RudpTicket ticket; // Start 前必须有效（这里给，或之后 SetTicket）
+    RUdpOptions rudp;
+    RUdpTicket ticket; // Start 前必须有效（这里给，或之后 SetTicket）
     std::chrono::milliseconds connect_timeout{5000};
     std::chrono::milliseconds hello_interval{200};
     std::chrono::milliseconds ping_interval{1000}; // 0 = 不发心跳
@@ -50,17 +50,17 @@ struct RudpClientOptions
     ConnectFailedCallback on_connect_failed;
 };
 
-class RudpClient final : public NetClient
+class RUdpClient final : public NetClient
 {
 public:
-    RudpClient(EventLoopGroup& group,
-               const RudpEndpoint& server,
-               RudpClientOptions options,
+    RUdpClient(EventLoopGroup& group,
+               const RUdpEndpoint& server,
+               RUdpClientOptions options,
                ConnectionHandler& handler);
-    ~RudpClient() override;
+    ~RUdpClient() override;
 
-    RudpClient(const RudpClient&) = delete;
-    RudpClient& operator=(const RudpClient&) = delete;
+    RUdpClient(const RUdpClient&) = delete;
+    RUdpClient& operator=(const RUdpClient&) = delete;
 
     // 任意线程；group 必须已 Start（否则是编程错误，LOG_FATAL）。投递到所属 loop 串行处理：先 Stop 再 Start 不会并存
     // 两条连接（旧连接的 OnClosed 先于新连接的握手）。Idle 下合法；已在 Running（握手中或已连通）再调是编程错误。
@@ -74,7 +74,7 @@ public:
 
     // 换下一次 Start 用的票据（断线或握手失败之后，从控制面拿到新票据时调）。任意线程。
     // 对正在握手 / 已连通的连接没有影响。
-    void SetTicket(const RudpTicket& ticket);
+    void SetTicket(const RUdpTicket& ticket);
 
     // 经当前连接发送。未连通 → Closed，不缓冲。线程安全。
     [[nodiscard]] SendResult Send(SharedBuffer payload) override;
@@ -87,7 +87,7 @@ public:
 
     // 服务端地址（构造时给的）。
     const Endpoint& endpoint() const noexcept override { return server_; }
-    RudpEndpoint server() const;
+    RUdpEndpoint server() const;
 
 private:
     struct Impl;

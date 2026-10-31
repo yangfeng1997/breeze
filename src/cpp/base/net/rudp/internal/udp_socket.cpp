@@ -62,7 +62,7 @@ int ConnectTo(int fd, const Endpoint& ep)
 
 int UdpSocket::OpenServer(EventLoop& loop,
                           const Endpoint& local,
-                          const RudpOptions& options,
+                          const RUdpOptions& options,
                           DatagramHandler& handler,
                           std::unique_ptr<UdpSocket>& out)
 {
@@ -71,7 +71,7 @@ int UdpSocket::OpenServer(EventLoop& loop,
 
 int UdpSocket::OpenClient(EventLoop& loop,
                           const Endpoint& peer,
-                          const RudpOptions& options,
+                          const RUdpOptions& options,
                           DatagramHandler& handler,
                           std::unique_ptr<UdpSocket>& out)
 {
@@ -81,7 +81,7 @@ int UdpSocket::OpenClient(EventLoop& loop,
 int UdpSocket::Open(EventLoop& loop,
                     const Endpoint& ep,
                     bool server,
-                    const RudpOptions& options,
+                    const RUdpOptions& options,
                     DatagramHandler& handler,
                     std::unique_ptr<UdpSocket>& out)
 {

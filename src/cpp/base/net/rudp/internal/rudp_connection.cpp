@@ -20,7 +20,7 @@ constexpr int kCloseRepeat = 3;
 
 } // namespace
 
-RudpConnection* RudpConnection::Create(EventLoop& loop,
+RUdpConnection* RUdpConnection::Create(EventLoop& loop,
                                        UdpSocket& socket,
                                        const sockaddr_storage* peer_addr,
                                        socklen_t peer_len,
@@ -29,18 +29,18 @@ RudpConnection* RudpConnection::Create(EventLoop& loop,
                                        ConnectionHandler& handler,
                                        Owner& owner,
                                        const ConnectionOptions& conn_options,
-                                       const RudpOptions& rudp_options)
+                                       const RUdpOptions& rudp_options)
 {
     loop.AssertInLoopThread();
     // 先建 KCP：失败时还没占槽，调用方只要归还名额。output 的 user 要等连接对象建好才有，下面补。
-    std::unique_ptr<KcpSession> kcp = KcpSession::Create(conv, rudp_options, &RudpConnection::KcpOutput, nullptr);
+    std::unique_ptr<KcpSession> kcp = KcpSession::Create(conv, rudp_options, &RUdpConnection::KcpOutput, nullptr);
     if (kcp == nullptr)
         return nullptr;
     ConnectionTable& table = loop.table();
     const std::uint32_t slot = table.Allocate(conn_options.high_water_mark);
     const std::uint32_t generation = table.slot(slot).generation.load(std::memory_order_relaxed);
     const ConnectionHandle handle = loop.MakeHandle(slot, generation);
-    std::unique_ptr<RudpConnection> conn(new RudpConnection(loop,
+    std::unique_ptr<RUdpConnection> conn(new RUdpConnection(loop,
                                                             socket,
                                                             peer_addr,
                                                             peer_len,
@@ -54,13 +54,13 @@ RudpConnection* RudpConnection::Create(EventLoop& loop,
                                                             table.slot(slot),
                                                             slot,
                                                             handle));
-    RudpConnection* raw = conn.get();
+    RUdpConnection* raw = conn.get();
     raw->kcp_->SetUser(raw);
     table.Install(slot, std::move(conn));
     return raw;
 }
 
-RudpConnection::RudpConnection(EventLoop& loop,
+RUdpConnection::RUdpConnection(EventLoop& loop,
                                UdpSocket& socket,
                                const sockaddr_storage* peer_addr,
                                socklen_t peer_len,
@@ -70,7 +70,7 @@ RudpConnection::RudpConnection(EventLoop& loop,
                                ConnectionHandler& handler,
                                Owner& owner,
                                const ConnectionOptions& conn_options,
-                               const RudpOptions& rudp_options,
+                               const RUdpOptions& rudp_options,
                                ConnectionTable::Slot& slot,
                                std::uint32_t slot_index,
                                ConnectionHandle handle)
@@ -95,24 +95,24 @@ RudpConnection::RudpConnection(EventLoop& loop,
         peer_addr_ = *peer_addr;
 }
 
-RudpConnection::~RudpConnection() = default;
+RUdpConnection::~RUdpConnection() = default;
 
-void RudpConnection::OnEvents(std::uint32_t) { LOG_FATAL("RudpConnection 没有自己的 fd，不该收到 epoll 事件"); }
+void RUdpConnection::OnEvents(std::uint32_t) { LOG_FATAL("RUdpConnection 没有自己的 fd，不该收到 epoll 事件"); }
 
-void RudpConnection::KcpOutput(void* user, std::span<const std::byte> segment)
+void RUdpConnection::KcpOutput(void* user, std::span<const std::byte> segment)
 {
-    auto* self = static_cast<RudpConnection*>(user);
+    auto* self = static_cast<RUdpConnection*>(user);
     const std::byte hdr = rudp::DataHeader();
     // 发送失败（缓冲满）按丢包处理，KCP 会重传。
     (void)self->socket_.Send({&hdr, 1}, segment, self->peer_len_ != 0 ? &self->peer_addr_ : nullptr, self->peer_len_);
 }
 
-void RudpConnection::SendControl(const rudp::Control& c) noexcept
+void RUdpConnection::SendControl(const rudp::Control& c) noexcept
 {
     (void)socket_.Send({}, c.view(), peer_len_ != 0 ? &peer_addr_ : nullptr, peer_len_);
 }
 
-void RudpConnection::Establish()
+void RUdpConnection::Establish()
 {
     loop_.AssertInLoopThread();
     kcp_->Update(KcpNowMs()); // ikcp 要先 Update 过一次才会 flush
@@ -131,7 +131,7 @@ void RudpConnection::Establish()
 
 // ---- 收 ----
 
-void RudpConnection::OnPacket(const rudp::Packet& p)
+void RUdpConnection::OnPacket(const rudp::Packet& p)
 {
     if (state_ == State::Disconnected)
         return;
@@ -176,7 +176,7 @@ void RudpConnection::OnPacket(const rudp::Packet& p)
 
 // 把 KCP 已经收齐的消息交给 handler，直到没有、暂停或连接关闭。Disconnecting 也要交付：
 // 优雅关闭期间对端的最后几条消息不能丢。
-void RudpConnection::DeliverReady()
+void RUdpConnection::DeliverReady()
 {
     // 线程本地、所有会话共用：一次只交付一条，handler 里不会再进入交付路径（ResumeRead 只置标志）。
     static thread_local std::vector<std::byte> buf;
@@ -209,18 +209,18 @@ void RudpConnection::DeliverReady()
 
 // ---- 发 ----
 
-SendResult RudpConnection::Send(SharedBuffer payload) { return SendImpl(payload.bytes(), false); }
+SendResult RUdpConnection::Send(SharedBuffer payload) { return SendImpl(payload.bytes(), false); }
 
-SendResult RudpConnection::Send(std::span<const std::byte> payload) { return SendImpl(payload, false); }
+SendResult RUdpConnection::Send(std::span<const std::byte> payload) { return SendImpl(payload, false); }
 
-void RudpConnection::SendFromTask(SharedBuffer payload)
+void RUdpConnection::SendFromTask(SharedBuffer payload)
 {
     if (state_ != State::Connected)
         return; // 连接已标记关闭：槽回收时 pending_bytes 会清零，这里不用减
     (void)SendImpl(payload.bytes(), true);
 }
 
-SendResult RudpConnection::SendImpl(std::span<const std::byte> payload, bool counted)
+SendResult RUdpConnection::SendImpl(std::span<const std::byte> payload, bool counted)
 {
     loop_.AssertInLoopThread();
     if (state_ != State::Connected)
@@ -242,7 +242,7 @@ SendResult RudpConnection::SendImpl(std::span<const std::byte> payload, bool cou
     std::uint32_t fragments = 0;
     if (kcp_->Send(payload, fragments) != 0)
     {
-        // max_message_size 已限在 127 段以内（RudpOptions::Valid），走到这里是 KCP 的约束变了。
+        // max_message_size 已限在 127 段以内（RUdpOptions::Valid），走到这里是 KCP 的约束变了。
         LOG_ERROR("KCP 拒绝了 {} 字节的消息，关闭连接", payload.size());
         LoopStats::Add(loop_.stats().send_closed_oversize);
         CloseWith(CloseReason::ProtocolError, 0);
@@ -273,7 +273,7 @@ SendResult RudpConnection::SendImpl(std::span<const std::byte> payload, bool cou
 
 // 已进窗口的段数 = 累计排入 - 还在队列里的。消息的最后一段已进窗口，整条就离开了队列，把它的字节从积压里减掉。
 // KCP 只在 flush（Update / Flush）里把队列往窗口里移，所以只需在这两处之后调用；队列先进先出，释放是精确的。
-void RudpConnection::ReleaseSent()
+void RUdpConnection::ReleaseSent()
 {
     if (queued_.empty())
         return;
@@ -287,7 +287,7 @@ void RudpConnection::ReleaseSent()
 
 // ---- 定时推进 ----
 
-bool RudpConnection::Tick(std::uint32_t now_ms)
+bool RUdpConnection::Tick(std::uint32_t now_ms)
 {
     if (state_ == State::Disconnected)
     {
@@ -333,7 +333,7 @@ bool RudpConnection::Tick(std::uint32_t now_ms)
 }
 
 // 从静止变成有事可做：告诉拥有者把我放进活跃表。已经在表里（或已关闭）就什么都不做。
-void RudpConnection::Wake()
+void RUdpConnection::Wake()
 {
     if (state_ == State::Disconnected)
         return;
@@ -346,7 +346,7 @@ void RudpConnection::Wake()
 
 // ---- 流控与优雅关闭 ----
 
-void RudpConnection::PauseRead()
+void RUdpConnection::PauseRead()
 {
     loop_.AssertInLoopThread();
     if (state_ != State::Connected || paused_)
@@ -357,7 +357,7 @@ void RudpConnection::PauseRead()
         loop_.SetIdlePaused(slot_index_, true);
 }
 
-void RudpConnection::ResumeRead()
+void RUdpConnection::ResumeRead()
 {
     loop_.AssertInLoopThread();
     if (!paused_)
@@ -372,7 +372,7 @@ void RudpConnection::ResumeRead()
         loop_.SetIdlePaused(slot_index_, false);
 }
 
-void RudpConnection::CloseGracefully(std::chrono::milliseconds timeout)
+void RUdpConnection::CloseGracefully(std::chrono::milliseconds timeout)
 {
     loop_.AssertInLoopThread();
     if (state_ != State::Connected)
@@ -395,9 +395,9 @@ void RudpConnection::CloseGracefully(std::chrono::milliseconds timeout)
 
 // ---- 关闭：标记 → 本轮分发之后回调 OnClosed → 销毁 ----
 
-void RudpConnection::Close() { CloseWith(CloseReason::LocalClose, 0); }
+void RUdpConnection::Close() { CloseWith(CloseReason::LocalClose, 0); }
 
-void RudpConnection::CloseWith(CloseReason reason, int sys_errno)
+void RUdpConnection::CloseWith(CloseReason reason, int sys_errno)
 {
     if (state_ == State::Disconnected)
         return;
@@ -431,7 +431,7 @@ void RudpConnection::CloseWith(CloseReason reason, int sys_errno)
     loop_.QueueClose(this);
 }
 
-void RudpConnection::NotifyClosed()
+void RUdpConnection::NotifyClosed()
 {
     owner_.OnConnectionDetached(*this); // 先摘表：OnClosed 里拥有者就看不到这个会话了
     if (!notified_connected_)

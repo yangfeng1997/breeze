@@ -1,4 +1,4 @@
-// RUDP 端点：UDP 的 IP 字面量加端口。是 Endpoint 的类型化外壳：将来的 RudpServer / RudpClient 只收它，
+// RUDP 端点：UDP 的 IP 字面量加端口。是 Endpoint 的类型化外壳：将来的 RUdpServer / RUdpClient 只收它，
 // 传不进 TCP 与 UDS 的端点（它们也收不了它）。校验规则同 Endpoint::Udp（只接 IP 字面量、不做 DNS、IP 规范化后保存）。
 // 配置里写 udp://ip:port。
 
@@ -15,14 +15,14 @@
 namespace breeze
 {
 
-class RudpEndpoint
+class RUdpEndpoint
 {
 public:
-    static std::optional<RudpEndpoint> Make(std::string_view ip, std::uint16_t port);
+    static std::optional<RUdpEndpoint> Make(std::string_view ip, std::uint16_t port);
     // udp://1.2.3.4:80 | udp://[::1]:80；其它写法（包括 tcp:// 与 unix://）返回 nullopt。
-    static std::optional<RudpEndpoint> Parse(std::string_view text);
+    static std::optional<RUdpEndpoint> Parse(std::string_view text);
     // 从通用 Endpoint 转换；不是 UDP 的返回 nullopt。
-    static std::optional<RudpEndpoint> From(const Endpoint& ep);
+    static std::optional<RUdpEndpoint> From(const Endpoint& ep);
 
     const std::string& ip() const noexcept { return ep_.address(); }
     // 0 表示由系统分配（bind 用）。
@@ -33,10 +33,10 @@ public:
     // 通用形式：PeerInfo、日志、NetServer / NetClient 接口都用它。
     const Endpoint& endpoint() const noexcept { return ep_; }
 
-    bool operator==(const RudpEndpoint&) const = default;
+    bool operator==(const RUdpEndpoint&) const = default;
 
 private:
-    explicit RudpEndpoint(Endpoint ep)
+    explicit RUdpEndpoint(Endpoint ep)
         : ep_(std::move(ep))
     {
     }

@@ -15,11 +15,13 @@
 //
 // UDP（--transport udp，rudp 的基线）：客户端是同一个闭环 ping-pong，payload 不带 4 字节长度（UDP 自带边界）：
 //   raw-udp       裸 UDP 回显：一个 socket、recvmmsg 批量收、sendto 回。没有会话、没有可靠性，是 UDP 的上限
-//   rudp          本库 RudpServer（1 个 IO 线程，echo 用视图版 Send），flush_on_send = true：每条回复立刻发出，
+//   rudp          本库 RUdpServer（1 个 IO 线程，echo 用视图版 Send），flush_on_send = true：每条回复立刻发出，
 //                 低延迟配置，闭环 ping-pong 的合理选择
 //   rudp-batched  同 rudp，但用默认的批量配置（flush_on_send = false，回复等下一次 10ms 的 KCP 定时器才发）：
 //                 闭环 ping-pong 下每条连接被钳在 ~100 msg/s，只在连接多时才有吞吐，
 //                 留作"默认配置不适合这种负载"的参照
+//   rudp-mainloop 同 rudp，但像 breeze-mainloop 一样经 App::Run 主循环 + NetModule（udp://）：IO 线程把事件回投主循环，
+//                 业务在主循环线程上经 ConnectionHandle::Send 回显。与 rudp 的差就是 MainLoopExecutor 的代价
 //   压测客户端：raw-udp 的每条连接是一个 connect 过的 UDP socket；
 //   rudp 的每条连接多一个 KcpSession（握手用服务端签发的票据），每条消息 Update + Send + Flush 立刻发出。
 //   不显式 bind：本机内核上 bind(端口 0) 每次约 10ms 且随数量线性变慢，只 connect 让内核自动绑定则是瞬时的
@@ -31,16 +33,21 @@
 // 用法：net_bench --impl raw|raw-iov|muduo|breeze|breeze-copy|breeze-fixed|breeze-mainloop --transport tcp|uds --size
 // 64 --conns 64
 //                 [--duration 3] [--warmup 1] [--client-threads 4] [--server-cpu 2] [--client-cpus 4,6,8,10]
-//                 [--mainloop-cpu 12]   breeze-mainloop 的主循环线程绑哪个核（IO 线程用 --server-cpu）
+//                 [--mainloop-cpu 12]   breeze-mainloop / rudp-mainloop 的主循环线程绑哪个核（IO 线程用 --server-cpu）
 //                 [--active K]          共 --conns 条连接，只让其中 K 条 ping-pong，其余连上后空闲
 //                 [--delay-ms D]        UDP：压测客户端给收和发各加 D 毫秒延迟（往返 2D），模拟有 RTT 的网络。
 //                                       本机没有 netem 的权限，只能在客户端里排队；闭环下负载由往返时间决定，
 //                                       所以可以在相同负载下比服务端的 CPU
+//                 [--rate R]            每条连接每秒发 R 条（默认 0 = 闭环：回包一到就发下一条）。回包后等到
+//                                       上一次发出之后 1/R 秒再发，各连接的起点在一个周期内均匀错开。负载由
+//                                       连接数 × R 决定、与服务端快慢无关，延迟与服务端 CPU 才有意义
+//                                       （闭环全速时延迟只是排队）
 //                 [--mem-probe N]       不压测，只测建 N 条空闲连接的内存与空闲 CPU
 
 #include <poll.h>
 #include <sched.h>
 #include <sys/epoll.h>
+#include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
@@ -125,6 +132,7 @@ struct BenchOptions
     int mem_probe = 0;
     int delay_ms = 0; // UDP：客户端侧给每个方向各加这么多毫秒的延迟（往返 = 2 倍），模拟有 RTT 的网络
     int active = 0;   // > 0：只让这么多条连接 ping-pong，其余连上之后空闲（测「会话多」对活跃连接的影响）
+    double rate = 0;  // > 0：每条连接每秒发这么多条（定速负载）；0 = 闭环全速
     std::vector<int> client_cpus;
 };
 
@@ -143,6 +151,35 @@ std::vector<int> ParseCpus(const std::string& s)
     return v;
 }
 
+// 服务端连接表的槽数（每槽 64 字节）：默认 64K，连接数更多时放大到 128K；main 在建服务端之前按 --conns 设定。
+std::uint32_t g_table_slots = 1u << 16;
+
+// TCP 连接数超过 2 万时，单个（源地址, 目的地址）的临时端口不够（本机范围 32768–60999，约 2.8 万）：
+// 把连接分散到 127.0.0.1..8（服务端监听 0.0.0.0，源地址随目的地址，四元组各不相同）。
+// UDP 做不到 2.8 万以上：服务端按来源 ip:port 固定会话，每条连接要一个独一无二的来源地址，
+// 而内核自动选端口只有约 2.8 万个（SO_REUSEADDR 会让端口重复、来源地址冲突；回环上源地址永远是 127.0.0.1，
+// 改目的地址也没用），显式 bind 在本机每次约 10ms 且全局串行（多线程不重叠，换 IPv6 / SO_REUSEPORT 都一样），
+// 10 万条要 1000 秒以上。
+constexpr int kScaleThreshold = 20000;
+constexpr int kScaleAddrs = 8;
+constexpr int kUdpMaxConns = 25000;
+
+Endpoint ScaleTcpTarget(const Endpoint& ep, int global_index)
+{
+    return *Endpoint::Tcp("127.0.0." + std::to_string(1 + global_index % kScaleAddrs), ep.port());
+}
+
+// 压测客户端的等待：纳秒精度（epoll_pwait2）并把线程的定时器松弛降到 1ns。定速时每个发送都在各自的到期时刻发出，
+// 别按毫秒取整：取整会让一个毫秒里到期的发送攒成一个突发（回环上服务端的接收缓冲被一次打爆，延迟里混进排队），
+// 实际速率也会因为每次晚一点而偏低（每条连接每秒 100 条时低了约 6%）。
+int EpollWaitFor(int epfd, epoll_event* evs, int max, std::chrono::nanoseconds timeout)
+{
+    timeout = std::max(timeout, std::chrono::nanoseconds(0));
+    const timespec ts{static_cast<time_t>(timeout.count() / 1000000000),
+                      static_cast<long>(timeout.count() % 1000000000)};
+    return ::epoll_pwait2(epfd, evs, max, &ts, nullptr);
+}
+
 // ---- 被测服务端 ----
 
 class EchoServer
@@ -159,7 +196,7 @@ public:
     // 除 IO 线程之外还有第二个服务端线程（主循环）的实现返回它，否则 0：同样读它的 CPU 时间，看瓶颈在哪一个。
     virtual pthread_t ExtraThread() { return 0; }
     // rudp 的服务端要凭票据握手：签发 n 张；其它实现返回空。
-    virtual std::vector<RudpTicket> IssueTickets(int /*n*/) { return {}; }
+    virtual std::vector<RUdpTicket> IssueTickets(int /*n*/) { return {}; }
     // 服务端 loop 迄今为止单轮（分发事件 + 任务 + 定时器 + 回收）最长的耗时（微秒）；没有这个概念的实现返回 0。
     virtual double MaxLoopLagUs() { return 0; }
     // 服务端 loop 迄今收到的字节数（rudp 的 UdpSocket 统计）；没有这个统计的实现返回 0。
@@ -393,7 +430,7 @@ public:
 
 private:
     std::unique_ptr<ConnectionHandler> handler_;
-    EventLoopThread lt_{EventLoopOptions{EventLoopOptions::kNoGroup, 0, 1u << 16}}; // 连接表要装得下 10k 连接
+    EventLoopThread lt_{EventLoopOptions{EventLoopOptions::kNoGroup, 0, g_table_slots}}; // 连接表要装得下全部连接
     std::unique_ptr<LengthPrefixCodecFactory> factory_;
     std::unique_ptr<LoopServer> srv_;
 };
@@ -412,18 +449,40 @@ class MainLoopServer final : public EchoServer
     class BizModule final : public Module
     {
     public:
-        BizModule(App& a, EchoBiz& biz, std::string listen, std::promise<Endpoint>& ready)
+        BizModule(App& a,
+                  EchoBiz& biz,
+                  const Endpoint& listen,
+                  bool rudp,
+                  std::promise<Endpoint>& ready,
+                  RUdpServer*& rudp_out)
             : Module(a)
             , biz_(biz)
-            , listen_(std::move(listen))
+            , listen_(listen)
+            , rudp_(rudp)
             , ready_(ready)
+            , rudp_out_(rudp_out)
         {
         }
         std::string_view Name() const override { return "biz"; }
         std::vector<std::string_view> DependsOn() const override { return {"net"}; }
         Result<> Init() override
         {
-            auto s = app().GetModule<NetModule>("net")->AddServer(listen_, biz_, factory_);
+            auto* net = app().GetModule<NetModule>("net");
+            if (rudp_)
+            {
+                // 10 万会话时要一次签发 10 万张票据，超过默认的待用票据上限（65536）
+                RUdpServerOptions so;
+                so.connection = net->options().connection;
+                so.rudp = net->options().rudp;
+                so.max_pending_tickets = 1u << 18;
+                auto s = net->AddRUdpServer(*RUdpEndpoint::From(listen_), biz_, std::move(so));
+                if (!s)
+                    return std::unexpected(s.error());
+                server_ = *s;
+                rudp_out_ = *s; // Start 里的 set_value 把它发布给压测线程
+                return {};
+            }
+            auto s = net->AddServer(listen_.ToString(), biz_, factory_);
             if (!s)
                 return std::unexpected(s.error());
             server_ = *s;
@@ -437,22 +496,27 @@ class MainLoopServer final : public EchoServer
 
     private:
         EchoBiz& biz_;
-        std::string listen_;
+        Endpoint listen_;
+        bool rudp_;
         LengthPrefixCodecFactory factory_{1024 * 1024};
         std::promise<Endpoint>& ready_;
+        RUdpServer*& rudp_out_;
         NetServer* server_ = nullptr;
     };
 
 public:
-    explicit MainLoopServer(int mainloop_cpu)
+    // rudp = true：udp:// 端点（rudp 服务端，flush_on_send），业务照样在主循环线程上回显。
+    MainLoopServer(int mainloop_cpu, bool rudp)
         : mainloop_cpu_(mainloop_cpu)
+        , rudp_(rudp)
     {
     }
 
     Endpoint Start(const Endpoint& ep, int cpu) override
     {
         NetModuleOptions no;
-        no.group = {1, 1u << 16}; // 连接表要装得下 10k 连接
+        no.group = {1, g_table_slots}; // 连接表要装得下全部连接
+        no.rudp.flush_on_send = true; // 只对 udp:// 生效，与 rudp 一样用低延迟配置
         app_ = std::make_unique<App>("bench");
         app_->RegisterModule(
             [&](App& a)
@@ -462,7 +526,8 @@ public:
                 return m;
             });
         std::promise<Endpoint> ready;
-        app_->RegisterModule([&](App& a) { return std::make_unique<BizModule>(a, biz_, ep.ToString(), ready); });
+        app_->RegisterModule([&](App& a)
+                             { return std::make_unique<BizModule>(a, biz_, ep, rudp_, ready, rudp_server_); });
         auto bound = ready.get_future();
         thread_ = std::thread(
             [this]
@@ -494,9 +559,23 @@ public:
     pthread_t ServerThread() override { return io_thread_; }
     pthread_t ExtraThread() override { return thread_.native_handle(); }
     std::uint64_t Iterations() override { return GroupAccess::LoopAt(net_->group(), 0).Iterations(); }
+    std::vector<RUdpTicket> IssueTickets(int n) override
+    {
+        REQUIRE(rudp_ && rudp_server_ != nullptr);
+        std::vector<RUdpTicket> out;
+        for (int i = 0; i < n; ++i)
+        {
+            const auto t = rudp_server_->IssueTicket(std::chrono::minutes(10));
+            REQUIRE(t.has_value());
+            out.push_back(*t);
+        }
+        return out;
+    }
 
 private:
     int mainloop_cpu_;
+    bool rudp_;
+    RUdpServer* rudp_server_ = nullptr;
     EchoBiz biz_;
     std::unique_ptr<App> app_;
     NetModule* net_ = nullptr;
@@ -644,28 +723,29 @@ private:
     std::thread thread_;
 };
 
-// 本库 rudp：1 个 IO 线程的 EventLoopGroup + RudpServer，回调里用视图版 Send 回显（与 breeze 的 TCP 同一个写法）。
-class RudpEchoHandler final : public ConnectionHandler
+// 本库 rudp：1 个 IO 线程的 EventLoopGroup + RUdpServer，回调里用视图版 Send 回显（与 breeze 的 TCP 同一个写法）。
+class RUdpEchoHandler final : public ConnectionHandler
 {
 public:
     void OnMessage(Connection& c, std::span<const std::byte> payload) noexcept override { (void)c.Send(payload); }
 };
 
-class RudpBenchServer final : public EchoServer
+class RUdpBenchServer final : public EchoServer
 {
 public:
-    explicit RudpBenchServer(bool flush_on_send)
+    explicit RUdpBenchServer(bool flush_on_send)
         : flush_on_send_(flush_on_send)
     {
     }
 
     Endpoint Start(const Endpoint& ep, int cpu) override
     {
-        group_ = std::make_unique<EventLoopGroup>(EventLoopGroupOptions{1, 1u << 16}); // 连接表要装得下 10k 会话
+        group_ = std::make_unique<EventLoopGroup>(EventLoopGroupOptions{1, g_table_slots}); // 连接表要装得下全部会话
         REQUIRE(group_->Start() == 0);
-        RudpServerOptions so;
+        RUdpServerOptions so;
         so.rudp.flush_on_send = flush_on_send_;
-        server_ = std::make_unique<RudpServer>(*group_, *RudpEndpoint::From(ep), std::move(so), handler_);
+        so.max_pending_tickets = 1u << 18; // 10 万会话时要一次签发 10 万张票据，超过默认的 65536
+        server_ = std::make_unique<RUdpServer>(*group_, *RUdpEndpoint::From(ep), std::move(so), handler_);
         REQUIRE(server_->Start() == 0);
         EventLoop& loop = GroupAccess::LoopAt(*group_, 0);
         std::promise<pthread_t> io;
@@ -693,9 +773,9 @@ public:
         return static_cast<double>(
             std::chrono::duration_cast<std::chrono::microseconds>(group_->GetStats().max_loop_lag).count());
     }
-    std::vector<RudpTicket> IssueTickets(int n) override
+    std::vector<RUdpTicket> IssueTickets(int n) override
     {
-        std::vector<RudpTicket> out;
+        std::vector<RUdpTicket> out;
         for (int i = 0; i < n; ++i)
         {
             const auto t = server_->IssueTicket(std::chrono::minutes(10));
@@ -707,9 +787,9 @@ public:
 
 private:
     bool flush_on_send_;
-    RudpEchoHandler handler_;
+    RUdpEchoHandler handler_;
     std::unique_ptr<EventLoopGroup> group_;
-    std::unique_ptr<RudpServer> server_;
+    std::unique_ptr<RUdpServer> server_;
     pthread_t io_thread_{};
 };
 
@@ -728,9 +808,9 @@ std::unique_ptr<EchoServer> MakeServer(const std::string& impl, std::size_t size
     if (impl == "raw-udp")
         return std::make_unique<RawUdpServer>();
     if (impl == "rudp")
-        return std::make_unique<RudpBenchServer>(true);
+        return std::make_unique<RUdpBenchServer>(true);
     if (impl == "rudp-batched")
-        return std::make_unique<RudpBenchServer>(false);
+        return std::make_unique<RUdpBenchServer>(false);
     if (impl == "breeze")
         return std::make_unique<BreezeServer>(std::make_unique<BenchHandler>());
     if (impl == "breeze-copy")
@@ -738,7 +818,9 @@ std::unique_ptr<EchoServer> MakeServer(const std::string& impl, std::size_t size
     if (impl == "breeze-fixed")
         return std::make_unique<BreezeServer>(std::make_unique<FixedReplyHandler>(size));
     if (impl == "breeze-mainloop")
-        return std::make_unique<MainLoopServer>(mainloop_cpu);
+        return std::make_unique<MainLoopServer>(mainloop_cpu, false);
+    if (impl == "rudp-mainloop")
+        return std::make_unique<MainLoopServer>(mainloop_cpu, true);
 #ifdef BREEZE_BENCH_MUDUO
     if (impl == "muduo")
         return std::make_unique<MuduoServer>();
@@ -760,6 +842,8 @@ public:
     virtual ~WorkerBase() = default;
     // 只让前 n 条连接 ping-pong（默认全部）；在 Run 之前调用。
     void SetActive(int n) { active_ = n; }
+    // 每条连接两次发送的最小间隔；0 = 回包一到就发下一条（闭环全速）。在 Run 之前调用。
+    void SetPeriod(std::chrono::nanoseconds p) { period_ = p; }
     virtual void Connect() = 0;
     virtual void Run(const std::atomic<bool>& measuring, const std::atomic<bool>& stop) = 0;
     virtual WorkerResult& result() = 0;
@@ -767,16 +851,21 @@ public:
 protected:
     int Active(int total) const { return active_ < 0 ? total : std::min(active_, total); }
     int active_ = -1;
+    std::chrono::nanoseconds period_{0};
 };
 
 class Worker final : public WorkerBase
 {
 public:
-    Worker(const Endpoint& ep, int conns, const std::vector<std::byte>& frame, int cpu)
+    // first：本线程第一条连接在全部连接里的序号；scale：连接数很多，TCP 把连接分散到多个回环地址（见 kScaleThreshold）
+    Worker(
+        const Endpoint& ep, int conns, const std::vector<std::byte>& frame, int cpu, int first = 0, bool scale = false)
         : ep_(ep)
         , nconns_(conns)
         , frame_(frame)
         , cpu_(cpu)
+        , first_(first)
+        , scale_(scale)
     {
     }
 
@@ -789,16 +878,17 @@ public:
         for (int i = 0; i < nconns_; ++i)
         {
             Conn& c = conns_[static_cast<std::size_t>(i)];
-            REQUIRE(sock::CreateStreamSocket(ep_, c.fd) == 0);
+            const Endpoint target = scale_ && ep_.kind() == Endpoint::Kind::Tcp ? ScaleTcpTarget(ep_, first_ + i) : ep_;
+            REQUIRE(sock::CreateStreamSocket(target, c.fd) == 0);
             int rc;
             // UDS 的非阻塞 connect 在对方 accept 队列满时返回 EAGAIN（TCP 是 SYN
             // 重传，不会走到这里）：等服务端消化一会儿再试。
-            while ((rc = sock::Connect(c.fd.get(), ep_)) == EAGAIN)
+            while ((rc = sock::Connect(c.fd.get(), target)) == EAGAIN)
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             REQUIRE(rc == 0 || rc == EINPROGRESS);
             pollfd p{c.fd.get(), POLLOUT, 0};
             REQUIRE(::poll(&p, 1, 10000) > 0 && sock::GetSocketError(c.fd.get()) == 0);
-            if (ep_.kind() == Endpoint::Kind::Tcp)
+            if (target.kind() == Endpoint::Kind::Tcp)
                 (void)tcp::SetNoDelay(c.fd.get());
             c.rbuf.resize(frame_.size());
             epoll_event ev{};
@@ -812,16 +902,38 @@ public:
     void Run(const std::atomic<bool>& measuring, const std::atomic<bool>& stop) override
     {
         PinTo(cpu_);
-        for (int i = 0; i < Active(nconns_); ++i)
-            SendNext(conns_[static_cast<std::size_t>(i)]);
+        const int active = Active(nconns_);
+        const bool paced = period_.count() > 0;
+        if (!paced)
+        {
+            for (int i = 0; i < active; ++i)
+                SendNext(conns_[static_cast<std::size_t>(i)]);
+        }
+        else // 起点在一个周期内均匀错开，别让所有连接同相
+        {
+            const auto t0 = BenchClock::now();
+            for (int i = 0; i < active; ++i)
+            {
+                Conn& c = conns_[static_cast<std::size_t>(i)];
+                c.due = t0 + period_ * i / std::max(active, 1);
+                starts_.push_back({c.due, static_cast<std::uint32_t>(i)});
+            }
+        }
+        ::prctl(PR_SET_TIMERSLACK, 1UL, 0UL, 0UL, 0UL);
         std::vector<epoll_event> evs(1024);
         bool verified_all = false;
         while (!stop.load(std::memory_order_relaxed))
         {
-            const int n = ::epoll_wait(epfd_.get(), evs.data(), static_cast<int>(evs.size()), 50);
+            auto timeout = std::chrono::nanoseconds(std::chrono::milliseconds(50));
+            if (!starts_.empty())
+                timeout = std::min(
+                    timeout,
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(starts_.front().first - BenchClock::now()));
+            const int n = EpollWaitFor(epfd_.get(), evs.data(), static_cast<int>(evs.size()), timeout);
             for (int i = 0; i < n; ++i)
             {
-                Conn& c = conns_[evs[static_cast<std::size_t>(i)].data.u32];
+                const std::uint32_t idx = evs[static_cast<std::size_t>(i)].data.u32;
+                Conn& c = conns_[idx];
                 const ssize_t r = ::read(c.fd.get(), c.rbuf.data() + c.got, frame_.size() - c.got);
                 if (r <= 0)
                 {
@@ -846,7 +958,23 @@ public:
                     ++result_.msgs;
                 }
                 c.got = 0;
-                SendNext(c);
+                if (paced)
+                {
+                    c.due += period_; // 按到期时刻累加，不从实际发送时刻算：晚了的发送不让速率往下漂
+                    starts_.push_back({c.due, idx});
+                }
+                else
+                    SendNext(c);
+            }
+            if (!starts_.empty())
+            {
+                const auto now = BenchClock::now();
+                while (!starts_.empty() && starts_.front().first <= now)
+                {
+                    const std::uint32_t idx = starts_.front().second;
+                    starts_.pop_front();
+                    SendNext(conns_[idx]);
+                }
             }
             (void)verified_all;
         }
@@ -862,6 +990,7 @@ private:
         std::size_t got = 0;
         bool verified = false;
         BenchClock::time_point sent_at;
+        BenchClock::time_point due; // 定速时：下一次该发送的时刻
     };
 
     void SendNext(Conn& c)
@@ -887,8 +1016,11 @@ private:
     int nconns_;
     const std::vector<std::byte>& frame_;
     int cpu_;
+    int first_;
+    bool scale_;
     UniqueFd epfd_;
     std::vector<Conn> conns_;
+    std::deque<std::pair<BenchClock::time_point, std::uint32_t>> starts_; // 定速时：各连接下一次发送的时刻
     WorkerResult result_;
 };
 
@@ -903,7 +1035,7 @@ public:
               const std::vector<std::byte>& payload,
               int cpu,
               bool kcp,
-              std::vector<RudpTicket> tickets,
+              std::vector<RUdpTicket> tickets,
               int delay_ms = 0)
         : ep_(ep)
         , nconns_(conns)
@@ -948,47 +1080,52 @@ public:
         const bool delayed = delay_.count() > 0;
         std::vector<epoll_event> evs(1024);
         auto last_scan = BenchClock::now();
-        if (!delayed)
+        const bool paced = period_.count() > 0;
+        if (!delayed && !paced)
         {
             for (int i = 0; i < active; ++i)
                 SendNext(conns_[static_cast<std::size_t>(i)]);
         }
         else
         {
-            // 有延迟时把各连接的起点在一个往返内均匀错开：闭环 + 固定延迟会让同时起步的连接一直同相，
-            // 每个往返都冲来一波突发，把服务端的接收缓冲打爆（丢包），污染要比较的 CPU。
-            const auto rtt = 2 * delay_;
+            // 有延迟（或定速）时把各连接的起点在一个往返（或一个周期）内均匀错开：闭环 + 固定延迟会让同时起步的连接
+            // 一直同相，每个往返都冲来一波突发，把服务端的接收缓冲打爆（丢包），污染要比较的 CPU。
+            const auto span = paced ? period_ : 2 * delay_;
             for (int i = 0; i < active; ++i)
-                starts_.push_back({last_scan + rtt * i / std::max(active, 1), static_cast<std::uint32_t>(i)});
+            {
+                Conn& c = conns_[static_cast<std::size_t>(i)];
+                c.due = last_scan + span * i / std::max(active, 1);
+                starts_.push_back({c.due, static_cast<std::uint32_t>(i)});
+            }
         }
+        ::prctl(PR_SET_TIMERSLACK, 1UL, 0UL, 0UL, 0UL);
         while (!stop.load(std::memory_order_relaxed))
         {
-            int timeout = 10;
-            if (delayed) // 睡到最近一个延迟项到期，最多 10ms
+            auto timeout = std::chrono::nanoseconds(std::chrono::milliseconds(10));
+            if (delayed || !starts_.empty()) // 睡到最近一个延迟 / 定速项到期，最多 10ms
             {
                 const auto now0 = BenchClock::now();
-                auto next = now0 + std::chrono::milliseconds(10);
+                auto next = now0 + timeout;
                 if (!rx_.empty())
                     next = std::min(next, rx_.front().due);
                 if (!tx_.empty())
                     next = std::min(next, tx_.front().due);
                 if (!starts_.empty())
                     next = std::min(next, starts_.front().first);
-                timeout = static_cast<int>(
-                    std::max<std::int64_t>(0, std::chrono::ceil<std::chrono::milliseconds>(next - now0).count()));
+                timeout = std::chrono::duration_cast<std::chrono::nanoseconds>(next - now0);
             }
-            const int n = ::epoll_wait(epfd_.get(), evs.data(), static_cast<int>(evs.size()), timeout);
+            const int n = EpollWaitFor(epfd_.get(), evs.data(), static_cast<int>(evs.size()), timeout);
             for (int i = 0; i < n; ++i)
                 OnReadable(conns_[evs[static_cast<std::size_t>(i)].data.u32], measuring);
             const auto now = BenchClock::now();
+            while (!starts_.empty() && starts_.front().first <= now)
+            {
+                const std::uint32_t i = starts_.front().second;
+                starts_.pop_front();
+                SendNext(conns_[i]);
+            }
             if (delayed)
             {
-                while (!starts_.empty() && starts_.front().first <= now)
-                {
-                    const std::uint32_t i = starts_.front().second;
-                    starts_.pop_front();
-                    SendNext(conns_[i]);
-                }
                 // 到期的收包先处理（处理里会产生新的发包，到期时刻在 now 之后，不会在这一轮里被发出）
                 while (!rx_.empty() && rx_.front().due <= now)
                 {
@@ -1009,7 +1146,7 @@ public:
                 for (int i = 0; i < active; ++i)
                 {
                     Conn& c = conns_[static_cast<std::size_t>(i)];
-                    if (now - c.last_tx > retry_after_) // 很久没回包：丢了
+                    if (c.pending && now - c.last_tx > retry_after_) // 发出去很久没回包：丢了
                         Retry(c);
                 }
             }
@@ -1026,6 +1163,8 @@ private:
         UdpWorker* owner = nullptr;
         std::uint32_t index = 0;
         bool verified = false;
+        bool pending = false; // 有一条已发出、还没收到回包的请求（定速时连接大部分时间在等下一次发送，不是丢包）
+        BenchClock::time_point due;     // 定速时：下一次该发送的时刻
         BenchClock::time_point sent_at; // 这条消息第一次发出的时刻：延迟从这里算，丢包的等待也算进去
         BenchClock::time_point last_tx; // 最近一次（含重发）发出的时刻：决定什么时候重发
     };
@@ -1067,7 +1206,7 @@ private:
         (void)::sendmsg(c->fd.get(), &mh, MSG_NOSIGNAL);
     }
 
-    void Handshake(Conn& c, const RudpTicket& t)
+    void Handshake(Conn& c, const RUdpTicket& t)
     {
         bool ok = false;
         for (int attempt = 0; attempt < 20 && !ok; ++attempt)
@@ -1085,7 +1224,7 @@ private:
             ok = pk && pk->type == rudp::PacketType::Accept && pk->conv == t.conv;
         }
         REQUIRE(ok);
-        c.kcp = KcpSession::Create(t.conv, RudpOptions{}, &UdpWorker::Output, &c);
+        c.kcp = KcpSession::Create(t.conv, RUdpOptions{}, &UdpWorker::Output, &c);
         REQUIRE(c.kcp != nullptr);
         c.kcp->Update(KcpNowMs());
     }
@@ -1093,6 +1232,7 @@ private:
     void SendNext(Conn& c)
     {
         c.sent_at = c.last_tx = BenchClock::now();
+        c.pending = true;
         if (!kcp_)
         {
             Transmit(c, payload_);
@@ -1131,7 +1271,18 @@ private:
             result_.lat_ns.push_back(static_cast<std::uint32_t>(std::min<std::int64_t>(lat, UINT32_MAX)));
             ++result_.msgs;
         }
-        SendNext(c);
+        c.pending = false;
+        if (period_.count() == 0)
+        {
+            SendNext(c);
+            return;
+        }
+        // 定速：真实的客户端收到数据后很快（至多一个 interval）就会把确认发出去，不会等到下一条请求才顺带；
+        // 稀疏的消息下这就是单独的一个数据报，服务端要多收一个。
+        if (kcp_)
+            c.kcp->Flush(KcpNowMs());
+        c.due += period_; // 按到期时刻累加，不从实际发送时刻算：晚了的发送不让速率往下漂
+        starts_.push_back({c.due, c.index});
     }
 
     void OnReadable(Conn& c, const std::atomic<bool>& measuring)
@@ -1181,11 +1332,12 @@ private:
     const std::vector<std::byte>& payload_;
     int cpu_;
     bool kcp_;
-    std::vector<RudpTicket> tickets_;
+    std::vector<RUdpTicket> tickets_;
     std::chrono::milliseconds delay_;
     std::chrono::milliseconds retry_after_;
     std::deque<Delayed> rx_, tx_;
-    std::deque<std::pair<BenchClock::time_point, std::uint32_t>> starts_; // 各连接开始发第一条的时刻（有延迟时才用）
+    std::deque<std::pair<BenchClock::time_point, std::uint32_t>>
+        starts_; // 各连接下一次发送的时刻（有延迟或定速时才用）
     UniqueFd epfd_;
     std::vector<Conn> conns_;
     WorkerResult result_;
@@ -1299,7 +1451,7 @@ long RssKb()
 // rudp 的会话含 KcpSession：ikcp_setmtu 按 (mtu + 24) × 3 分配一块收发缓冲，这是大头。
 int MemProbe(const BenchOptions& o, const Endpoint& ep, EchoServer& server, bool kcp)
 {
-    std::vector<RudpTicket> tickets;
+    std::vector<RUdpTicket> tickets;
     if (kcp)
         tickets = server.IssueTickets(o.mem_probe);
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
@@ -1314,7 +1466,7 @@ int MemProbe(const BenchOptions& o, const Endpoint& ep, EchoServer& server, bool
             REQUIRE(sock::Connect(fd.get(), ep) == 0);
             if (kcp)
             {
-                const RudpTicket& t = tickets[static_cast<std::size_t>(i)];
+                const RUdpTicket& t = tickets[static_cast<std::size_t>(i)];
                 bool ok = false;
                 for (int attempt = 0; attempt < 20 && !ok; ++attempt)
                 {
@@ -1333,9 +1485,10 @@ int MemProbe(const BenchOptions& o, const Endpoint& ep, EchoServer& server, bool
         }
         else
         {
-            REQUIRE(sock::CreateStreamSocket(
-                        ep.kind() == Endpoint::Kind::Tcp ? *Endpoint::Tcp("127.0.0.1", ep.port()) : ep, fd) == 0);
-            const Endpoint target = ep.kind() == Endpoint::Kind::Tcp ? *Endpoint::Tcp("127.0.0.1", ep.port()) : ep;
+            const Endpoint target = ep.kind() != Endpoint::Kind::Tcp ? ep
+                                    : o.mem_probe > kScaleThreshold  ? ScaleTcpTarget(ep, i)
+                                                                     : *Endpoint::Tcp("127.0.0.1", ep.port());
+            REQUIRE(sock::CreateStreamSocket(target, fd) == 0);
             int rc;
             while ((rc = sock::Connect(fd.get(), target)) == EAGAIN)
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -1402,6 +1555,8 @@ int main(int argc, char** argv)
             o.mainloop_cpu = std::atoi(next().c_str());
         else if (a == "--delay-ms")
             o.delay_ms = std::atoi(next().c_str());
+        else if (a == "--rate")
+            o.rate = std::atof(next().c_str());
         else if (a == "--active")
             o.active = std::atoi(next().c_str());
         else if (a == "--mem-probe")
@@ -1412,6 +1567,8 @@ int main(int argc, char** argv)
             Die("未知参数");
     }
     REQUIRE(o.conns >= 1 && o.client_threads >= 1 && o.size >= 1);
+    if (o.transport == "udp" && std::max(o.conns, o.mem_probe) > kUdpMaxConns)
+        Die("UDP 在本机最多约 2.5 万条连接（临时端口范围，见 kScaleThreshold 旁的注释）");
     o.client_threads = std::min(o.client_threads, o.conns);
 
     // 本进程里同时有服务端与客户端两份 fd；先把软限额提到硬限额。
@@ -1432,8 +1589,8 @@ int main(int argc, char** argv)
     // TCP 监听 0.0.0.0，压测线程分别连 127.0.0.1..4：同一源地址连同一 (目的IP, 目的端口) 的连接数受临时端口范围限制
     // （本机 ip_local_port_range 只有约 4000 个），目的 IP 不同则四元组不同，才能凑够上万条连接。
     std::optional<Endpoint> listen_ep;
-    const bool udp_impl = o.impl == "raw-udp" || o.impl == "rudp" || o.impl == "rudp-batched";
-    const bool kcp_impl = o.impl == "rudp" || o.impl == "rudp-batched";
+    const bool kcp_impl = o.impl == "rudp" || o.impl == "rudp-batched" || o.impl == "rudp-mainloop";
+    const bool udp_impl = o.impl == "raw-udp" || kcp_impl;
     if (o.transport == "tcp")
         listen_ep = Endpoint::Tcp("0.0.0.0", 0);
     else if (o.transport == "uds")
@@ -1445,13 +1602,14 @@ int main(int argc, char** argv)
         Die("--transport 只能是 tcp、uds 或 udp");
     REQUIRE(listen_ep.has_value());
     if (udp_impl != (o.transport == "udp"))
-        Die("raw-udp / rudp / rudp-batched 只能配 --transport udp，反之亦然");
+        Die("raw-udp / rudp / rudp-batched / rudp-mainloop 只能配 --transport udp，反之亦然");
 
+    g_table_slots = std::max(o.conns, o.mem_probe) > 60000 ? (1u << 17) : (1u << 16);
     auto server = MakeServer(o.impl, o.size, o.mainloop_cpu);
     const Endpoint ep = server->Start(*listen_ep, o.server_cpu);
     if (o.mem_probe > 0)
         return MemProbe(o, ep, *server, kcp_impl);
-    std::vector<RudpTicket> tickets;
+    std::vector<RUdpTicket> tickets;
     if (kcp_impl)
         tickets = server->IssueTickets(o.conns);
 
@@ -1466,34 +1624,37 @@ int main(int argc, char** argv)
     std::atomic<bool> stop{false};
     std::atomic<int> connected{0};
     std::atomic<bool> go{false};
+    const bool scale = o.conns > kScaleThreshold;
     for (int t = 0; t < o.client_threads; ++t)
     {
         const int share = o.conns / o.client_threads + (t < o.conns % o.client_threads ? 1 : 0);
         const int cpu = o.client_cpus.empty() ? -1 : o.client_cpus[static_cast<std::size_t>(t) % o.client_cpus.size()];
+        int begin = 0; // 本线程第一条连接的序号
+        for (int k = 0; k < t; ++k)
+            begin += o.conns / o.client_threads + (k < o.conns % o.client_threads ? 1 : 0);
         Endpoint target = ep;
         if (o.transport == "tcp")
             target = *Endpoint::Tcp("127.0.0." + std::to_string(1 + t % 4), ep.port());
         if (o.transport == "udp")
         {
             // 票据按线程切片
-            std::vector<RudpTicket> mine;
+            std::vector<RUdpTicket> mine;
             if (kcp_impl)
-            {
-                std::ptrdiff_t begin = 0;
-                for (int k = 0; k < t; ++k)
-                    begin += o.conns / o.client_threads + (k < o.conns % o.client_threads ? 1 : 0);
                 mine.assign(tickets.begin() + begin, tickets.begin() + begin + share);
-            }
             workers.push_back(
                 std::make_unique<UdpWorker>(target, share, payload, cpu, kcp_impl, std::move(mine), o.delay_ms));
             continue;
         }
-        workers.push_back(std::make_unique<Worker>(target, share, frame, cpu));
+        workers.push_back(std::make_unique<Worker>(target, share, frame, cpu, begin, scale));
     }
+    if (o.rate > 0)
+        for (auto& w : workers)
+            w->SetPeriod(std::chrono::nanoseconds(static_cast<std::int64_t>(1e9 / o.rate)));
     if (o.active > 0) // 活跃连接均摊到各压测线程
         for (int t = 0; t < o.client_threads; ++t)
             workers[static_cast<std::size_t>(t)]->SetActive(o.active / o.client_threads +
                                                             (t < o.active % o.client_threads ? 1 : 0));
+    const auto setup0 = BenchClock::now();
     for (int t = 0; t < o.client_threads; ++t)
     {
         threads.emplace_back(
@@ -1508,6 +1669,7 @@ int main(int argc, char** argv)
     }
     while (connected.load() < o.client_threads)
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    const double setup_s = std::chrono::duration<double>(BenchClock::now() - setup0).count();
     Phase("clients connected");
 
     go = true;
@@ -1557,7 +1719,8 @@ int main(int argc, char** argv)
     std::printf(
         "RESULT impl=%s transport=%s size=%zu conns=%d active=%d msgs_per_s=%.0f mb_per_s=%.1f p50_us=%.1f "
         "p99_us=%.1f srv_cpu_pct=%.0f msgs_per_iter=%.1f drops_per_s=%.0f srv_sock_drops_per_s=%.0f "
-        "max_lag_us=%.0f srv_rx_bytes_per_msg=%.1f dgram_in_per_msg=%.2f dgram_out_per_msg=%.2f delay_ms=%d\n",
+        "max_lag_us=%.0f srv_rx_bytes_per_msg=%.1f dgram_in_per_msg=%.2f dgram_out_per_msg=%.2f delay_ms=%d "
+        "rate=%.1f p90_us=%.1f p999_us=%.1f max_us=%.1f setup_s=%.2f\n",
         o.impl.c_str(),
         o.transport.c_str(),
         o.size,
@@ -1575,7 +1738,12 @@ int main(int argc, char** argv)
         msgs == 0 ? 0.0 : static_cast<double>(rx_bytes) / static_cast<double>(msgs),
         msgs == 0 ? 0.0 : static_cast<double>(dgrams_in) / static_cast<double>(msgs),
         msgs == 0 ? 0.0 : static_cast<double>(dgrams_out) / static_cast<double>(msgs),
-        o.delay_ms);
+        o.delay_ms,
+        o.rate,
+        Percentile(lat, 0.90) / 1000.0,
+        Percentile(lat, 0.999) / 1000.0,
+        lat.empty() ? 0.0 : static_cast<double>(lat.back()) / 1000.0,
+        setup_s);
     if (has_extra) // 第二个服务端线程（主循环）的 CPU 占用，单独一行以免打乱 RESULT 的固定字段
         std::printf("EXTRA main_cpu_pct=%.0f\n", (extra1 - extra0) / secs * 100.0);
     return 0;

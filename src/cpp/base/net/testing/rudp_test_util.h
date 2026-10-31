@@ -44,9 +44,9 @@ inline Endpoint Loopback(std::uint16_t port = 0)
     return *ep;
 }
 
-inline RudpEndpoint RudpLoopback(std::uint16_t port = 0)
+inline RUdpEndpoint RUdpLoopback(std::uint16_t port = 0)
 {
-    const auto ep = RudpEndpoint::Make("127.0.0.1", port);
+    const auto ep = RUdpEndpoint::Make("127.0.0.1", port);
     CHECK(ep.has_value());
     return *ep;
 }
@@ -291,7 +291,7 @@ public:
         std::uint8_t reason;
     };
 
-    KcpPeer(RawUdp& udp, const Endpoint& server, std::uint32_t conv, const RudpOptions& options = {})
+    KcpPeer(RawUdp& udp, const Endpoint& server, std::uint32_t conv, const RUdpOptions& options = {})
         : udp_(udp)
         , server_(server)
         , conv_(conv)
@@ -306,7 +306,7 @@ public:
 
     // 发 Hello，等 Accept（期间的其它包记入 controls）。
     // 返回是否收到 Accept；收到 Reject 返回 false，原因在 last_reject()。
-    bool Handshake(const RudpTicket& ticket, std::chrono::milliseconds timeout = 2s)
+    bool Handshake(const RUdpTicket& ticket, std::chrono::milliseconds timeout = 2s)
     {
         const auto c = rudp::EncodeHello(ticket.conv, ticket.token);
         udp_.SendTo(server_, c.view());

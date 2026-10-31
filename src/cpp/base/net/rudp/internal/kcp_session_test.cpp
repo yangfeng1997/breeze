@@ -58,7 +58,7 @@ struct Pair
     bool reorder = false;   // 每一步里把数据报倒过来送
     bool duplicate = false; // 每个数据报送两遍
 
-    explicit Pair(const RudpOptions& opt = {}, std::uint32_t conv_a = 7, std::uint32_t conv_b = 7)
+    explicit Pair(const RUdpOptions& opt = {}, std::uint32_t conv_a = 7, std::uint32_t conv_b = 7)
     {
         a.kcp = KcpSession::Create(conv_a, opt, &Output, &a);
         b.kcp = KcpSession::Create(conv_b, opt, &Output, &b);
@@ -142,7 +142,7 @@ void TestBidirectional()
 // 每段能装 mtu - 1（rudp 包头）- 24（KCP 头）字节。
 void TestMss()
 {
-    RudpOptions o;
+    RUdpOptions o;
     o.mtu = 1400;
     Pair p(o);
     CHECK(p.a.kcp->mss() == 1400 - 1 - 24);
@@ -177,7 +177,7 @@ void TestEmptyMessage()
 // 大消息被分段、对端收齐才交付一次；分段没收齐之前 PeekSize 是 -1。
 void TestLargeMessage()
 {
-    RudpOptions o;
+    RUdpOptions o;
     o.recv_window = 256;
     Pair p(o);
     std::string big(60000, '\0');
@@ -193,7 +193,7 @@ void TestLargeMessage()
 // 上限：127 段能发，128 段不行（ikcp 的限制）；MaxMessageForMtu 与它对得上。
 void TestMaxMessage()
 {
-    RudpOptions o;
+    RUdpOptions o;
     Pair p(o);
     const std::size_t max = rudp::MaxMessageForMtu(o.mtu);
     CHECK(max == 127u * p.a.kcp->mss());
@@ -205,7 +205,7 @@ void TestMaxMessage()
 // 最大的一条消息真能端到端送达（窗口要装得下 127 段）。
 void TestMaxMessageDelivered()
 {
-    RudpOptions o;
+    RUdpOptions o;
     Pair p(o);
     const std::size_t max = rudp::MaxMessageForMtu(o.mtu);
     std::string m(max, 'm');
@@ -281,7 +281,7 @@ void TestDuplicates()
 // 发送窗口远小于消息数：排队等窗口，最终全部送达（不丢、不乱序）。
 void TestSendQueueBeyondWindow()
 {
-    RudpOptions o;
+    RUdpOptions o;
     o.send_window = 4;
     Pair p(o);
     std::vector<std::string> want;
@@ -311,7 +311,7 @@ void TestWaitSnd()
 // 没有对端回应：同一个段重传 dead_link 次之后判死。
 void TestDeadLink()
 {
-    RudpOptions o;
+    RUdpOptions o;
     o.dead_link = 5;
     Pair p(o);
     p.b.lose = [](std::size_t) { return true; }; // 对端的 ack 全丢
@@ -339,7 +339,7 @@ void TestNotDeadWhenAlive()
 // conv 不符 / 垃圾：Input 返回负数，不影响会话。
 void TestInputRejectsForeign()
 {
-    Pair p(RudpOptions{}, 7, 8); // 两端 conv 不同：互相不认
+    Pair p(RUdpOptions{}, 7, 8); // 两端 conv 不同：互相不认
     SendStr(*p.a.kcp, "hello");
     p.Run(200);
     CHECK(Drain(*p.b.kcp).empty());
@@ -370,7 +370,7 @@ void TestFlushImmediate()
 // 只推进 a 的时钟、不把数据报送走，这样能看到它发出的全部。
 void TestDatagramSizeBound()
 {
-    RudpOptions o;
+    RUdpOptions o;
     o.mtu = 800;
     Pair p(o);
     SendStr(*p.a.kcp, std::string(50000, 'z'));
@@ -422,7 +422,7 @@ void TestNeedsUpdate()
     {
         // 对端窗口为 0：即使什么都不用发也要 Update（定时探测）；对端读走消息、窗口恢复后，
         // 它有一条窗口通告要发，发完两边都静止
-        RudpOptions o;
+        RUdpOptions o;
         o.recv_window = 128; // KCP 的下限；发满 128 条、对端又不读，它的接收窗口就是 0
         Pair p(o);
         for (int i = 0; i < 128; ++i)
@@ -469,7 +469,7 @@ void TestPlanUpdate()
     {
         // 待发的窗口通告：ikcp_update 受 ts_flush 限制，调早了不 flush，通告还留着——计划必须还是 Soon，
         // 不能因为"没有排队的数据、没有在途的段"就睡过去（对端的窗口一直是 0，要等 5 秒的探测才会再问）
-        RudpOptions o;
+        RUdpOptions o;
         o.recv_window = 128;
         Pair p(o);
         for (int i = 0; i < 128; ++i)
@@ -497,7 +497,7 @@ void TestPlanUpdate()
     }
     {
         // 对端窗口为 0
-        RudpOptions o;
+        RUdpOptions o;
         o.recv_window = 128;
         Pair p(o);
         for (int i = 0; i < 128; ++i)

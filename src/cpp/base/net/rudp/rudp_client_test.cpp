@@ -1,4 +1,4 @@
-// RudpClient：用原始 UDP 对端冒充服务端，测客户端自己的行为：握手（Hello 内容与重传、Accept 校验、Reject 的错误码映射、
+// RUdpClient：用原始 UDP 对端冒充服务端，测客户端自己的行为：握手（Hello 内容与重传、Accept 校验、Reject 的错误码映射、
 // 超时、服务端晚起）、心跳、Close 之后不重连、换票据重来、Stop / Start 的各种时序、空闲、析构与停机。
 // 无测试框架依赖：失败即 abort；每个用例都带超时，卡死也会 abort。
 
@@ -128,30 +128,30 @@ struct Fixture
     }
     ~Fixture() { group.Shutdown(5s); }
 
-    RudpTicket Ticket()
+    RUdpTicket Ticket()
     {
-        RudpTicket t;
+        RUdpTicket t;
         t.conv = ++next_conv;
         t.token.fill(static_cast<std::byte>(next_conv & 0xFF));
         return t;
     }
 
-    RudpClientOptions Options(const RudpTicket& t)
+    RUdpClientOptions Options(const RUdpTicket& t)
     {
-        RudpClientOptions o;
+        RUdpClientOptions o;
         o.ticket = t;
         o.ping_interval = 0ms; // 默认不发心跳：免得干扰对包的断言
         o.on_connect_failed = [this](int e, bool r) noexcept { failures.Add(e, r); };
         return o;
     }
 
-    std::unique_ptr<RudpClient> MakeClient(RudpClientOptions o)
+    std::unique_ptr<RUdpClient> MakeClient(RUdpClientOptions o)
     {
-        return std::make_unique<RudpClient>(group, *RudpEndpoint::From(server.local()), std::move(o), rec);
+        return std::make_unique<RUdpClient>(group, *RUdpEndpoint::From(server.local()), std::move(o), rec);
     }
 
     // 启动并完成握手：返回 Hello 里的客户端地址。
-    Endpoint Connect(RudpClient& c, const RudpTicket& t, std::size_t connected_index = 0)
+    Endpoint Connect(RUdpClient& c, const RUdpTicket& t, std::size_t connected_index = 0)
     {
         CHECK(c.Start() == 0);
         const auto h = RecvHello(server);
@@ -168,7 +168,7 @@ struct Fixture
 void TestHelloContentAndRetransmit()
 {
     Fixture f;
-    const RudpTicket t = f.Ticket();
+    const RUdpTicket t = f.Ticket();
     auto o = f.Options(t);
     o.hello_interval = 100ms;
     auto c = f.MakeClient(std::move(o));
@@ -197,7 +197,7 @@ void TestHelloContentAndRetransmit()
 void TestAcceptConnectsAndExchangesMessages()
 {
     Fixture f;
-    const RudpTicket t = f.Ticket();
+    const RUdpTicket t = f.Ticket();
     auto c = f.MakeClient(f.Options(t));
     CHECK(!c->handle().valid());
     CHECK(c->Send(Buf("x")) == SendResult::Closed); // 没连上
@@ -251,7 +251,7 @@ void TestRejectMapping()
 void TestHandshakeTimeout()
 {
     Fixture f;
-    const RudpTicket t = f.Ticket();
+    const RUdpTicket t = f.Ticket();
     auto o = f.Options(t);
     o.connect_timeout = 500ms;
     o.hello_interval = 100ms;
@@ -286,7 +286,7 @@ void TestConnRefusedReportedAtTimeout()
     auto o = f.Options(f.Ticket());
     o.connect_timeout = 600ms;
     o.hello_interval = 100ms;
-    RudpClient c(f.group, RudpLoopback(dead_port), std::move(o), f.rec);
+    RUdpClient c(f.group, RUdpLoopback(dead_port), std::move(o), f.rec);
     CHECK(c.Start() == 0);
     CHECK(WaitUntil([&] { return f.failures.size() == 1; }, 5s));
     CHECK(f.failures.at(0).err == ECONNREFUSED);
@@ -301,11 +301,11 @@ void TestServerStartsLate()
         RawUdp temp;
         port = temp.local().port();
     }
-    const RudpTicket t = f.Ticket();
+    const RUdpTicket t = f.Ticket();
     auto o = f.Options(t);
     o.connect_timeout = 5s;
     o.hello_interval = 100ms;
-    RudpClient c(f.group, RudpLoopback(port), std::move(o), f.rec);
+    RUdpClient c(f.group, RUdpLoopback(port), std::move(o), f.rec);
     CHECK(c.Start() == 0);
     std::this_thread::sleep_for(400ms); // 这期间 Hello 都撞上 ICMP 不可达
     CHECK(f.failures.size() == 0);
@@ -321,7 +321,7 @@ void TestServerStartsLate()
 void TestBadRepliesIgnoredWhileHandshaking()
 {
     Fixture f;
-    const RudpTicket t = f.Ticket();
+    const RUdpTicket t = f.Ticket();
     auto c = f.MakeClient(f.Options(t));
     CHECK(c->Start() == 0);
     const auto h = RecvHello(f.server);
@@ -348,7 +348,7 @@ void TestBadRepliesIgnoredWhileHandshaking()
 void TestConnectionOutlivesConnectTimeout()
 {
     Fixture f;
-    const RudpTicket t = f.Ticket();
+    const RUdpTicket t = f.Ticket();
     auto o = f.Options(t);
     o.connect_timeout = 300ms;
     o.hello_interval = 50ms;
@@ -365,7 +365,7 @@ void TestConnectionOutlivesConnectTimeout()
 void TestExtraAcceptAndRejectIgnoredWhenConnected()
 {
     Fixture f;
-    const RudpTicket t = f.Ticket();
+    const RUdpTicket t = f.Ticket();
     auto c = f.MakeClient(f.Options(t));
     const Endpoint client_ep = f.Connect(*c, t);
     const auto dropped = f.group.GetStats().datagrams_dropped;
@@ -383,7 +383,7 @@ void TestExtraAcceptAndRejectIgnoredWhenConnected()
 void TestPing()
 {
     Fixture f;
-    const RudpTicket t = f.Ticket();
+    const RUdpTicket t = f.Ticket();
     auto o = f.Options(t);
     o.ping_interval = 100ms;
     auto c = f.MakeClient(std::move(o));
@@ -408,7 +408,7 @@ void TestPing()
 void TestNoPingWhenDisabled()
 {
     Fixture f;
-    const RudpTicket t = f.Ticket();
+    const RUdpTicket t = f.Ticket();
     auto c = f.MakeClient(f.Options(t)); // ping_interval = 0
     f.Connect(*c, t);
     f.server.Drain();
@@ -421,7 +421,7 @@ void TestNoPingWhenDisabled()
 void TestServerCloseDoesNotReconnect()
 {
     Fixture f;
-    const RudpTicket t = f.Ticket();
+    const RUdpTicket t = f.Ticket();
     auto c = f.MakeClient(f.Options(t));
     const Endpoint client_ep = f.Connect(*c, t);
     f.server.SendTo(client_ep, rudp::EncodeClose(t.conv, 0).view());
@@ -438,7 +438,7 @@ void TestServerCloseDoesNotReconnect()
 void TestNewTicketAfterClose()
 {
     Fixture f;
-    const RudpTicket t1 = f.Ticket(), t2 = f.Ticket();
+    const RUdpTicket t1 = f.Ticket(), t2 = f.Ticket();
     auto c = f.MakeClient(f.Options(t1));
     const Endpoint ep1 = f.Connect(*c, t1);
     const ConnectionHandle h1 = f.rec.WaitConnected(0);
@@ -457,7 +457,7 @@ void TestStartValidation()
 {
     Fixture f;
     {
-        RudpClientOptions o = f.Options(RudpTicket{}); // 票据无效（conv 为 0）
+        RUdpClientOptions o = f.Options(RUdpTicket{}); // 票据无效（conv 为 0）
         auto c = f.MakeClient(std::move(o));
         CHECK(c->Start() == EINVAL);
         c->SetTicket(f.Ticket()); // 补上就可以
@@ -466,15 +466,15 @@ void TestStartValidation()
     }
     const auto bad = [&](auto mutate)
     {
-        RudpClientOptions o = f.Options(f.Ticket());
+        RUdpClientOptions o = f.Options(f.Ticket());
         mutate(o);
         auto c = f.MakeClient(std::move(o));
         CHECK(c->Start() == EINVAL);
     };
-    bad([](RudpClientOptions& o) { o.rudp.mtu = 100; });
-    bad([](RudpClientOptions& o) { o.connect_timeout = 0ms; });
-    bad([](RudpClientOptions& o) { o.hello_interval = 0ms; });
-    bad([](RudpClientOptions& o) { o.ping_interval = -1ms; });
+    bad([](RUdpClientOptions& o) { o.rudp.mtu = 100; });
+    bad([](RUdpClientOptions& o) { o.connect_timeout = 0ms; });
+    bad([](RUdpClientOptions& o) { o.hello_interval = 0ms; });
+    bad([](RUdpClientOptions& o) { o.ping_interval = -1ms; });
 }
 
 // group 已停机：Start 返回 ESHUTDOWN，不是编程错误。
@@ -484,11 +484,11 @@ void TestStartAfterShutdown()
     CHECK(group.Start() == 0);
     EventRecorder rec;
     RawUdp server;
-    RudpTicket t;
+    RUdpTicket t;
     t.conv = 5;
-    RudpClientOptions o;
+    RUdpClientOptions o;
     o.ticket = t;
-    RudpClient c(group, *RudpEndpoint::From(server.local()), std::move(o), rec);
+    RUdpClient c(group, *RUdpEndpoint::From(server.local()), std::move(o), rec);
     group.Shutdown(1s);
     CHECK(c.Start() == ESHUTDOWN);
 }
@@ -497,7 +497,7 @@ void TestStartAfterShutdown()
 void TestStopDuringHandshake()
 {
     Fixture f;
-    const RudpTicket t = f.Ticket(); // 下面 got_close 要对上它
+    const RUdpTicket t = f.Ticket(); // 下面 got_close 要对上它
     auto o = f.Options(t);
     o.hello_interval = 100ms;
     o.connect_timeout = 400ms; // 下面等得比它久：Stop 之后超时定时器不能再触发 on_connect_failed
@@ -524,7 +524,7 @@ void TestStopDuringHandshake()
 void TestStopWhenConnected()
 {
     Fixture f;
-    const RudpTicket t = f.Ticket();
+    const RUdpTicket t = f.Ticket();
     auto c = f.MakeClient(f.Options(t));
     f.Connect(*c, t);
     f.server.Drain();
@@ -550,7 +550,7 @@ void TestStopWhenConnected()
 void TestStopThenStartDoesNotOverlap()
 {
     Fixture f;
-    const RudpTicket t1 = f.Ticket(), t2 = f.Ticket();
+    const RUdpTicket t1 = f.Ticket(), t2 = f.Ticket();
     auto c = f.MakeClient(f.Options(t1));
     f.Connect(*c, t1);
     f.server.Drain();
@@ -571,7 +571,7 @@ void TestRestartFromConnectFailedCallback()
 {
     Fixture f;
     std::atomic<int> failed{0};
-    RudpClient* self = nullptr;
+    RUdpClient* self = nullptr;
     auto o = f.Options(f.Ticket());
     o.on_connect_failed = [&](int, bool) noexcept
     {
@@ -595,7 +595,7 @@ void TestRestartFromConnectFailedCallback()
 void TestIdleTimeoutWhenSilent()
 {
     Fixture f;
-    const RudpTicket t = f.Ticket();
+    const RUdpTicket t = f.Ticket();
     auto o = f.Options(t);
     o.connection.idle_timeout = 500ms;
     auto c = f.MakeClient(std::move(o));
@@ -610,7 +610,7 @@ void TestIdleTimeoutWhenSilent()
 void TestPongKeepsAlive()
 {
     Fixture f;
-    const RudpTicket t = f.Ticket();
+    const RUdpTicket t = f.Ticket();
     auto o = f.Options(t);
     o.connection.idle_timeout = 500ms;
     o.ping_interval = 100ms;
@@ -633,13 +633,13 @@ void TestIcmpWhenConnectedDoesNotClose()
     CHECK(group.Start() == 0);
     EventRecorder rec;
     auto server = std::make_unique<RawUdp>();
-    RudpTicket t;
+    RUdpTicket t;
     t.conv = 77;
     t.token.fill(std::byte{1});
-    RudpClientOptions o;
+    RUdpClientOptions o;
     o.ticket = t;
     o.ping_interval = 50ms;
-    RudpClient c(group, *RudpEndpoint::From(server->local()), std::move(o), rec);
+    RUdpClient c(group, *RUdpEndpoint::From(server->local()), std::move(o), rec);
     CHECK(c.Start() == 0);
     const auto h = RecvHello(*server);
     CHECK(h.has_value());
@@ -661,14 +661,14 @@ void TestDestroyWhileConnected()
     CHECK(group.Start() == 0);
     EventRecorder rec;
     RawUdp server;
-    RudpTicket t;
+    RUdpTicket t;
     t.conv = 9;
     t.token.fill(std::byte{2});
     auto dtor_start = std::chrono::steady_clock::now();
     {
-        RudpClientOptions o;
+        RUdpClientOptions o;
         o.ticket = t;
-        RudpClient c(group, *RudpEndpoint::From(server.local()), std::move(o), rec);
+        RUdpClient c(group, *RUdpEndpoint::From(server.local()), std::move(o), rec);
         CHECK(c.Start() == 0);
         const auto h = RecvHello(server);
         CHECK(h.has_value());
@@ -692,13 +692,13 @@ void TestDestroyDuringHandshake()
     EventRecorder rec;
     RawUdp server;
     {
-        RudpTicket t;
+        RUdpTicket t;
         t.conv = 11;
         t.token.fill(std::byte{3});
-        RudpClientOptions o;
+        RUdpClientOptions o;
         o.ticket = t;
         o.hello_interval = 50ms;
-        RudpClient c(group, *RudpEndpoint::From(server.local()), std::move(o), rec);
+        RUdpClient c(group, *RUdpEndpoint::From(server.local()), std::move(o), rec);
         CHECK(c.Start() == 0);
         CHECK(RecvHello(server).has_value());
     }
@@ -716,16 +716,16 @@ void TestGroupShutdown()
     CHECK(group.Start() == 0);
     EventRecorder rec;
     RawUdp server;
-    RudpTicket t1, t2;
+    RUdpTicket t1, t2;
     t1.conv = 21;
     t1.token.fill(std::byte{4});
     t2.conv = 22;
     t2.token.fill(std::byte{5});
-    RudpClientOptions o1, o2;
+    RUdpClientOptions o1, o2;
     o1.ticket = t1;
     o2.ticket = t2;
-    RudpClient connected(group, *RudpEndpoint::From(server.local()), std::move(o1), rec);
-    RudpClient pending(group, *RudpEndpoint::From(server.local()), std::move(o2), rec);
+    RUdpClient connected(group, *RUdpEndpoint::From(server.local()), std::move(o1), rec);
+    RUdpClient pending(group, *RUdpEndpoint::From(server.local()), std::move(o2), rec);
     CHECK(connected.Start() == 0);
     const auto h = RecvHello(server);
     CHECK(h.has_value() && h->conv == t1.conv);

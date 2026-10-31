@@ -1,4 +1,4 @@
-// RudpServer：用原始 UDP 对端（RawUdp / KcpPeer）直接和服务端讲协议，不经 RudpClient，测服务端自己的行为：
+// RUdpServer：用原始 UDP 对端（RawUdp / KcpPeer）直接和服务端讲协议，不经 RUdpClient，测服务端自己的行为：
 // 握手与票据（一次性、过期、token 错、版本、过滤、表满、重传的 Hello）、按来源固定会话（陌生来源操纵不了会话）、
 // 畸形包、心跳、Close、空闲、Stop、析构、统计。
 // 无测试框架依赖：失败即 abort；每个用例都带超时，卡死也会 abort。
@@ -50,7 +50,7 @@ std::optional<Reply> RecvReply(RawUdp& raw, std::chrono::milliseconds timeout = 
     return Reply{p->type, p->version, p->conv, p->reason};
 }
 
-void SendHello(RawUdp& raw, const Endpoint& to, const RudpTicket& t)
+void SendHello(RawUdp& raw, const Endpoint& to, const RUdpTicket& t)
 {
     raw.SendTo(to, rudp::EncodeHello(t.conv, t.token).view());
 }
@@ -64,13 +64,13 @@ struct Fixture
 {
     EventLoopGroup group;
     EventRecorder rec;
-    std::unique_ptr<RudpServer> server;
+    std::unique_ptr<RUdpServer> server;
 
-    explicit Fixture(RudpServerOptions o = {}, EventLoopGroupOptions go = EventLoopGroupOptions{2, 256})
+    explicit Fixture(RUdpServerOptions o = {}, EventLoopGroupOptions go = EventLoopGroupOptions{2, 256})
         : group(go)
     {
         CHECK(group.Start() == 0);
-        server = std::make_unique<RudpServer>(group, RudpLoopback(), std::move(o), rec);
+        server = std::make_unique<RUdpServer>(group, RUdpLoopback(), std::move(o), rec);
         CHECK(server->Start() == 0);
     }
     ~Fixture()
@@ -80,7 +80,7 @@ struct Fixture
     }
 
     const Endpoint& ep() const { return server->endpoint(); }
-    RudpTicket Ticket(std::chrono::milliseconds ttl = 30s)
+    RUdpTicket Ticket(std::chrono::milliseconds ttl = 30s)
     {
         const auto t = server->IssueTicket(ttl);
         CHECK(t.has_value());
@@ -102,7 +102,7 @@ void TestHandshakeAccept()
 {
     Fixture f;
     RawUdp raw;
-    const RudpTicket t = f.Ticket();
+    const RUdpTicket t = f.Ticket();
     SendHello(raw, f.ep(), t);
     const auto r = RecvReply(raw);
     CHECK(r && r->type == rudp::PacketType::Accept && r->conv == t.conv && r->version == rudp::kVersion);
@@ -116,7 +116,7 @@ void TestUnknownTicketRejected()
 {
     Fixture f;
     RawUdp raw;
-    RudpTicket fake;
+    RUdpTicket fake;
     fake.conv = 12345;
     fake.token.fill(std::byte{7});
     SendHello(raw, f.ep(), fake);
@@ -130,8 +130,8 @@ void TestWrongTokenRejectedThenRightOne()
 {
     Fixture f;
     RawUdp raw;
-    RudpTicket t = f.Ticket();
-    RudpTicket forged = t;
+    RUdpTicket t = f.Ticket();
+    RUdpTicket forged = t;
     forged.token[3] ^= std::byte{0x40};
     SendHello(raw, f.ep(), forged);
     CHECK(IsReject(RecvReply(raw), rudp::RejectReason::Ticket));
@@ -146,7 +146,7 @@ void TestTicketSingleUse()
 {
     Fixture f;
     RawUdp a, b;
-    const RudpTicket t = f.Ticket();
+    const RUdpTicket t = f.Ticket();
     SendHello(a, f.ep(), t);
     CHECK(RecvReply(a)->type == rudp::PacketType::Accept);
     SendHello(b, f.ep(), t);
@@ -158,7 +158,7 @@ void TestTicketExpired()
 {
     Fixture f;
     RawUdp raw;
-    const RudpTicket t = f.Ticket(50ms);
+    const RUdpTicket t = f.Ticket(50ms);
     std::this_thread::sleep_for(120ms);
     SendHello(raw, f.ep(), t);
     CHECK(IsReject(RecvReply(raw), rudp::RejectReason::Ticket));
@@ -170,7 +170,7 @@ void TestAddTicket()
 {
     Fixture f;
     RawUdp raw;
-    RudpTicket t;
+    RUdpTicket t;
     t.conv = 0xABCD1234u;
     t.token.fill(std::byte{0x5C});
     CHECK(f.server->AddTicket(t, 10s));
@@ -183,7 +183,7 @@ void TestAddTicket()
 
 void TestTicketLimits()
 {
-    RudpServerOptions o;
+    RUdpServerOptions o;
     o.max_pending_tickets = 2;
     Fixture f(std::move(o));
     CHECK(f.server->IssueTicket(10s).has_value());
@@ -198,7 +198,7 @@ void TestDuplicateHelloResendsAccept()
 {
     Fixture f;
     RawUdp raw;
-    const RudpTicket t = f.Ticket();
+    const RUdpTicket t = f.Ticket();
     for (int i = 0; i < 3; ++i)
     {
         SendHello(raw, f.ep(), t);
@@ -214,8 +214,8 @@ void TestHelloWithOtherConvFromSameSourceIgnored()
 {
     Fixture f;
     RawUdp raw;
-    const RudpTicket a = f.Ticket();
-    const RudpTicket b = f.Ticket();
+    const RUdpTicket a = f.Ticket();
+    const RUdpTicket b = f.Ticket();
     SendHello(raw, f.ep(), a);
     CHECK(RecvReply(raw)->type == rudp::PacketType::Accept);
     const auto dropped = f.stats().datagrams_dropped;
@@ -230,7 +230,7 @@ void TestVersionMismatch()
 {
     Fixture f;
     RawUdp raw;
-    const RudpTicket t = f.Ticket();
+    const RUdpTicket t = f.Ticket();
     auto hello = rudp::EncodeHello(t.conv, t.token);
     hello.bytes[1] = std::byte{rudp::kVersion + 1};
     raw.SendTo(f.ep(), hello.view());
@@ -246,7 +246,7 @@ void TestAcceptFilter()
     std::optional<Endpoint> seen;
     std::optional<PeerCredentials> creds;
     std::atomic<bool> allow{false};
-    RudpServerOptions o;
+    RUdpServerOptions o;
     o.accept_filter = [&](const PeerInfo& p) noexcept
     {
         const std::lock_guard lk(mu);
@@ -256,7 +256,7 @@ void TestAcceptFilter()
     };
     Fixture f(std::move(o));
     RawUdp raw;
-    const RudpTicket t = f.Ticket();
+    const RUdpTicket t = f.Ticket();
     SendHello(raw, f.ep(), t);
     CHECK(IsReject(RecvReply(raw), rudp::RejectReason::Filtered));
     {
@@ -274,9 +274,9 @@ void TestAcceptFilter()
 // 连接表满：Reject(Busy)，不消耗票据；腾出位置后同一张票据还能用。
 void TestConnectionTableFull()
 {
-    Fixture f(RudpServerOptions{}, EventLoopGroupOptions{1, 2});
+    Fixture f(RUdpServerOptions{}, EventLoopGroupOptions{1, 2});
     RawUdp a, b, c;
-    const RudpTicket ta = f.Ticket(), tb = f.Ticket(), tc = f.Ticket();
+    const RUdpTicket ta = f.Ticket(), tb = f.Ticket(), tc = f.Ticket();
     SendHello(a, f.ep(), ta);
     CHECK(RecvReply(a)->type == rudp::PacketType::Accept);
     SendHello(b, f.ep(), tb);
@@ -321,7 +321,7 @@ void TestMalformedDatagramsDropped()
     CHECK(raw.ExpectSilence());
     CHECK(WaitUntil([&] { return f.stats().datagrams_dropped == base + 5; }));
     // 服务端没被搞坏：正常握手
-    const RudpTicket t = f.Ticket();
+    const RUdpTicket t = f.Ticket();
     SendHello(raw, f.ep(), t);
     CHECK(RecvReply(raw)->type == rudp::PacketType::Accept);
 }
@@ -358,7 +358,7 @@ void TestAddressPinning()
 {
     Fixture f;
     RawUdp owner_sock, intruder_sock;
-    const RudpTicket t = f.Ticket();
+    const RUdpTicket t = f.Ticket();
     KcpPeer real(owner_sock, f.ep(), t.conv);
     CHECK(real.Handshake(t));
     f.rec.WaitConnected(0);
@@ -384,7 +384,7 @@ void TestPingPong()
 {
     Fixture f;
     RawUdp raw;
-    const RudpTicket t = f.Ticket();
+    const RUdpTicket t = f.Ticket();
     SendHello(raw, f.ep(), t);
     CHECK(RecvReply(raw)->type == rudp::PacketType::Accept);
     raw.SendTo(f.ep(), rudp::EncodePing(t.conv).view());
@@ -402,7 +402,7 @@ void TestPeerClose()
 {
     Fixture f;
     RawUdp raw;
-    const RudpTicket t = f.Ticket();
+    const RUdpTicket t = f.Ticket();
     SendHello(raw, f.ep(), t);
     CHECK(RecvReply(raw)->type == rudp::PacketType::Accept);
     f.rec.WaitConnected(0);
@@ -422,7 +422,7 @@ void TestLocalCloseSendsCloseBurst()
 {
     Fixture f;
     RawUdp raw;
-    const RudpTicket t = f.Ticket();
+    const RUdpTicket t = f.Ticket();
     SendHello(raw, f.ep(), t);
     CHECK(RecvReply(raw)->type == rudp::PacketType::Accept);
     const ConnectionHandle h = f.rec.WaitConnected(0);
@@ -445,11 +445,11 @@ void TestLocalCloseSendsCloseBurst()
 // 空闲：开了 idle_timeout，来源一直不吭声就以 IdleTimeout 关闭；定期发心跳的不会被关。
 void TestIdleTimeout()
 {
-    RudpServerOptions o;
+    RUdpServerOptions o;
     o.connection.idle_timeout = 600ms;
     Fixture f(std::move(o));
     RawUdp quiet, chatty;
-    const RudpTicket tq = f.Ticket(), tc = f.Ticket();
+    const RUdpTicket tq = f.Ticket(), tc = f.Ticket();
     SendHello(quiet, f.ep(), tq);
     CHECK(RecvReply(quiet)->type == rudp::PacketType::Accept);
     SendHello(chatty, f.ep(), tc);
@@ -478,7 +478,7 @@ void TestStopRejectsNewButKeepsExisting()
 {
     Fixture f;
     RawUdp live, late;
-    const RudpTicket t1 = f.Ticket(), t2 = f.Ticket();
+    const RUdpTicket t1 = f.Ticket(), t2 = f.Ticket();
     SendHello(live, f.ep(), t1);
     CHECK(RecvReply(live)->type == rudp::PacketType::Accept);
     f.rec.WaitConnected(0);
@@ -521,7 +521,7 @@ void TestStopWithoutSessionsReleasesPort()
     EventLoopGroup g2;
     CHECK(g2.Start() == 0);
     EventRecorder rec2;
-    RudpServer never_started(g2, RudpLoopback(), RudpServerOptions{}, rec2);
+    RUdpServer never_started(g2, RUdpLoopback(), RUdpServerOptions{}, rec2);
     never_started.Stop(); // 空操作
     g2.Shutdown(1s);
 }
@@ -532,21 +532,21 @@ void TestStartErrors()
     CHECK(group.Start() == 0);
     EventRecorder rec;
     {
-        RudpServerOptions bad;
+        RUdpServerOptions bad;
         bad.rudp.mtu = 100; // 低于下限
-        RudpServer s(group, RudpLoopback(), std::move(bad), rec);
+        RUdpServer s(group, RUdpLoopback(), std::move(bad), rec);
         CHECK(s.Start() == EINVAL);
     }
     {
-        RudpServerOptions bad;
+        RUdpServerOptions bad;
         bad.rudp.max_message_size = rudp::MaxMessageForMtu(1400) + 1;
-        RudpServer s(group, RudpLoopback(), std::move(bad), rec);
+        RUdpServer s(group, RUdpLoopback(), std::move(bad), rec);
         CHECK(s.Start() == EINVAL);
     }
-    RudpServer first(group, RudpLoopback(), RudpServerOptions{}, rec);
+    RUdpServer first(group, RUdpLoopback(), RUdpServerOptions{}, rec);
     CHECK(first.Start() == 0);
     {
-        RudpServer second(group, *RudpEndpoint::From(first.endpoint()), RudpServerOptions{}, rec);
+        RUdpServer second(group, *RUdpEndpoint::From(first.endpoint()), RUdpServerOptions{}, rec);
         CHECK(second.Start() == EADDRINUSE);
     }
     // 失败的启动不影响第一个
@@ -555,7 +555,7 @@ void TestStartErrors()
     raw.SendTo(first.endpoint(), rudp::EncodeHello(t->conv, t->token).view());
     CHECK(RecvReply(raw)->type == rudp::PacketType::Accept);
     group.Shutdown(2s);
-    RudpServer after(group, RudpLoopback(), RudpServerOptions{}, rec);
+    RUdpServer after(group, RUdpLoopback(), RUdpServerOptions{}, rec);
     CHECK(after.Start() == ESHUTDOWN);
 }
 
@@ -564,7 +564,7 @@ void TestEndpointBeforeAndAfterStart()
     EventLoopGroup group(EventLoopGroupOptions{1, 64});
     CHECK(group.Start() == 0);
     EventRecorder rec;
-    RudpServer s(group, RudpLoopback(0), RudpServerOptions{}, rec);
+    RUdpServer s(group, RUdpLoopback(0), RUdpServerOptions{}, rec);
     CHECK(s.endpoint().port() == 0 && s.local_endpoint().port() == 0);
     CHECK(s.Start() == 0);
     CHECK(s.endpoint().port() != 0 && s.endpoint().kind() == Endpoint::Kind::Udp);
@@ -582,7 +582,7 @@ void TestDestructorWithLiveSessions()
     std::vector<std::unique_ptr<RawUdp>> raws;
     auto dtor_start = std::chrono::steady_clock::now();
     {
-        RudpServer server(group, RudpLoopback(), RudpServerOptions{}, rec);
+        RUdpServer server(group, RUdpLoopback(), RUdpServerOptions{}, rec);
         CHECK(server.Start() == 0);
         for (int i = 0; i < 5; ++i)
         {
@@ -617,7 +617,7 @@ void TestGroupShutdownClosesSessions()
     EventLoopGroup group(EventLoopGroupOptions{2, 64});
     CHECK(group.Start() == 0);
     EventRecorder rec;
-    RudpServer server(group, RudpLoopback(), RudpServerOptions{}, rec);
+    RUdpServer server(group, RUdpLoopback(), RUdpServerOptions{}, rec);
     CHECK(server.Start() == 0);
     RawUdp raw;
     const auto t = server.IssueTicket(10s);
@@ -632,10 +632,10 @@ void TestGroupShutdownClosesSessions()
 // 许多会话并发握手、各自心跳：按来源分得开，计数对得上。
 void TestManySessions()
 {
-    Fixture f(RudpServerOptions{}, EventLoopGroupOptions{2, 512});
+    Fixture f(RUdpServerOptions{}, EventLoopGroupOptions{2, 512});
     constexpr int kN = 100;
     std::vector<std::unique_ptr<RawUdp>> raws;
-    std::vector<RudpTicket> tickets;
+    std::vector<RUdpTicket> tickets;
     for (int i = 0; i < kN; ++i)
     {
         raws.push_back(std::make_unique<RawUdp>());
@@ -701,7 +701,7 @@ void TestSendWhileInFlightIsFlushedPromptly()
     Fixture f;
     f.rec.on_connected = [](Connection& c) { CHECK(c.Send(std::as_bytes(std::span("first", 5))) == SendResult::Ok); };
     RawUdp raw;
-    const RudpTicket t = f.Ticket();
+    const RUdpTicket t = f.Ticket();
     SendHello(raw, f.ep(), t);
     CHECK(RecvReply(raw)->type == rudp::PacketType::Accept);
     const ConnectionHandle h = f.rec.WaitConnected(0);
@@ -730,11 +730,11 @@ void TestSendWhileInFlightIsFlushedPromptly()
 // 下一个要等 200ms 之后的真正重传。
 void TestSendAfterIdleIsNotRetransmittedPrematurely()
 {
-    RudpServerOptions o;
+    RUdpServerOptions o;
     o.rudp.flush_on_send = true;
     Fixture f(std::move(o));
     RawUdp raw;
-    const RudpTicket t = f.Ticket();
+    const RUdpTicket t = f.Ticket();
     SendHello(raw, f.ep(), t);
     CHECK(RecvReply(raw)->type == rudp::PacketType::Accept);
     const ConnectionHandle h = f.rec.WaitConnected(0);
@@ -759,7 +759,7 @@ void TestWrongConvDataFromPinnedSourceDropped()
 {
     Fixture f;
     RawUdp raw;
-    const RudpTicket t = f.Ticket();
+    const RUdpTicket t = f.Ticket();
     KcpPeer real(raw, f.ep(), t.conv);
     CHECK(real.Handshake(t));
     f.rec.WaitConnected(0);
@@ -776,11 +776,11 @@ void TestWrongConvDataFromPinnedSourceDropped()
 // 只发数据、不发心跳也算活跃：每 100ms 一条消息，idle_timeout 600ms 下撑过 2 秒不被关。
 void TestDataKeepsSessionAlive()
 {
-    RudpServerOptions o;
+    RUdpServerOptions o;
     o.connection.idle_timeout = 600ms;
     Fixture f(std::move(o));
     RawUdp raw;
-    const RudpTicket t = f.Ticket();
+    const RUdpTicket t = f.Ticket();
     KcpPeer peer(raw, f.ep(), t.conv);
     CHECK(peer.Handshake(t));
     f.rec.WaitConnected(0);
@@ -799,12 +799,12 @@ void TestDataKeepsSessionAlive()
 // 客户端收到的第一个数据报必须是 Accept，否则数据会撞上"还在握手"被丢，白等一个重传。
 void TestAcceptPrecedesDataSentFromOnConnected()
 {
-    RudpServerOptions o;
+    RUdpServerOptions o;
     o.rudp.flush_on_send = true;
     Fixture f(std::move(o));
     f.rec.on_connected = [](Connection& c) { CHECK(c.Send(std::as_bytes(std::span("hello", 5))) == SendResult::Ok); };
     RawUdp raw;
-    const RudpTicket t = f.Ticket();
+    const RUdpTicket t = f.Ticket();
     SendHello(raw, f.ep(), t);
     const auto first = RecvReply(raw);
     CHECK(first && first->type == rudp::PacketType::Accept);
@@ -818,7 +818,7 @@ void TestSessionsSurviveSwapRemove()
     Fixture f;
     constexpr int kN = 6;
     std::vector<std::unique_ptr<RawUdp>> raws;
-    std::vector<RudpTicket> tickets;
+    std::vector<RUdpTicket> tickets;
     for (int i = 0; i < kN; ++i)
     {
         raws.push_back(std::make_unique<RawUdp>());
@@ -858,7 +858,7 @@ void TestTickIntervalDrivesLatency()
     Fixture f;
     f.rec.on_message = [](Connection& c, std::string_view sv) { Echo(c, sv); };
     RawUdp raw;
-    const RudpTicket t = f.Ticket();
+    const RUdpTicket t = f.Ticket();
     KcpPeer peer(raw, f.ep(), t.conv);
     CHECK(peer.Handshake(t));
     const auto start = std::chrono::steady_clock::now();
@@ -903,7 +903,7 @@ void TestSessionGoesQuietAfterActivity()
     Fixture f;
     f.rec.on_message = [](Connection& c, std::string_view sv) { Echo(c, sv); };
     RawUdp raw;
-    const RudpTicket t = f.Ticket();
+    const RUdpTicket t = f.Ticket();
     KcpPeer peer(raw, f.ep(), t.conv);
     CHECK(peer.Handshake(t));
     for (int i = 0; i < 5; ++i)
@@ -926,7 +926,7 @@ void TestDataIsAckedPromptly()
 {
     Fixture f; // 默认的批量配置：确认只能靠定时器发
     RawUdp raw;
-    const RudpTicket t = f.Ticket();
+    const RUdpTicket t = f.Ticket();
     KcpPeer peer(raw, f.ep(), t.conv);
     CHECK(peer.Handshake(t));
     const auto start = std::chrono::steady_clock::now();
@@ -946,7 +946,7 @@ void TestSessionsClosedWhileTickingLeaveTheRestWorking()
     constexpr int kN = 6;
     std::vector<std::unique_ptr<RawUdp>> raws;
     std::vector<std::unique_ptr<KcpPeer>> peers;
-    std::vector<RudpTicket> tickets;
+    std::vector<RUdpTicket> tickets;
     for (int i = 0; i < kN; ++i)
     {
         raws.push_back(std::make_unique<RawUdp>());
@@ -976,12 +976,12 @@ void TestSessionsClosedWhileTickingLeaveTheRestWorking()
 // 会话的数据通路（用 KcpPeer 讲真实 KCP）：消息边界与顺序、对端的超限消息按协议错误关闭。
 void TestDataPathAndOversizeFromPeer()
 {
-    RudpServerOptions o;
+    RUdpServerOptions o;
     o.rudp.max_message_size = 1000;
     Fixture f(std::move(o));
     f.rec.on_message = [](Connection& c, std::string_view sv) { Echo(c, sv); };
     RawUdp raw;
-    const RudpTicket t = f.Ticket();
+    const RUdpTicket t = f.Ticket();
     KcpPeer peer(raw, f.ep(), t.conv);
     CHECK(peer.Handshake(t));
     peer.Send("one");

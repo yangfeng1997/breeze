@@ -1,4 +1,4 @@
-// rudp 端到端：真实的 RudpServer 与 RudpClient 经回环 UDP（以及可丢包 / 复制 / 乱序 / 黑洞的代理）通信。
+// rudp 端到端：真实的 RUdpServer 与 RUdpClient 经回环 UDP（以及可丢包 / 复制 / 乱序 / 黑洞的代理）通信。
 // 消息边界与顺序、大消息、超限、双向、多客户端、多线程发送、恶劣网络、背压与慢消费者、优雅 / 强制关闭、空闲、
 // 重来、服务端重启后的快速失败、停机、与 TCP 共用一个 group、发送延迟（flush_on_send）、积压计数。
 // 无测试框架依赖：失败即 abort；每个用例都带超时，卡死也会 abort。
@@ -41,13 +41,13 @@ struct Env
 {
     EventLoopGroup group;
     EventRecorder srv; // 服务端看到的事件
-    std::unique_ptr<RudpServer> server;
+    std::unique_ptr<RUdpServer> server;
 
-    explicit Env(RudpServerOptions so = {}, EventLoopGroupOptions go = EventLoopGroupOptions{2, 1024})
+    explicit Env(RUdpServerOptions so = {}, EventLoopGroupOptions go = EventLoopGroupOptions{2, 1024})
         : group(go)
     {
         CHECK(group.Start() == 0);
-        server = std::make_unique<RudpServer>(group, RudpLoopback(), std::move(so), srv);
+        server = std::make_unique<RUdpServer>(group, RUdpLoopback(), std::move(so), srv);
         CHECK(server->Start() == 0);
     }
     ~Env()
@@ -57,17 +57,17 @@ struct Env
     }
 
     // 新建一个客户端（自动向服务端要一张票据）。via 给了就连那个地址（比如代理），否则直连服务端。
-    std::unique_ptr<RudpClient> Client(EventRecorder& rec, RudpClientOptions o = {}, const Endpoint* via = nullptr)
+    std::unique_ptr<RUdpClient> Client(EventRecorder& rec, RUdpClientOptions o = {}, const Endpoint* via = nullptr)
     {
         const auto t = server->IssueTicket(30s);
         CHECK(t.has_value());
         o.ticket = *t;
-        return std::make_unique<RudpClient>(
-            group, *RudpEndpoint::From(via != nullptr ? *via : server->endpoint()), std::move(o), rec);
+        return std::make_unique<RUdpClient>(
+            group, *RUdpEndpoint::From(via != nullptr ? *via : server->endpoint()), std::move(o), rec);
     }
 
     // 建一个客户端并连上，返回时两端都已 OnConnected。
-    std::unique_ptr<RudpClient> Connected(EventRecorder& rec, RudpClientOptions o = {}, const Endpoint* via = nullptr)
+    std::unique_ptr<RUdpClient> Connected(EventRecorder& rec, RUdpClientOptions o = {}, const Endpoint* via = nullptr)
     {
         auto c = Client(rec, std::move(o), via);
         CHECK(c->Start() == 0);
@@ -98,7 +98,7 @@ void TestEchoBoundariesAndOrder()
     Env env;
     EchoBack(env.srv);
     EventRecorder cli;
-    RudpClientOptions co;
+    RUdpClientOptions co;
     co.connection.high_water_mark = 8 * 1024 * 1024; // 测试线程一口气塞 ~450KB：句柄侧判水位、不能 flush
     auto c = env.Connected(cli, std::move(co));
     std::vector<std::string> want;
@@ -144,12 +144,12 @@ void TestPeerInfo()
 // 大消息：分成多段、收齐才交付一次；最大的一条（max_message_size）也能回显。
 void TestLargeMessages()
 {
-    RudpServerOptions so;
+    RUdpServerOptions so;
     so.rudp.max_message_size = 120000;
     Env env(std::move(so));
     EchoBack(env.srv);
     EventRecorder cli;
-    RudpClientOptions co;
+    RUdpClientOptions co;
     co.rudp.max_message_size = 120000;
     auto c = env.Connected(cli, std::move(co));
     std::string big(120000, '\0');
@@ -207,11 +207,11 @@ void TestBidirectionalBulk()
 // 多个客户端并发：按来源分得开，各自的回显只回给各自，顺序不乱。
 void TestManyClients()
 {
-    Env env(RudpServerOptions{}, EventLoopGroupOptions{3, 512});
+    Env env(RUdpServerOptions{}, EventLoopGroupOptions{3, 512});
     EchoBack(env.srv);
     constexpr int kClients = 40, kMsgs = 50;
     std::vector<std::unique_ptr<EventRecorder>> recs;
-    std::vector<std::unique_ptr<RudpClient>> clients;
+    std::vector<std::unique_ptr<RUdpClient>> clients;
     for (int i = 0; i < kClients; ++i)
     {
         recs.push_back(std::make_unique<EventRecorder>());
@@ -236,7 +236,7 @@ void TestManyClients()
     CHECK(env.stats().accepted == kClients && env.stats().connected == kClients);
 }
 
-// 多个线程同时经 RudpClient::Send（句柄）发：每个线程自己的消息保持顺序，总数不少。
+// 多个线程同时经 RUdpClient::Send（句柄）发：每个线程自己的消息保持顺序，总数不少。
 void TestSendFromManyThreads()
 {
     Env env;
@@ -273,14 +273,14 @@ void TestSendFromManyThreads()
 // 慢消费者判定，不是本用例要测的。
 void LossyRoundTrip(int loss_pct, int n)
 {
-    RudpServerOptions so;
+    RUdpServerOptions so;
     so.connection.high_water_mark = 8 * 1024 * 1024;
     Env env(std::move(so));
     EchoBack(env.srv);
     UdpProxy proxy(env.server->endpoint());
     proxy.SetRules({.loss_up_pct = loss_pct, .loss_down_pct = loss_pct, .dup_pct = 3, .reorder_pct = 8});
     EventRecorder cli;
-    RudpClientOptions co;
+    RUdpClientOptions co;
     co.connection.high_water_mark = 8 * 1024 * 1024;
     auto c = env.Client(cli, std::move(co), &proxy.endpoint());
     CHECK(c->Start() == 0);
@@ -325,7 +325,7 @@ void TestBlackholeRecovery()
     Env env;
     UdpProxy proxy(env.server->endpoint());
     EventRecorder cli;
-    auto c = env.Connected(cli, RudpClientOptions{}, &proxy.endpoint());
+    auto c = env.Connected(cli, RUdpClientOptions{}, &proxy.endpoint());
     proxy.SetRules({.blackhole = true});
     for (int i = 0; i < 50; ++i)
         CHECK(c->Send(Buf(Numbered(i))) == SendResult::Ok);
@@ -342,11 +342,11 @@ void TestBlackholeRecovery()
 // 服务端没有未确认的数据，靠 idle_timeout 关闭。
 void TestDeadLinkClosesBothSides()
 {
-    RudpServerOptions so;
+    RUdpServerOptions so;
     so.connection.idle_timeout = 1000ms;
     Env env(std::move(so));
     UdpProxy proxy(env.server->endpoint());
-    RudpClientOptions co;
+    RUdpClientOptions co;
     co.rudp.dead_link = 5;
     EventRecorder cli;
     auto c = env.Connected(cli, std::move(co), &proxy.endpoint());
@@ -397,7 +397,7 @@ void TestSlowConsumerHighWater()
     Env env;
     env.srv.on_message = [](Connection& c, std::string_view) { c.PauseRead(); }; // 收到第一条就不再读
     EventRecorder cli;
-    RudpClientOptions co;
+    RUdpClientOptions co;
     co.connection.high_water_mark = 64 * 1024;
     auto c = env.Connected(cli, std::move(co));
     const std::string chunk(4096, 'z');
@@ -417,12 +417,12 @@ void TestSlowConsumerHighWater()
 // 恢复之后重新计时，对端仍不吭声才以 IdleTimeout 关闭。
 void TestPausedSessionIsNotIdleClosed()
 {
-    RudpServerOptions so;
+    RUdpServerOptions so;
     so.connection.idle_timeout = 600ms;
     Env env(std::move(so));
     env.srv.on_message = [](Connection& c, std::string_view) { c.PauseRead(); };
     EventRecorder cli;
-    RudpClientOptions co;
+    RUdpClientOptions co;
     co.ping_interval = 0ms; // 不发心跳：对端静默
     auto c = env.Connected(cli, std::move(co));
     CHECK(c->Send(Buf("pause me")) == SendResult::Ok);
@@ -464,7 +464,7 @@ void TestGracefulCloseTimesOut()
     Env env;
     UdpProxy proxy(env.server->endpoint());
     EventRecorder cli;
-    auto c = env.Connected(cli, RudpClientOptions{}, &proxy.endpoint());
+    auto c = env.Connected(cli, RUdpClientOptions{}, &proxy.endpoint());
     proxy.SetRules({.blackhole = true});
     CHECK(c->Send(Buf("never acked")) == SendResult::Ok);
     std::this_thread::sleep_for(100ms);
@@ -520,13 +520,13 @@ void TestSendAfterClose()
 // 服务端开了 idle_timeout：定期发心跳的客户端不会被关；不发心跳的被以 IdleTimeout 关闭，客户端收到 Close。
 void TestIdleTimeoutAndHeartbeat()
 {
-    RudpServerOptions so;
+    RUdpServerOptions so;
     so.connection.idle_timeout = 700ms;
     Env env(std::move(so));
     EventRecorder alive_rec, quiet_rec;
-    RudpClientOptions alive_o;
+    RUdpClientOptions alive_o;
     alive_o.ping_interval = 100ms;
-    RudpClientOptions quiet_o;
+    RUdpClientOptions quiet_o;
     quiet_o.ping_interval = 0ms;
     auto alive = env.Connected(alive_rec, std::move(alive_o));
     auto quiet = env.Connected(quiet_rec, std::move(quiet_o));
@@ -549,7 +549,7 @@ void TestReconnectWithNewTicket()
     auto c = env.Client(cli);
     CHECK(c->Start() == 0);
     const ConnectionHandle h1 = cli.WaitConnected(0);
-    const RudpTicket old = *env.server->IssueTicket(30s); // 另一张，留着
+    const RUdpTicket old = *env.server->IssueTicket(30s); // 另一张，留着
     env.srv.WaitConnected(0).Close();
     cli.WaitClosed(0);
     CHECK(c->handle() == ConnectionHandle{});
@@ -571,7 +571,7 @@ void TestUsedTicketIsRejected()
     Env env;
     std::atomic<int> err{0};
     EventRecorder cli;
-    RudpClientOptions co;
+    RUdpClientOptions co;
     co.on_connect_failed = [&](int e, bool) noexcept { err = e; };
     auto c = env.Client(cli, std::move(co));
     CHECK(c->Start() == 0);
@@ -592,13 +592,13 @@ void TestServerRestartFailsFast()
     UdpProxy proxy(env.server->endpoint());
     const std::uint16_t port = env.server->endpoint().port();
     EventRecorder cli;
-    RudpClientOptions co;
+    RUdpClientOptions co;
     co.ping_interval = 100ms;
     auto c = env.Connected(cli, std::move(co), &proxy.endpoint());
     proxy.SetRules({.blackhole = true}); // 旧服务端关闭时发的 Close 被吞掉，客户端不知道
     env.server.reset();
     EventRecorder dummy;
-    env.server = std::make_unique<RudpServer>(env.group, RudpLoopback(port), RudpServerOptions{}, dummy);
+    env.server = std::make_unique<RUdpServer>(env.group, RUdpLoopback(port), RUdpServerOptions{}, dummy);
     CHECK(env.server->Start() == 0);
     CHECK(cli.closed_count() == 0);
     proxy.SetRules({});
@@ -617,15 +617,15 @@ void TestShutdownWithLiveTraffic()
         CHECK(group.Start() == 0);
         EventRecorder srv, cli;
         srv.on_message = [](Connection& c, std::string_view sv) { Echo(c, sv); };
-        RudpServer server(group, RudpLoopback(), RudpServerOptions{}, srv);
+        RUdpServer server(group, RUdpLoopback(), RUdpServerOptions{}, srv);
         CHECK(server.Start() == 0);
-        std::vector<std::unique_ptr<RudpClient>> clients;
+        std::vector<std::unique_ptr<RUdpClient>> clients;
         for (int i = 0; i < 8; ++i)
         {
-            RudpClientOptions o;
+            RUdpClientOptions o;
             o.ticket = *server.IssueTicket(30s);
             clients.push_back(
-                std::make_unique<RudpClient>(group, *RudpEndpoint::From(server.endpoint()), std::move(o), cli));
+                std::make_unique<RUdpClient>(group, *RUdpEndpoint::From(server.endpoint()), std::move(o), cli));
             CHECK(clients.back()->Start() == 0);
         }
         for (int i = 0; i < 8; ++i)
@@ -656,13 +656,13 @@ void TestShutdownWithLiveTraffic()
 // 长连接始终可用，最后服务端只剩长连接的会话。
 void TestSessionChurn()
 {
-    RudpServerOptions so;
+    RUdpServerOptions so;
     so.connection.idle_timeout = 700ms; // 长连接靠心跳活过它；万一哪个短连接没被正常关掉，它也会兜底清走
     Env env(std::move(so), EventLoopGroupOptions{3, 1024});
     EchoBack(env.srv);
 
     EventRecorder keep_rec;
-    RudpClientOptions keep_o;
+    RUdpClientOptions keep_o;
     keep_o.ping_interval = 100ms; // 长连接靠心跳活过服务端的空闲超时
     auto keeper = env.Connected(keep_rec, std::move(keep_o));
 
@@ -677,7 +677,7 @@ void TestSessionChurn()
                 for (int i = 0; i < kPer; ++i)
                 {
                     EventRecorder rec;
-                    RudpClientOptions o;
+                    RUdpClientOptions o;
                     auto c = env.Client(rec, std::move(o));
                     CHECK(c->Start() == 0);
                     rec.WaitConnected(0);
@@ -734,13 +734,13 @@ void TestSharesGroupWithTcp()
     LengthPrefixCodecFactory factory(1 << 20);
     TcpServer tcp(group, *TcpEndpoint::Make("127.0.0.1", 0), TcpServerOptions{}, tcp_srv, factory);
     CHECK(tcp.Start() == 0);
-    RudpServer rudp(group, RudpLoopback(), RudpServerOptions{}, rudp_srv);
+    RUdpServer rudp(group, RUdpLoopback(), RUdpServerOptions{}, rudp_srv);
     CHECK(rudp.Start() == 0);
 
     TestClient tc(tcp.endpoint());
-    RudpClientOptions o;
+    RUdpClientOptions o;
     o.ticket = *rudp.IssueTicket(30s);
-    RudpClient rc(group, *RudpEndpoint::From(rudp.endpoint()), std::move(o), rudp_cli);
+    RUdpClient rc(group, *RUdpEndpoint::From(rudp.endpoint()), std::move(o), rudp_cli);
     CHECK(rc.Start() == 0);
     rudp_cli.WaitConnected(0);
 
@@ -785,7 +785,7 @@ void TestFlushOnSendLatency()
     {
         std::mutex mu; // 回调引用的状态放在 env 之前：env 析构时回调可能还在跑
         std::vector<std::chrono::steady_clock::duration> lat;
-        RudpServerOptions so;
+        RUdpServerOptions so;
         so.rudp.interval_ms = 100;
         Env env(std::move(so));
         env.srv.on_message = [&](Connection&, std::string_view sv)
@@ -796,7 +796,7 @@ void TestFlushOnSendLatency()
             lat.push_back(std::chrono::steady_clock::now() - sent);
         };
         EventRecorder cli;
-        RudpClientOptions co;
+        RUdpClientOptions co;
         co.rudp.interval_ms = 100;
         co.rudp.flush_on_send = flush;
         auto c = env.Connected(cli, std::move(co));
@@ -826,7 +826,7 @@ void TestPendingBytesAccounting()
     Env env;
     UdpProxy proxy(env.server->endpoint());
     EventRecorder cli;
-    RudpClientOptions co;
+    RUdpClientOptions co;
     co.rudp.send_window = 4;
     auto c = env.Connected(cli, std::move(co), &proxy.endpoint());
     const ConnectionHandle h = c->handle();
@@ -846,7 +846,7 @@ void TestPendingBytesAccounting()
 // 水位 32KB）。握手时对端的窗口按 KCP 的初始值 128 段算，所以 22KB 留在队列里，没越过水位；客户端照常收齐，两边都不关。
 void TestBurstWithinWindowIsNotSlowConsumer()
 {
-    RudpServerOptions so;
+    RUdpServerOptions so;
     so.connection.high_water_mark = 32 * 1024;
     Env env(std::move(so));
     env.srv.on_connected = [](Connection& c)

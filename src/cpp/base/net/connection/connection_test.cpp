@@ -1,6 +1,6 @@
 // Connection 接口：没有数据成员（守住 StreamConnection 的热字段布局）、能被与流无关的实现填满、
 // 业务回调只经接口就能工作。
-// 假连接代表将来的 RudpConnection：没有 fd、不经 epoll。
+// 假连接代表将来的 RUdpConnection：没有 fd、不经 epoll。
 // 无测试框架依赖：失败即 abort。
 
 #include "connection.h"
@@ -180,7 +180,7 @@ void TestHandle()
     CHECK(!b.handle().valid() && b.handle().raw() == 0); // 没有句柄：无效句柄
 }
 
-// 与流无关的服务端 / 客户端：NetModule 与业务只认 NetServer / NetClient，将来的 RudpServer / RudpClient 就是这个角色。
+// 与流无关的服务端 / 客户端：NetModule 与业务只认 NetServer / NetClient，将来的 RUdpServer / RUdpClient 就是这个角色。
 class FakeServer final : public NetServer
 {
 public:

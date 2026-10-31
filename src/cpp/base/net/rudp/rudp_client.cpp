@@ -35,13 +35,13 @@ int ErrnoFor(std::uint8_t reason) noexcept
     return ECONNREFUSED; // 不认识的原因码
 }
 
-static_assert(std::is_same_v<decltype(RudpTicket::token), rudp::Token>);
+static_assert(std::is_same_v<decltype(RUdpTicket::token), rudp::Token>);
 
 } // namespace
 
 // 状态：Idle → Handshaking → Connected → Closing → Idle。Closing 是 Stop 关掉了连接、但它的 OnClosed 还没回调的间隙：
 // 这期间 Start 要等 OnClosed 之后再开始，否则旧连接的收尾会拆掉新连接的 socket 与定时器。
-struct RudpClient::Impl final : DatagramHandler, RudpConnection::Owner, ConnectionHandler
+struct RUdpClient::Impl final : DatagramHandler, RUdpConnection::Owner, ConnectionHandler
 {
     enum class State : std::uint8_t
     {
@@ -51,7 +51,7 @@ struct RudpClient::Impl final : DatagramHandler, RudpConnection::Owner, Connecti
         Closing,
     };
 
-    Impl(EventLoopGroup& g, Endpoint ep, RudpClientOptions o, ConnectionHandler& h, std::atomic<std::uint64_t>& hd)
+    Impl(EventLoopGroup& g, Endpoint ep, RUdpClientOptions o, ConnectionHandler& h, std::atomic<std::uint64_t>& hd)
         : group(g)
         , server(std::move(ep))
         , options(std::move(o))
@@ -63,20 +63,20 @@ struct RudpClient::Impl final : DatagramHandler, RudpConnection::Owner, Connecti
 
     EventLoopGroup& group;
     Endpoint server;
-    RudpClientOptions options;
+    RUdpClientOptions options;
     ConnectionHandler& handler;
     std::atomic<std::uint64_t>& handle;
 
     std::mutex ticket_mu; // SetTicket（任意线程）与 Start（读）
-    RudpTicket ticket;
+    RUdpTicket ticket;
 
     EventLoop* loop = nullptr; // 第一次 Start 时选定，此后固定
 
     // 以下只在 loop 线程访问。
     State state = State::Idle;
     std::unique_ptr<UdpSocket> socket; // 关闭后对象留着（可能就在它的 OnDatagram 里），下次 Start 时才销毁
-    RudpConnection* conn = nullptr;
-    RudpTicket active; // 本次握手用的
+    RUdpConnection* conn = nullptr;
+    RUdpTicket active; // 本次握手用的
     int last_error = 0;
     EventLoop::TimerId hello_timer = 0;
     EventLoop::TimerId deadline_timer = 0;
@@ -85,11 +85,11 @@ struct RudpClient::Impl final : DatagramHandler, RudpConnection::Owner, Connecti
     EventLoop::HookId hook = 0;
     bool shutting_down = false; // 停机或析构：不再开始新的握手
     bool restart_pending = false;
-    RudpTicket restart_ticket;
+    RUdpTicket restart_ticket;
     // 连接建立到它的 OnClosed 回调完成：析构要等它变回 false（回调里还在用 Impl）。
     std::atomic<bool> awaiting_closed{false};
 
-    void StartOnLoop(const RudpTicket& t);
+    void StartOnLoop(const RUdpTicket& t);
     void StopOnLoop();
     void FailHandshake(int err);
     void CancelHandshakeTimers();
@@ -109,14 +109,14 @@ struct RudpClient::Impl final : DatagramHandler, RudpConnection::Owner, Connecti
         if (state == State::Handshaking)
             last_error = err; // 握手期间记下来，超时时报告；连通之后的 ICMP 错误不关会话
     }
-    // RudpConnection::Owner
-    void OnConnectionDetached(RudpConnection& c) noexcept override
+    // RUdpConnection::Owner
+    void OnConnectionDetached(RUdpConnection& c) noexcept override
     {
         if (conn == &c)
             conn = nullptr; // Tick / 心跳不再碰它
     }
     // 客户端只有一条会话，定时器一直在跑，不需要活跃表。
-    void OnConnectionWake(RudpConnection&) noexcept override {}
+    void OnConnectionWake(RUdpConnection&) noexcept override {}
     // ConnectionHandler：转发给业务，OnClosed 时先收尾
     void OnConnected(Connection& c) noexcept override { handler.OnConnected(c); }
     void OnMessage(Connection& c, std::span<const std::byte> payload) noexcept override
@@ -128,7 +128,7 @@ struct RudpClient::Impl final : DatagramHandler, RudpConnection::Owner, Connecti
 
 // ---- 握手 ----
 
-void RudpClient::Impl::StartOnLoop(const RudpTicket& t)
+void RUdpClient::Impl::StartOnLoop(const RUdpTicket& t)
 {
     if (shutting_down)
         return;
@@ -139,7 +139,7 @@ void RudpClient::Impl::StartOnLoop(const RudpTicket& t)
         return;
     }
     if (state != State::Idle)
-        LOG_FATAL("RudpClient::Start 在 Running 状态下重复调用 server={}", server.ToString());
+        LOG_FATAL("RUdpClient::Start 在 Running 状态下重复调用 server={}", server.ToString());
     active = t;
     last_error = 0;
     socket.reset();
@@ -165,7 +165,7 @@ void RudpClient::Impl::StartOnLoop(const RudpTicket& t)
                                     });
 }
 
-void RudpClient::Impl::SendHello()
+void RUdpClient::Impl::SendHello()
 {
     const rudp::Control c = rudp::EncodeHello(active.conv, active.token);
     if (const int e = socket->Send({}, c.view(), nullptr, 0); e != 0)
@@ -174,14 +174,14 @@ void RudpClient::Impl::SendHello()
 
 // 放弃握手时告诉服务端：Accept 可能只是丢了或来晚了，服务端那边其实已经建好会话；不通知，
 // 它就只能等空闲超时才回收（默认不开）。尽力而为，发一个；服务端没有这个会话时会当成陌生来源忽略。
-void RudpClient::Impl::SendAbort()
+void RUdpClient::Impl::SendAbort()
 {
     if (socket && socket->open())
         (void)socket->Send(
             {}, rudp::EncodeClose(active.conv, static_cast<std::uint8_t>(CloseReason::LocalClose)).view(), nullptr, 0);
 }
 
-void RudpClient::Impl::OnHelloTimer()
+void RUdpClient::Impl::OnHelloTimer()
 {
     if (state != State::Handshaking)
         return;
@@ -194,7 +194,7 @@ void RudpClient::Impl::OnHelloTimer()
                                  });
 }
 
-void RudpClient::Impl::CancelHandshakeTimers()
+void RUdpClient::Impl::CancelHandshakeTimers()
 {
     if (hello_timer != 0)
         loop->Cancel(hello_timer);
@@ -205,7 +205,7 @@ void RudpClient::Impl::CancelHandshakeTimers()
 
 // 握手失败：关 socket、回到 Idle，再回调（回调里直接 Start() 是合法的：它只是投递）。
 // 可能就在 socket 的 OnDatagram 里被调用，所以只关 fd，不销毁对象。
-void RudpClient::Impl::FailHandshake(int err)
+void RUdpClient::Impl::FailHandshake(int err)
 {
     CancelHandshakeTimers();
     if (socket)
@@ -216,7 +216,7 @@ void RudpClient::Impl::FailHandshake(int err)
         options.on_connect_failed(err, false);
 }
 
-void RudpClient::Impl::OnDatagram(const sockaddr_storage&, socklen_t, std::span<const std::byte> data)
+void RUdpClient::Impl::OnDatagram(const sockaddr_storage&, socklen_t, std::span<const std::byte> data)
 {
     LoopStats& st = loop->stats();
     const auto packet = rudp::Parse(data);
@@ -246,7 +246,7 @@ void RudpClient::Impl::OnDatagram(const sockaddr_storage&, socklen_t, std::span<
     conn->OnPacket(*packet);
 }
 
-void RudpClient::Impl::OnAccepted()
+void RUdpClient::Impl::OnAccepted()
 {
     CancelHandshakeTimers();
     if (!loop->table().TryReserve())
@@ -256,7 +256,7 @@ void RudpClient::Impl::OnAccepted()
     }
     PeerInfo info;
     info.endpoint = server;
-    RudpConnection* c = RudpConnection::Create(
+    RUdpConnection* c = RUdpConnection::Create(
         *loop, *socket, nullptr, 0, active.conv, std::move(info), *this, *this, options.connection, options.rudp);
     if (c == nullptr)
     {
@@ -267,7 +267,7 @@ void RudpClient::Impl::OnAccepted()
     conn = c;
     state = State::Connected;
     awaiting_closed.store(true, std::memory_order_release);
-    // 句柄先于 OnConnected 发布：OnConnected 里就能经 RudpClient::Send 发数据。
+    // 句柄先于 OnConnected 发布：OnConnected 里就能经 RUdpClient::Send 发数据。
     handle.store(c->handle().raw(), std::memory_order_release);
     ArmTick();
     ArmPing();
@@ -277,7 +277,7 @@ void RudpClient::Impl::OnAccepted()
 
 // ---- 连通之后：定时推进与心跳 ----
 
-void RudpClient::Impl::ArmTick()
+void RUdpClient::Impl::ArmTick()
 {
     tick_timer = loop->RunAfter(std::chrono::milliseconds(options.rudp.interval_ms),
                                 [this]
@@ -290,7 +290,7 @@ void RudpClient::Impl::ArmTick()
                                 });
 }
 
-void RudpClient::Impl::ArmPing()
+void RUdpClient::Impl::ArmPing()
 {
     if (options.ping_interval.count() <= 0)
         return;
@@ -305,7 +305,7 @@ void RudpClient::Impl::ArmPing()
                                 });
 }
 
-void RudpClient::Impl::CancelRunTimers()
+void RUdpClient::Impl::CancelRunTimers()
 {
     if (tick_timer != 0)
         loop->Cancel(tick_timer);
@@ -316,7 +316,7 @@ void RudpClient::Impl::CancelRunTimers()
 
 // ---- 连接结束（NotifyClosed 里经转发器到这里）----
 
-void RudpClient::Impl::HandleClosed(Connection& c, CloseReason reason, int err)
+void RUdpClient::Impl::HandleClosed(Connection& c, CloseReason reason, int err)
 {
     handle.store(0, std::memory_order_release); // 先清句柄：回调里的 Send 得到 Closed
     conn = nullptr;
@@ -330,15 +330,15 @@ void RudpClient::Impl::HandleClosed(Connection& c, CloseReason reason, int err)
     {
         // 不在这里直接开始：旧连接的槽要到本轮回收才释放，连接表恰好满时 TryReserve 会误失败。
         // 定时器下一轮才触发，那时槽已经回收。
-        const RudpTicket t = restart_ticket;
+        const RUdpTicket t = restart_ticket;
         loop->RunAfter(std::chrono::milliseconds::zero(), [this, t] { StartOnLoop(t); });
     }
-    // 清标志必须是这里最后一步：RudpClient 的析构等的就是它，清了之后 Impl 随时可能被销毁；
+    // 清标志必须是这里最后一步：RUdpClient 的析构等的就是它，清了之后 Impl 随时可能被销毁；
     // 也必须在用户的 OnClosed 返回之后，否则析构会和还在执行的用户回调赛跑。
     awaiting_closed.store(false, std::memory_order_release);
 }
 
-void RudpClient::Impl::StopOnLoop()
+void RUdpClient::Impl::StopOnLoop()
 {
     restart_pending = false;
     switch (state)
@@ -354,7 +354,7 @@ void RudpClient::Impl::StopOnLoop()
             state = State::Idle; // 自己叫停的，不回调 on_connect_failed
             return;
         case State::Connected:
-            handle.store(0, std::memory_order_release); // 先清句柄：之后 RudpClient::Send 得到 Closed
+            handle.store(0, std::memory_order_release); // 先清句柄：之后 RUdpClient::Send 得到 Closed
             state = State::Closing;
             if (conn != nullptr)
                 conn->Close(); // 它的 OnClosed 随后回调，那时才回到 Idle
@@ -364,16 +364,16 @@ void RudpClient::Impl::StopOnLoop()
 
 // ---- 对外 ----
 
-RudpClient::RudpClient(EventLoopGroup& group,
-                       const RudpEndpoint& server,
-                       RudpClientOptions options,
+RUdpClient::RUdpClient(EventLoopGroup& group,
+                       const RUdpEndpoint& server,
+                       RUdpClientOptions options,
                        ConnectionHandler& handler)
     : server_(server.endpoint())
     , impl_(std::make_unique<Impl>(group, server.endpoint(), std::move(options), handler, handle_))
 {
 }
 
-RudpClient::~RudpClient()
+RUdpClient::~RUdpClient()
 {
     Impl& m = *impl_;
     if (m.loop == nullptr || !m.group.running())
@@ -396,7 +396,7 @@ RudpClient::~RudpClient()
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
 }
 
-int RudpClient::Start()
+int RUdpClient::Start()
 {
     Impl& m = *impl_;
     if (!m.group.running())
@@ -404,9 +404,9 @@ int RudpClient::Start()
         // 回调里 Start()（文档允许）可能恰好撞上停机：返回 ESHUTDOWN，不是编程错误。
         if (m.group.stopping())
             return ESHUTDOWN;
-        LOG_FATAL("RudpClient::Start 之前必须已 EventLoopGroup::Start() 成功 server={}", server_.ToString());
+        LOG_FATAL("RUdpClient::Start 之前必须已 EventLoopGroup::Start() 成功 server={}", server_.ToString());
     }
-    RudpTicket t;
+    RUdpTicket t;
     {
         const std::lock_guard lk(m.ticket_mu);
         t = m.ticket;
@@ -419,7 +419,7 @@ int RudpClient::Start()
     m.loop->Post(
         [&m, t]
         {
-            if (m.hook == 0) // 停机时 loop 自己放弃握手、不再重开：group 不认识 RudpClient，只认钩子
+            if (m.hook == 0) // 停机时 loop 自己放弃握手、不再重开：group 不认识 RUdpClient，只认钩子
             {
                 m.hook = m.loop->AddShutdownHook(
                     [&m]
@@ -434,7 +434,7 @@ int RudpClient::Start()
     return 0;
 }
 
-void RudpClient::Stop()
+void RUdpClient::Stop()
 {
     Impl& m = *impl_;
     if (m.loop == nullptr)
@@ -442,13 +442,13 @@ void RudpClient::Stop()
     m.loop->Post([&m] { m.StopOnLoop(); });
 }
 
-void RudpClient::SetTicket(const RudpTicket& ticket)
+void RUdpClient::SetTicket(const RUdpTicket& ticket)
 {
     const std::lock_guard lk(impl_->ticket_mu);
     impl_->ticket = ticket;
 }
 
-SendResult RudpClient::Send(SharedBuffer payload)
+SendResult RUdpClient::Send(SharedBuffer payload)
 {
     const ConnectionHandle h = handle();
     if (!h.valid())
@@ -456,6 +456,6 @@ SendResult RudpClient::Send(SharedBuffer payload)
     return h.Send(std::move(payload));
 }
 
-RudpEndpoint RudpClient::server() const { return *RudpEndpoint::From(server_); }
+RUdpEndpoint RUdpClient::server() const { return *RUdpEndpoint::From(server_); }
 
 } // namespace breeze

@@ -1,4 +1,4 @@
-// 服务端的传输无关接口：StreamServer（TCP / UDS，经 TcpServer / UdsServer）与将来的 RudpServer 都实现它。
+// 服务端的传输无关接口：StreamServer（TCP / UDS，经 TcpServer / UdsServer）与将来的 RUdpServer 都实现它。
 // NetModule 经它持有各种服务端，业务代码需要"某个服务端的统一句柄"时也用它；要类型化的端点与选项，直接用具体类。
 // 设计见 docs/网络库设计.md §4.1 / §4.13。
 

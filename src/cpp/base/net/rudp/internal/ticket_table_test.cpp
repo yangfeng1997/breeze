@@ -30,9 +30,9 @@ namespace
 
 const Clock::time_point t0 = Clock::time_point{} + 1000s;
 
-RudpTicket MakeTicket(std::uint32_t conv, int fill)
+RUdpTicket MakeTicket(std::uint32_t conv, int fill)
 {
-    RudpTicket t;
+    RUdpTicket t;
     t.conv = conv;
     t.token.fill(static_cast<std::byte>(fill));
     return t;
@@ -70,7 +70,7 @@ void TestIssueIsRandom()
 void TestSingleUse()
 {
     TicketTable tbl(10);
-    const RudpTicket t = MakeTicket(5, 0xAB);
+    const RUdpTicket t = MakeTicket(5, 0xAB);
     CHECK(tbl.Add(t, 10s, t0));
     CHECK(tbl.Consume(t.conv, t.token, t0));
     CHECK(!tbl.Consume(t.conv, t.token, t0));
@@ -80,9 +80,9 @@ void TestSingleUse()
 void TestWrongTokenDoesNotBurn()
 {
     TicketTable tbl(10);
-    const RudpTicket t = MakeTicket(5, 0xAB);
+    const RUdpTicket t = MakeTicket(5, 0xAB);
     CHECK(tbl.Add(t, 10s, t0));
-    RudpTicket forged = t;
+    RUdpTicket forged = t;
     forged.token[15] ^= std::byte{1}; // 只差最后一个字节
     CHECK(!tbl.Consume(forged.conv, forged.token, t0));
     forged = t;
@@ -104,7 +104,7 @@ void TestUnknownConv()
 void TestExpiry()
 {
     TicketTable tbl(10);
-    const RudpTicket t = MakeTicket(5, 1);
+    const RUdpTicket t = MakeTicket(5, 1);
     CHECK(tbl.Add(t, 10s, t0));
     CHECK(!tbl.Consume(t.conv, t.token, t0 + 10s)); // 正好到期
     CHECK(tbl.size() == 0);                         // 顺手删了
@@ -130,8 +130,8 @@ void TestAddValidation()
 void TestConvConflict()
 {
     TicketTable tbl(10);
-    const RudpTicket a = MakeTicket(5, 1);
-    const RudpTicket b = MakeTicket(5, 2);
+    const RUdpTicket a = MakeTicket(5, 1);
+    const RUdpTicket b = MakeTicket(5, 2);
     CHECK(tbl.Add(a, 10s, t0));
     CHECK(!tbl.Add(b, 10s, t0 + 1s));
     CHECK(tbl.Consume(a.conv, a.token, t0 + 2s)); // a 没被覆盖
@@ -146,8 +146,8 @@ void TestConvConflict()
 void TestConvConflictBoundary()
 {
     TicketTable tbl(10);
-    const RudpTicket a = MakeTicket(5, 1);
-    const RudpTicket b = MakeTicket(5, 2);
+    const RUdpTicket a = MakeTicket(5, 1);
+    const RUdpTicket b = MakeTicket(5, 2);
     CHECK(tbl.Add(a, 500ms, t0));
     CHECK(!tbl.Add(b, 10s, t0 + 499ms)); // 还差 1ms：冲突
     CHECK(tbl.Add(b, 10s, t0 + 500ms));  // 正好到期：可以顶掉
@@ -205,7 +205,7 @@ void TestConcurrent()
     constexpr int kTotal = kPerIssuer * kIssuers;
 
     std::mutex mu;
-    std::vector<RudpTicket> handoff;
+    std::vector<RUdpTicket> handoff;
     std::atomic<int> issued{0};
     std::atomic<int> consumed{0};
 
@@ -234,7 +234,7 @@ void TestConcurrent()
             {
                 for (;;)
                 {
-                    RudpTicket t;
+                    RUdpTicket t;
                     bool got = false;
                     {
                         const std::lock_guard lk(mu);

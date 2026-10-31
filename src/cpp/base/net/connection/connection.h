@@ -1,6 +1,6 @@
 // 一条已建立的连接（接口）：业务回调（ConnectionHandler）里拿到的就是它。设计见 docs/网络库设计.md §4.4。
 //
-// 具体类：StreamConnection（TCP / UDS，内部类型）；将来 RudpConnection。业务代码只认这个接口，不关心底下是什么传输。
+// 具体类：StreamConnection（TCP / UDS，内部类型）；将来 RUdpConnection。业务代码只认这个接口，不关心底下是什么传输。
 // 只能在所属 EventLoop 的 IO 线程上使用（回调里拿到的 Connection& 即是）；跨线程用 ConnectionHandle。
 //
 // **只有虚函数、没有数据成员**：具体类里热字段的布局是按缓存行排过的（见 stream_connection.h），基类带数据会让它们

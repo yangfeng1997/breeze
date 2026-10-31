@@ -43,13 +43,13 @@ public:
     // 服务端：bind 到 local。成功时 out 有值，失败返回 errno（out 不变）。
     [[nodiscard]] static int OpenServer(EventLoop& loop,
                                         const Endpoint& local,
-                                        const RudpOptions& options,
+                                        const RUdpOptions& options,
                                         DatagramHandler& handler,
                                         std::unique_ptr<UdpSocket>& out);
     // 客户端：connect 到 peer（UDP 的 connect 只设默认对端，立即返回）。
     [[nodiscard]] static int OpenClient(EventLoop& loop,
                                         const Endpoint& peer,
-                                        const RudpOptions& options,
+                                        const RUdpOptions& options,
                                         DatagramHandler& handler,
                                         std::unique_ptr<UdpSocket>& out);
 
@@ -85,7 +85,7 @@ private:
     static int Open(EventLoop& loop,
                     const Endpoint& ep,
                     bool server,
-                    const RudpOptions& options,
+                    const RUdpOptions& options,
                     DatagramHandler& handler,
                     std::unique_ptr<UdpSocket>& out);
 

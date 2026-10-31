@@ -104,13 +104,13 @@ Result<NetServer*> NetModule::AddServer(std::string_view endpoint,
             std::format(
                 "net: 监听端点 '{}' 不合法（tcp://ip:port | udp://ip:port | unix:///path | unix-abstract://name）",
                 endpoint));
-    if (const auto udp = RudpEndpoint::From(*ep))
+    if (const auto udp = RUdpEndpoint::From(*ep))
     {
-        RudpServerOptions o;
+        RUdpServerOptions o;
         o.connection = options.connection;
         o.rudp = options_.rudp;
         o.accept_filter = std::move(options.accept_filter);
-        auto s = AddRudpServer(*udp, handler, std::move(o));
+        auto s = AddRUdpServer(*udp, handler, std::move(o));
         if (!s)
             return std::unexpected(s.error());
         return static_cast<NetServer*>(*s); // factory 与 options.tcp / backlog 对 rudp 没有意义，丢掉
@@ -166,9 +166,9 @@ Result<NetClient*> NetModule::AddClient(std::string_view endpoint,
             std::format(
                 "net: 对端端点 '{}' 不合法（tcp://ip:port | udp://ip:port | unix:///path | unix-abstract://name）",
                 endpoint));
-    if (RudpEndpoint::From(*ep))
+    if (RUdpEndpoint::From(*ep))
         return Fail(Errc::Module,
-                    std::format("net: 对端端点 '{}' 是 rudp（udp）：客户端要凭控制面发的票据握手，请用 AddRudpClient",
+                    std::format("net: 对端端点 '{}' 是 rudp（udp）：客户端要凭控制面发的票据握手，请用 AddRUdpClient",
                                 endpoint));
     const auto tcp = TcpEndpoint::From(*ep);
     const auto uds = tcp ? std::optional<UdsEndpoint>{} : UdsEndpoint::From(*ep);
@@ -196,50 +196,50 @@ Result<NetClient*> NetModule::AddClient(std::string_view endpoint,
     return clients_.back().get();
 }
 
-Result<RudpServer*> NetModule::AddRudpServer(const RudpEndpoint& endpoint, MainLoopHandler& handler)
+Result<RUdpServer*> NetModule::AddRUdpServer(const RUdpEndpoint& endpoint, MainLoopHandler& handler)
 {
-    RudpServerOptions o;
+    RUdpServerOptions o;
     o.connection = options_.connection;
     o.rudp = options_.rudp;
-    return AddRudpServer(endpoint, handler, std::move(o));
+    return AddRUdpServer(endpoint, handler, std::move(o));
 }
 
-Result<RudpServer*> NetModule::AddRudpServer(const RudpEndpoint& endpoint,
+Result<RUdpServer*> NetModule::AddRUdpServer(const RUdpEndpoint& endpoint,
                                              MainLoopHandler& handler,
-                                             RudpServerOptions options)
+                                             RUdpServerOptions options)
 {
-    if (auto r = CheckPhase("AddRudpServer"); !r)
+    if (auto r = CheckPhase("AddRUdpServer"); !r)
         return std::unexpected(r.error());
     if (!options.rudp.Valid())
         return Fail(Errc::Module,
-                    std::format("net: rudp 服务端 {} 的传输参数不合法（见 RudpOptions::Valid）", endpoint.ToString()));
+                    std::format("net: rudp 服务端 {} 的传输参数不合法（见 RUdpOptions::Valid）", endpoint.ToString()));
     ConnectionHandler& wrapped = executor_.Wrap(handler);
-    auto server = std::make_unique<RudpServer>(*group_, endpoint, std::move(options), wrapped);
-    RudpServer* raw = server.get();
+    auto server = std::make_unique<RUdpServer>(*group_, endpoint, std::move(options), wrapped);
+    RUdpServer* raw = server.get();
     servers_.push_back(std::move(server));
     return raw;
 }
 
-Result<RudpClient*> NetModule::AddRudpClient(const RudpEndpoint& server, MainLoopHandler& handler)
+Result<RUdpClient*> NetModule::AddRUdpClient(const RUdpEndpoint& server, MainLoopHandler& handler)
 {
-    RudpClientOptions o;
+    RUdpClientOptions o;
     o.connection = options_.connection;
     o.rudp = options_.rudp;
-    return AddRudpClient(server, handler, std::move(o));
+    return AddRUdpClient(server, handler, std::move(o));
 }
 
-Result<RudpClient*> NetModule::AddRudpClient(const RudpEndpoint& server,
+Result<RUdpClient*> NetModule::AddRUdpClient(const RUdpEndpoint& server,
                                              MainLoopHandler& handler,
-                                             RudpClientOptions options)
+                                             RUdpClientOptions options)
 {
-    if (auto r = CheckPhase("AddRudpClient"); !r)
+    if (auto r = CheckPhase("AddRUdpClient"); !r)
         return std::unexpected(r.error());
     if (!options.rudp.Valid())
         return Fail(Errc::Module,
-                    std::format("net: rudp 客户端 {} 的传输参数不合法（见 RudpOptions::Valid）", server.ToString()));
+                    std::format("net: rudp 客户端 {} 的传输参数不合法（见 RUdpOptions::Valid）", server.ToString()));
     ConnectionHandler& wrapped = executor_.Wrap(handler);
-    auto client = std::make_unique<RudpClient>(*group_, server, std::move(options), wrapped);
-    RudpClient* raw = client.get();
+    auto client = std::make_unique<RUdpClient>(*group_, server, std::move(options), wrapped);
+    RUdpClient* raw = client.get();
     rudp_clients_.push_back(std::move(client));
     return raw;
 }

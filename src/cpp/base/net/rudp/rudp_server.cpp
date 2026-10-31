@@ -91,9 +91,9 @@ static_assert(sizeof(AddrKey) == 20, "AddrKeyHash 假定 ip 数组之前是 4 �
 
 } // namespace
 
-struct RudpServer::Impl final : DatagramHandler, RudpConnection::Owner
+struct RUdpServer::Impl final : DatagramHandler, RUdpConnection::Owner
 {
-    Impl(EventLoopGroup& g, Endpoint ep, RudpServerOptions o, ConnectionHandler& h)
+    Impl(EventLoopGroup& g, Endpoint ep, RUdpServerOptions o, ConnectionHandler& h)
         : group(g)
         , endpoint(std::move(ep))
         , options(std::move(o))
@@ -105,13 +105,13 @@ struct RudpServer::Impl final : DatagramHandler, RudpConnection::Owner
 
     struct Session
     {
-        RudpConnection* conn;
+        RUdpConnection* conn;
         AddrKey key;
     };
 
     EventLoopGroup& group;
     Endpoint endpoint;
-    RudpServerOptions options;
+    RUdpServerOptions options;
     ConnectionHandler& handler;
     TicketTable tickets;
 
@@ -120,7 +120,7 @@ struct RudpServer::Impl final : DatagramHandler, RudpConnection::Owner
     std::unique_ptr<UdpSocket> socket;
     FlatHashMap<AddrKey, std::size_t, AddrKeyHash> by_addr; // → sessions 下标
     std::vector<Session> sessions;
-    std::vector<RudpConnection*> active; // 要 Tick 的会话（有事可做的），静止的不在里面；tick_index 是它在这里的下标
+    std::vector<RUdpConnection*> active; // 要 Tick 的会话（有事可做的），静止的不在里面；tick_index 是它在这里的下标
     EventLoop::TimerId tick_timer = 0;
     EventLoop::HookId hook = 0;
     bool accepting = false;
@@ -144,16 +144,16 @@ struct RudpServer::Impl final : DatagramHandler, RudpConnection::Owner
     void UnknownSource(const sockaddr_storage& src, socklen_t len, const rudp::Packet& p);
 
     void OnDatagram(const sockaddr_storage& src, socklen_t len, std::span<const std::byte> data) override;
-    void OnConnectionDetached(RudpConnection& conn) noexcept override;
-    void OnConnectionWake(RudpConnection& conn) noexcept override;
+    void OnConnectionDetached(RUdpConnection& conn) noexcept override;
+    void OnConnectionWake(RUdpConnection& conn) noexcept override;
 };
 
-int RudpServer::Impl::StartOnLoop()
+int RUdpServer::Impl::StartOnLoop()
 {
     if (const int e = UdpSocket::OpenServer(*loop, endpoint, options.rudp, *this, socket); e != 0)
         return e;
     accepting = true;
-    // 停机时 loop 自己停掉接受：group 不认识 RudpServer，只认钩子。socket 要留着：优雅关闭的会话还要收 ack、发 Close。
+    // 停机时 loop 自己停掉接受：group 不认识 RUdpServer，只认钩子。socket 要留着：优雅关闭的会话还要收 ack、发 Close。
     hook = loop->AddShutdownHook(
         [this]
         {
@@ -163,7 +163,7 @@ int RudpServer::Impl::StartOnLoop()
     return 0;
 }
 
-void RudpServer::Impl::StopAccepting()
+void RUdpServer::Impl::StopAccepting()
 {
     accepting = false;
     if (hook != 0)
@@ -175,13 +175,13 @@ void RudpServer::Impl::StopAccepting()
 }
 
 // 不再接受、且没有会话了：关 socket，端口随之释放。
-void RudpServer::Impl::MaybeCloseSocket()
+void RUdpServer::Impl::MaybeCloseSocket()
 {
     if (!accepting && sessions.empty() && socket)
         socket->Close();
 }
 
-void RudpServer::Impl::CloseAll()
+void RUdpServer::Impl::CloseAll()
 {
     StopAccepting();
     // Close 只是标记并排进回收列表，不会摘表，所以遍历期间 sessions 不变。
@@ -189,7 +189,7 @@ void RudpServer::Impl::CloseAll()
         s.conn->Close();
 }
 
-bool RudpServer::Impl::ShouldLogReject()
+bool RUdpServer::Impl::ShouldLogReject()
 {
     const auto now = EventLoop::Clock::now();
     if (now - last_reject_log < std::chrono::seconds(1))
@@ -201,14 +201,14 @@ bool RudpServer::Impl::ShouldLogReject()
     return true;
 }
 
-void RudpServer::Impl::Reply(const sockaddr_storage& to, socklen_t to_len, const rudp::Control& c)
+void RUdpServer::Impl::Reply(const sockaddr_storage& to, socklen_t to_len, const rudp::Control& c)
 {
     (void)socket->Send({}, c.view(), &to, to_len); // 失败（缓冲满）就丢：对端会重发
 }
 
 // ---- 收 ----
 
-void RudpServer::Impl::OnDatagram(const sockaddr_storage& src, socklen_t len, std::span<const std::byte> data)
+void RUdpServer::Impl::OnDatagram(const sockaddr_storage& src, socklen_t len, std::span<const std::byte> data)
 {
     LoopStats& st = loop->stats();
     const auto packet = rudp::Parse(data);
@@ -234,7 +234,7 @@ void RudpServer::Impl::OnDatagram(const sockaddr_storage& src, socklen_t len, st
 
 // 没有会话的来源发来数据：丢掉。Data / Ping 回一个 Close，让重启前的客户端立刻知道会话没了，
 // 而不是等心跳超时。Close 比触发它的包小，不会被用来放大流量。
-void RudpServer::Impl::UnknownSource(const sockaddr_storage& src, socklen_t len, const rudp::Packet& p)
+void RUdpServer::Impl::UnknownSource(const sockaddr_storage& src, socklen_t len, const rudp::Packet& p)
 {
     LoopStats::Bump(loop->stats().datagrams_dropped);
     std::uint32_t conv = 0;
@@ -246,7 +246,7 @@ void RudpServer::Impl::UnknownSource(const sockaddr_storage& src, socklen_t len,
         Reply(src, len, rudp::EncodeClose(conv, static_cast<std::uint8_t>(CloseReason::PeerClosed)));
 }
 
-void RudpServer::Impl::HandleHello(const sockaddr_storage& src,
+void RUdpServer::Impl::HandleHello(const sockaddr_storage& src,
                                    socklen_t len,
                                    const AddrKey& key,
                                    const rudp::Packet& p)
@@ -255,7 +255,7 @@ void RudpServer::Impl::HandleHello(const sockaddr_storage& src,
     // 同一来源已经有会话：Hello 是客户端没收到 Accept 的重传，重发 Accept（幂等）。conv 不同的不理。
     if (const auto it = by_addr.find(key); it != by_addr.end())
     {
-        RudpConnection* c = sessions[it->second].conn;
+        RUdpConnection* c = sessions[it->second].conn;
         if (c->conv() == p.conv && !c->closed())
             Reply(src, len, rudp::EncodeAccept(c->conv()));
         else
@@ -302,7 +302,7 @@ void RudpServer::Impl::HandleHello(const sockaddr_storage& src,
         return;
     }
 
-    RudpConnection* c = RudpConnection::Create(
+    RUdpConnection* c = RUdpConnection::Create(
         *loop, *socket, &src, len, p.conv, std::move(info), handler, *this, options.connection, options.rudp);
     if (c == nullptr)
     {
@@ -323,7 +323,7 @@ void RudpServer::Impl::HandleHello(const sockaddr_storage& src,
 
 // ---- 摘表（会话回收前，由 NotifyClosed 触发）----
 
-void RudpServer::Impl::OnConnectionDetached(RudpConnection& conn) noexcept
+void RUdpServer::Impl::OnConnectionDetached(RUdpConnection& conn) noexcept
 {
     if (conn.ticking())
         RemoveActive(conn.tick_index); // 关了但还没被 TickAll 清走：回收前必须摘掉，否则活跃表里是悬空指针
@@ -342,7 +342,7 @@ void RudpServer::Impl::OnConnectionDetached(RudpConnection& conn) noexcept
 
 // ---- 定时推进 ----
 
-void RudpServer::Impl::ArmTick()
+void RUdpServer::Impl::ArmTick()
 {
     if (tick_timer != 0)
         return;
@@ -354,16 +354,16 @@ void RudpServer::Impl::ArmTick()
                                 });
 }
 
-void RudpServer::Impl::OnConnectionWake(RudpConnection& conn) noexcept
+void RUdpServer::Impl::OnConnectionWake(RUdpConnection& conn) noexcept
 {
     conn.tick_index = active.size();
     active.push_back(&conn);
     ArmTick();
 }
 
-void RudpServer::Impl::RemoveActive(std::size_t i)
+void RUdpServer::Impl::RemoveActive(std::size_t i)
 {
-    RudpConnection* last = active.back();
+    RUdpConnection* last = active.back();
     active.pop_back();
     if (i < active.size())
     {
@@ -375,7 +375,7 @@ void RudpServer::Impl::RemoveActive(std::size_t i)
 // 只走活跃的会话（有事可做的）；静止的不在表里，空闲会话不占 CPU。没有活跃会话就不再装定时器，下一次唤醒时再装。
 // Tick 里的关闭只标记、不摘表（摘表在回收阶段）；回调里可能唤醒别的会话（push_back），所以按下标遍历、每轮重读大小，
 // 新加的在本轮就会被走到。
-void RudpServer::Impl::TickAll()
+void RUdpServer::Impl::TickAll()
 {
     const std::uint32_t now = KcpNowMs();
     for (std::size_t i = 0; i < active.size();)
@@ -391,16 +391,16 @@ void RudpServer::Impl::TickAll()
 
 // ---- 对外 ----
 
-RudpServer::RudpServer(EventLoopGroup& group,
-                       const RudpEndpoint& endpoint,
-                       RudpServerOptions options,
+RUdpServer::RUdpServer(EventLoopGroup& group,
+                       const RUdpEndpoint& endpoint,
+                       RUdpServerOptions options,
                        ConnectionHandler& handler)
     : endpoint_(endpoint.endpoint())
     , impl_(std::make_unique<Impl>(group, endpoint.endpoint(), std::move(options), handler))
 {
 }
 
-RudpServer::~RudpServer()
+RUdpServer::~RUdpServer()
 {
     Impl& m = *impl_;
     if (m.loop == nullptr || !m.group.running())
@@ -425,7 +425,7 @@ RudpServer::~RudpServer()
         });
 }
 
-int RudpServer::Start()
+int RUdpServer::Start()
 {
     Impl& m = *impl_;
     if (!m.options.rudp.Valid())
@@ -434,10 +434,10 @@ int RudpServer::Start()
     {
         if (m.group.stopping())
             return ESHUTDOWN;
-        LOG_FATAL("RudpServer::Start 之前必须已 EventLoopGroup::Start() 成功 endpoint={}", m.endpoint.ToString());
+        LOG_FATAL("RUdpServer::Start 之前必须已 EventLoopGroup::Start() 成功 endpoint={}", m.endpoint.ToString());
     }
     if (m.loop != nullptr)
-        LOG_FATAL("RudpServer 重复 Start endpoint={}", m.endpoint.ToString());
+        LOG_FATAL("RUdpServer 重复 Start endpoint={}", m.endpoint.ToString());
 
     m.loop = &GroupAccess::PickLoop(m.group);
     // bind 与登记 epoll 只能在 loop 线程上做；loop 已在运行，投过去等结果。
@@ -450,7 +450,7 @@ int RudpServer::Start()
     return 0;
 }
 
-void RudpServer::Stop()
+void RUdpServer::Stop()
 {
     Impl& m = *impl_;
     if (m.loop == nullptr)
@@ -458,19 +458,19 @@ void RudpServer::Stop()
     m.loop->Post([&m] { m.StopAccepting(); });
 }
 
-RudpEndpoint RudpServer::local_endpoint() const
+RUdpEndpoint RUdpServer::local_endpoint() const
 {
-    // endpoint_ 由构造时的 RudpEndpoint 而来，绑定后只是填上实际端口，种类不会变，所以转换一定成功。
-    return *RudpEndpoint::From(endpoint_);
+    // endpoint_ 由构造时的 RUdpEndpoint 而来，绑定后只是填上实际端口，种类不会变，所以转换一定成功。
+    return *RUdpEndpoint::From(endpoint_);
 }
 
-std::optional<RudpTicket> RudpServer::IssueTicket(std::chrono::milliseconds ttl) { return impl_->tickets.Issue(ttl); }
+std::optional<RUdpTicket> RUdpServer::IssueTicket(std::chrono::milliseconds ttl) { return impl_->tickets.Issue(ttl); }
 
-bool RudpServer::AddTicket(const RudpTicket& ticket, std::chrono::milliseconds ttl)
+bool RUdpServer::AddTicket(const RUdpTicket& ticket, std::chrono::milliseconds ttl)
 {
     return impl_->tickets.Add(ticket, ttl);
 }
 
-std::size_t RudpServer::pending_tickets() const { return impl_->tickets.size(); }
+std::size_t RUdpServer::pending_tickets() const { return impl_->tickets.size(); }
 
 } // namespace breeze

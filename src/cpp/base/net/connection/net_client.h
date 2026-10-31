@@ -1,4 +1,4 @@
-// 客户端的传输无关接口：StreamClient（TCP / UDS，经 TcpClient / UdsClient）与将来的 RudpClient 都实现它。
+// 客户端的传输无关接口：StreamClient（TCP / UDS，经 TcpClient / UdsClient）与将来的 RUdpClient 都实现它。
 // NetModule 经它持有各种客户端，业务代码经它发送；要类型化的端点与选项，直接用具体类。
 // 设计见 docs/网络库设计.md §4.1 / §4.13。
 

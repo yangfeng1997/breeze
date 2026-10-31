@@ -71,9 +71,9 @@ bool TicketTable::InsertLocked(std::uint32_t conv,
     return true;
 }
 
-std::optional<RudpTicket> TicketTable::Issue(std::chrono::milliseconds ttl, Clock::time_point now)
+std::optional<RUdpTicket> TicketTable::Issue(std::chrono::milliseconds ttl, Clock::time_point now)
 {
-    RudpTicket t;
+    RUdpTicket t;
     const std::lock_guard lk(mu_);
     // conv 撞上已有的概率是表大小 / 2^32，重试几次足够；还撞就放弃，不死循环。
     for (int attempt = 0; attempt < 8; ++attempt)
@@ -90,7 +90,7 @@ std::optional<RudpTicket> TicketTable::Issue(std::chrono::milliseconds ttl, Cloc
     return std::nullopt;
 }
 
-bool TicketTable::Add(const RudpTicket& ticket, std::chrono::milliseconds ttl, Clock::time_point now)
+bool TicketTable::Add(const RUdpTicket& ticket, std::chrono::milliseconds ttl, Clock::time_point now)
 {
     const std::lock_guard lk(mu_);
     return InsertLocked(ticket.conv, ticket.token, ttl, now);

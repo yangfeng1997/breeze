@@ -1,7 +1,7 @@
 // ikcp 的薄封装：一个 KCP 会话（消息模式，保持消息边界）。设计见 docs/网络库设计.md §4.14。
 //
 // 为什么封装：ikcp 是 C 接口，返回值约定五花八门（0 / 长度 / 负数混用），时钟是 32 位毫秒，输出走裸函数指针。
-// 这里统一成 C++ 类型，并把"消息最多多少段"之类 KCP 的约束固定下来；上层（RudpConnection）只认这里。
+// 这里统一成 C++ 类型，并把"消息最多多少段"之类 KCP 的约束固定下来；上层（RUdpConnection）只认这里。
 //
 // 非线程安全，只在会话所属的 loop 线程上用。output 回调在 Update / Flush / Send（flush_on_send 时）里同步触发，
 // 回调里不能再调本对象的任何方法。
@@ -43,7 +43,7 @@ public:
     using Output = void (*)(void* user, std::span<const std::byte> data);
 
     // 创建失败（内存不足、mtu 不合法）返回空。options 须已 Valid()。
-    static std::unique_ptr<KcpSession> Create(std::uint32_t conv, const RudpOptions& options, Output out, void* user);
+    static std::unique_ptr<KcpSession> Create(std::uint32_t conv, const RUdpOptions& options, Output out, void* user);
     ~KcpSession();
 
     KcpSession(const KcpSession&) = delete;

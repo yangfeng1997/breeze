@@ -10,7 +10,7 @@
 // 往返时间长（几十毫秒以上）时，每条消息的在途时间里会话都在活跃表里，这一步才省得下东西。
 //
 // 与 StreamConnection 的语义差异（都写在 Connection 接口的注释之外，因为是 rudp 特有的）：
-// - 消息自带边界，没有 codec；单条消息上限是 RudpOptions::max_message_size，
+// - 消息自带边界，没有 codec；单条消息上限是 RUdpOptions::max_message_size，
 //   超限的 Send 与 TCP 的 codec 超限一样关连接。
 // - PauseRead：停止向 handler 交付，消息留在 KCP 的接收队列里，队列占满接收窗口后对端自然被拖慢（真背压，不丢）。
 //   ResumeRead 后在下一次 Tick（≤ interval_ms）里补交付，不在调用栈里直接交付：调用方可能就在 OnMessage 里。
@@ -48,7 +48,7 @@ namespace breeze
 
 class EventLoop;
 
-class RudpConnection final : public Connection
+class RUdpConnection final : public Connection
 {
 public:
     // 会话的拥有者（服务端 / 客户端）。
@@ -57,9 +57,9 @@ public:
     public:
         // 会话回收前、OnClosed 之前调用：把它从自己的会话表里摘掉。只会调用一次，且不在 Tick 的遍历里。
         // 此时会话若还在活跃表里（ticking() 为真），拥有者要一并摘掉。
-        virtual void OnConnectionDetached(RudpConnection& conn) noexcept = 0;
+        virtual void OnConnectionDetached(RUdpConnection& conn) noexcept = 0;
         // 静止的会话被唤醒（有了要 Tick 的事）：拥有者把它放进活跃表并保证定时器在跑。只在 ticking() 由假变真时调一次。
-        virtual void OnConnectionWake(RudpConnection& conn) noexcept = 0;
+        virtual void OnConnectionWake(RUdpConnection& conn) noexcept = 0;
 
     protected:
         ~Owner() = default;
@@ -69,7 +69,7 @@ public:
     // 调用方须在 loop 线程上，且已 table().TryReserve() 成功。KCP 创建失败（内存不足）返回空，此时没有占槽，
     // 调用方自己归还名额。peer_addr 为空 = socket 已 connect（客户端），否则是服务端收包时的来源地址。
     // socket / handler / owner 必须比本会话活得久（回收之前）。
-    static RudpConnection* Create(EventLoop& loop,
+    static RUdpConnection* Create(EventLoop& loop,
                                   UdpSocket& socket,
                                   const sockaddr_storage* peer_addr,
                                   socklen_t peer_len,
@@ -78,9 +78,9 @@ public:
                                   ConnectionHandler& handler,
                                   Owner& owner,
                                   const ConnectionOptions& conn_options,
-                                  const RudpOptions& rudp_options);
+                                  const RUdpOptions& rudp_options);
 
-    ~RudpConnection() override;
+    ~RUdpConnection() override;
 
     SendResult Send(SharedBuffer payload) override;
     SendResult Send(std::span<const std::byte> payload) override;
@@ -128,7 +128,7 @@ private:
         std::uint32_t bytes;
     };
 
-    RudpConnection(EventLoop& loop,
+    RUdpConnection(EventLoop& loop,
                    UdpSocket& socket,
                    const sockaddr_storage* peer_addr,
                    socklen_t peer_len,
@@ -138,7 +138,7 @@ private:
                    ConnectionHandler& handler,
                    Owner& owner,
                    const ConnectionOptions& conn_options,
-                   const RudpOptions& rudp_options,
+                   const RUdpOptions& rudp_options,
                    ConnectionTable::Slot& slot,
                    std::uint32_t slot_index,
                    ConnectionHandle handle);

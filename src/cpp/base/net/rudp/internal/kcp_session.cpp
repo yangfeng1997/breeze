@@ -24,7 +24,7 @@ int KcpSession::OutputThunk(const char* buf, int len, IKCPCB*, void* user)
     return 0;
 }
 
-std::unique_ptr<KcpSession> KcpSession::Create(std::uint32_t conv, const RudpOptions& o, Output out, void* user)
+std::unique_ptr<KcpSession> KcpSession::Create(std::uint32_t conv, const RUdpOptions& o, Output out, void* user)
 {
     std::unique_ptr<KcpSession> s(new KcpSession);
     s->out_ = out;
