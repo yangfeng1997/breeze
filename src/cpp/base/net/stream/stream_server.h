@@ -18,14 +18,14 @@
 #include <functional>
 #include <memory>
 
-#include "connection_handler.h"
-#include "connection_options.h"
-#include "endpoint.h"
-#include "event_loop_group.h"
-#include "frame_codec.h"
-#include "net_server.h"
-#include "peer_info.h"
-#include "tcp_options.h"
+#include "base/net/codec/frame_codec_interface.h"
+#include "base/net/connection/connection_handler_interface.h"
+#include "base/net/connection/connection_options.h"
+#include "base/net/connection/net_server_interface.h"
+#include "base/net/endpoint/endpoint.h"
+#include "base/net/endpoint/peer_info.h"
+#include "base/net/loop/event_loop_group.h"
+#include "base/net/tcp/tcp_options.h"
 
 namespace breeze
 {
@@ -38,14 +38,14 @@ struct StreamServerOptions
     int backlog = SOMAXCONN;    // 内核还会按 net.core.somaxconn 截断
 };
 
-class StreamServer : public NetServer
+class StreamServer : public INetServer
 {
 public:
     StreamServer(EventLoopGroup& group,
                  const Endpoint& endpoint,
                  StreamServerOptions options,
-                 ConnectionHandler& handler,
-                 const FrameCodecFactory& factory);
+                 IConnectionHandler& handler,
+                 const IFrameCodecFactory& factory);
     ~StreamServer() override; // TcpServer / UdsServer 经基类指针销毁
 
     StreamServer(const StreamServer&) = delete;

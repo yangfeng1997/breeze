@@ -2,7 +2,7 @@
 // Tick 的窗口与"先清零再回调"、默认写日志、与 std::map 参考实现的随机对照。
 // 日志写到 stderr（没有默认 logger 时的兜底），用重定向 fd 2 的办法读回来。无测试框架依赖：失败即 abort。
 
-#include "message_stats.h"
+#include "base/metrics/message_stats.h"
 
 #include <unistd.h>
 

@@ -1,15 +1,15 @@
 // RUdpEndpoint：构造与访问器、解析、从通用 Endpoint 转换（种类不对就失败）、与通用形式互通；与 Tcp / Uds 端点互不接受。
 // 无测试框架依赖：失败即 abort。
 
-#include "rudp_endpoint.h"
+#include "base/net/rudp/rudp_endpoint.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <type_traits>
 
-#include "tcp_endpoint.h"
-#include "uds_endpoint.h"
+#include "base/net/tcp/tcp_endpoint.h"
+#include "base/net/uds/uds_endpoint.h"
 
 using namespace breeze;
 

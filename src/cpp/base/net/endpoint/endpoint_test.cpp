@@ -1,6 +1,6 @@
 // 无测试框架依赖：失败即 abort。
 
-#include "endpoint.h"
+#include "base/net/endpoint/endpoint.h"
 
 #include <cstdio>
 #include <cstdlib>

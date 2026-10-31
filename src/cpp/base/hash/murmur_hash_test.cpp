@@ -1,7 +1,7 @@
 // MurmurHash64A：与独立的 Python 参考实现逐位一致（含 smhasher 的验证值 0x1F0D3804）、不依赖对齐、各种长度余数、
 // 与"逐字节拼装"的朴素实现随机对照。无测试框架依赖：失败即 abort。
 
-#include "murmur_hash.h"
+#include "base/hash/murmur_hash.h"
 
 #include <cstdint>
 #include <cstdio>

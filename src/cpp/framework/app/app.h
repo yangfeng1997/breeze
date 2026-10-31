@@ -22,9 +22,9 @@
 #include <unordered_map>
 #include <vector>
 
-#include "app_options.h"
-#include "errors.h"
-#include "module.h"
+#include "framework/app/app_options.h"
+#include "framework/app/errors.h"
+#include "framework/app/module.h"
 
 namespace breeze
 {

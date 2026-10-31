@@ -1,6 +1,6 @@
 // 无测试框架依赖：失败即 abort。
 
-#include "log_config_yaml.h"
+#include "framework/kernel/log_config_yaml.h"
 
 #include <unistd.h>
 
@@ -11,7 +11,7 @@
 #include <fstream>
 #include <sstream>
 
-#include "logger_macros.h"
+#include "base/logger/logger_macros.h"
 
 using namespace breeze;
 namespace fs = std::filesystem;

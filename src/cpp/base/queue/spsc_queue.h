@@ -14,7 +14,7 @@
 #include <cstddef>
 #include <utility>
 
-#include "internal/thread_role.h"
+#include "base/queue/internal/thread_role.h"
 
 namespace breeze
 {

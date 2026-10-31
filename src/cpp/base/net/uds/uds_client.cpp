@@ -1,4 +1,4 @@
-#include "uds_client.h"
+#include "base/net/uds/uds_client.h"
 
 #include <utility>
 
@@ -23,8 +23,8 @@ UdsClient::UdsClient(EventLoopGroup& group,
                      const UdsEndpoint& peer,
                      UdsClientOptions options,
                      ReconnectPolicy policy,
-                     ConnectionHandler& handler,
-                     const FrameCodecFactory& factory)
+                     IConnectionHandler& handler,
+                     const IFrameCodecFactory& factory)
     : StreamClient(group, peer.endpoint(), ToStreamOptions(std::move(options)), policy, handler, factory)
 {
 }

@@ -1,6 +1,6 @@
 // 对照 src/go/core/app/app_test.go 与 loop_test.go。无测试框架依赖：失败即 abort。
 
-#include "app.h"
+#include "framework/app/app.h"
 
 #include <unistd.h>
 
@@ -17,7 +17,7 @@
 #include <thread>
 #include <vector>
 
-#include "logger.h"
+#include "base/logger/logger.h"
 
 using namespace breeze;
 using namespace std::chrono_literals;

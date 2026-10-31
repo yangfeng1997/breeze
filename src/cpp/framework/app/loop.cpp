@@ -1,6 +1,6 @@
 // 主循环，以及它驱动的能力广播。对照 src/go/core/app/loop.go。
 
-#include "app.h"
+#include "framework/app/app.h"
 
 namespace breeze
 {

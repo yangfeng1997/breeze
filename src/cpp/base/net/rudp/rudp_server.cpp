@@ -1,4 +1,4 @@
-#include "rudp_server.h"
+#include "base/net/rudp/rudp_server.h"
 
 #include <netinet/in.h>
 
@@ -12,14 +12,14 @@
 #include <utility>
 #include <vector>
 
-#include "flat_hash_map.h"
-#include "group_access.h"
-#include "logger.h"
-#include "logger_macros.h"
-#include "rudp_connection.h"
-#include "socket_address.h"
-#include "ticket_table.h"
-#include "udp_socket.h"
+#include "base/container/flat_hash_map.h"
+#include "base/logger/logger.h"
+#include "base/logger/logger_macros.h"
+#include "base/net/loop/group_access.h"
+#include "base/net/rudp/internal/rudp_connection.h"
+#include "base/net/rudp/internal/ticket_table.h"
+#include "base/net/rudp/internal/udp_socket.h"
+#include "base/net/socket/socket_address.h"
 
 namespace breeze
 {
@@ -91,9 +91,9 @@ static_assert(sizeof(AddrKey) == 20, "AddrKeyHash 假定 ip 数组之前是 4 �
 
 } // namespace
 
-struct RUdpServer::Impl final : DatagramHandler, RUdpConnection::Owner
+struct RUdpServer::Impl final : IDatagramHandler, RUdpConnection::Owner
 {
-    Impl(EventLoopGroup& g, Endpoint ep, RUdpServerOptions o, ConnectionHandler& h)
+    Impl(EventLoopGroup& g, Endpoint ep, RUdpServerOptions o, IConnectionHandler& h)
         : group(g)
         , endpoint(std::move(ep))
         , options(std::move(o))
@@ -112,7 +112,7 @@ struct RUdpServer::Impl final : DatagramHandler, RUdpConnection::Owner
     EventLoopGroup& group;
     Endpoint endpoint;
     RUdpServerOptions options;
-    ConnectionHandler& handler;
+    IConnectionHandler& handler;
     TicketTable tickets;
 
     // 以下只在 loop 线程访问（Start 时选定 loop 之前除外）。
@@ -394,7 +394,7 @@ void RUdpServer::Impl::TickAll()
 RUdpServer::RUdpServer(EventLoopGroup& group,
                        const RUdpEndpoint& endpoint,
                        RUdpServerOptions options,
-                       ConnectionHandler& handler)
+                       IConnectionHandler& handler)
     : endpoint_(endpoint.endpoint())
     , impl_(std::make_unique<Impl>(group, endpoint.endpoint(), std::move(options), handler))
 {

@@ -1,7 +1,7 @@
 // 无测试框架依赖：失败即 abort。
 //
 // 同一套用例分别跑在 TCP、UDS 路径、UDS 抽象名上——"同一份代码跑通"是 P2a 的验收点：
-// 差异只在建立时，Connection 以上没有 if tcp。每个用例独占一个 server，结束时检查没有 fd 泄漏。
+// 差异只在建立时，IConnection 以上没有 if tcp。每个用例独占一个 server，结束时检查没有 fd 泄漏。
 
 #include <dirent.h>
 #include <poll.h>
@@ -26,12 +26,12 @@
 #include <thread>
 #include <vector>
 
-#include "buffer.h"
-#include "connection.h"
-#include "event_loop_thread.h"
-#include "length_prefix_codec.h"
-#include "loop_server.h"
-#include "socket.h"
+#include "base/buffer/buffer.h"
+#include "base/net/codec/length_prefix_codec.h"
+#include "base/net/connection/connection_interface.h"
+#include "base/net/loop/event_loop_thread.h"
+#include "base/net/stream/internal/loop_server.h"
+#include "base/net/stream/internal/stream_socket.h"
 
 using namespace breeze;
 using namespace std::chrono_literals;
@@ -85,7 +85,7 @@ struct ConnLog
 };
 
 // 默认回显。触发词让它做别的事，用来构造各种连接行为。
-class RecordingHandler : public ConnectionHandler
+class RecordingHandler : public IConnectionHandler
 {
 public:
     std::string close_trigger;        // 收到这个 payload：先回显，再 Close，再试着 Send
@@ -102,7 +102,7 @@ public:
 
     static char ViewBigByte(std::size_t i) { return static_cast<char>('A' + (i * 7) % 26); }
 
-    void OnConnected(Connection& c) noexcept override
+    void OnConnected(IConnection& c) noexcept override
     {
         {
             const std::lock_guard lk(mu_);
@@ -117,7 +117,7 @@ public:
             c.Close();
     }
 
-    void OnMessage(Connection& c, std::span<const std::byte> payload) noexcept override
+    void OnMessage(IConnection& c, std::span<const std::byte> payload) noexcept override
     {
         const std::string text(reinterpret_cast<const char*>(payload.data()), payload.size());
         {
@@ -169,7 +169,7 @@ public:
         }
     }
 
-    static void Flood(Connection& c)
+    static void Flood(IConnection& c)
     {
         for (int i = 0; i < kFloodFrames; ++i)
         {
@@ -179,7 +179,7 @@ public:
         }
     }
 
-    void OnClosed(Connection& c, CloseReason r, int err) noexcept override
+    void OnClosed(IConnection& c, CloseReason r, int err) noexcept override
     {
         const std::lock_guard lk(mu_);
         auto it = active_.find(&c);
@@ -226,7 +226,7 @@ public:
 
 private:
     mutable std::mutex mu_;
-    std::map<Connection*, ConnLog> active_;
+    std::map<IConnection*, ConnLog> active_;
     std::vector<ConnLog> finished_;
     std::atomic<int> connected_{0};
 };
@@ -236,7 +236,7 @@ private:
 struct Server
 {
     // 水位放到 1GB：这里的用例会故意制造 10MB 级别的写积压，水位本身由 connection_handle_test 覆盖。
-    Server(ConnectionHandler& handler, const Endpoint& ep, std::size_t max_frame = kServerMaxFrame)
+    Server(IConnectionHandler& handler, const Endpoint& ep, std::size_t max_frame = kServerMaxFrame)
         : factory(max_frame)
         , srv(lt.loop, ep, handler, factory, ConnectionOptions{1ull << 30})
     {

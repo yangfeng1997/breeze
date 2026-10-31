@@ -37,7 +37,7 @@
 #include <utility>
 #include <vector>
 
-#include "thread.h"
+#include "base/thread/thread.h"
 
 namespace breeze
 {

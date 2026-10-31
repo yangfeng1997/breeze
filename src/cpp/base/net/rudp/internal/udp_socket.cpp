@@ -1,4 +1,4 @@
-#include "udp_socket.h"
+#include "base/net/rudp/internal/udp_socket.h"
 
 #include <sys/epoll.h>
 #include <sys/uio.h>
@@ -6,9 +6,9 @@
 #include <cerrno>
 #include <cstring>
 
-#include "logger.h"
-#include "logger_macros.h"
-#include "socket_address.h"
+#include "base/logger/logger.h"
+#include "base/logger/logger_macros.h"
+#include "base/net/socket/socket_address.h"
 
 namespace breeze
 {
@@ -63,7 +63,7 @@ int ConnectTo(int fd, const Endpoint& ep)
 int UdpSocket::OpenServer(EventLoop& loop,
                           const Endpoint& local,
                           const RUdpOptions& options,
-                          DatagramHandler& handler,
+                          IDatagramHandler& handler,
                           std::unique_ptr<UdpSocket>& out)
 {
     return Open(loop, local, true, options, handler, out);
@@ -72,7 +72,7 @@ int UdpSocket::OpenServer(EventLoop& loop,
 int UdpSocket::OpenClient(EventLoop& loop,
                           const Endpoint& peer,
                           const RUdpOptions& options,
-                          DatagramHandler& handler,
+                          IDatagramHandler& handler,
                           std::unique_ptr<UdpSocket>& out)
 {
     return Open(loop, peer, false, options, handler, out);
@@ -82,7 +82,7 @@ int UdpSocket::Open(EventLoop& loop,
                     const Endpoint& ep,
                     bool server,
                     const RUdpOptions& options,
-                    DatagramHandler& handler,
+                    IDatagramHandler& handler,
                     std::unique_ptr<UdpSocket>& out)
 {
     loop.AssertInLoopThread();

@@ -6,7 +6,7 @@
 //   - 线程局部：不同线程种子不同、SetSeed 可复现、fork 之后子进程重新播种。
 // 无测试框架依赖：失败即 abort。
 
-#include "random_util.h"
+#include "base/random/random_util.h"
 
 #include <sys/wait.h>
 #include <unistd.h>

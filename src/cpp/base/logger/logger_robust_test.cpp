@@ -12,10 +12,10 @@
 #include <unordered_set>
 #include <vector>
 
-#include "hourly_file_sink.h"
-#include "logger.h"
-#include "logger_macros.h"
-#include "logger_test_util.h"
+#include "base/logger/internal/hourly_file_sink.h"
+#include "base/logger/internal/logger_test_util.h"
+#include "base/logger/logger.h"
+#include "base/logger/logger_macros.h"
 
 using namespace breeze;
 using namespace breeze::testutil;

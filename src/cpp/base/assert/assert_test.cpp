@@ -8,8 +8,8 @@
 #include <thread>
 #include <vector>
 
-#include "assert_macros.h"
-#include "assert_test_util.h"
+#include "base/assert/assert_macros.h"
+#include "base/assert/assert_test_util.h"
 
 using breeze::testing::CaptureStderr;
 using breeze::testing::Count;

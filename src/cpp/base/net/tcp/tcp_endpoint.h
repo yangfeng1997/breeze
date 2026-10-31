@@ -9,7 +9,7 @@
 #include <string_view>
 #include <utility>
 
-#include "endpoint.h"
+#include "base/net/endpoint/endpoint.h"
 
 namespace breeze
 {

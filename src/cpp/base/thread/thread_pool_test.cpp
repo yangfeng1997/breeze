@@ -5,7 +5,7 @@
 // 用法：thread_pool_test           跑全部用例
 //       thread_pool_test --bench   只测吞吐（不进 ctest），数字记在 docs/线程基础库.md
 
-#include "thread_pool.h"
+#include "base/thread/thread_pool.h"
 
 #include <atomic>
 #include <chrono>
@@ -20,9 +20,9 @@
 #include <thread>
 #include <vector>
 
-#include "current_thread.h"
-#include "thread.h"
-#include "thread_test_util.h"
+#include "base/thread/current_thread.h"
+#include "base/thread/thread.h"
+#include "base/thread/thread_test_util.h"
 
 using namespace breeze;
 using namespace breeze::testing;

@@ -18,14 +18,14 @@
 #include <thread>
 #include <vector>
 
-#include "kcp_session.h"
-#include "net_test_util.h"
-#include "rudp_endpoint.h"
-#include "rudp_options.h"
-#include "rudp_protocol.h"
-#include "rudp_ticket.h"
-#include "socket_address.h"
-#include "unique_fd.h"
+#include "base/net/rudp/internal/kcp_session.h"
+#include "base/net/rudp/rudp_endpoint.h"
+#include "base/net/rudp/rudp_options.h"
+#include "base/net/rudp/rudp_protocol.h"
+#include "base/net/rudp/rudp_ticket.h"
+#include "base/net/socket/socket_address.h"
+#include "base/net/socket/unique_fd.h"
+#include "base/net/testing/net_test_util.h"
 
 namespace breeze::testing
 {

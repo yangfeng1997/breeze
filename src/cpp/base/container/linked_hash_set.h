@@ -13,8 +13,8 @@
 #include <type_traits>
 #include <utility>
 
-#include "detail/linked_hash_table.h"
-#include "detail/slot_policy.h"
+#include "base/container/detail/linked_hash_table.h"
+#include "base/container/detail/slot_policy.h"
 
 namespace breeze
 {

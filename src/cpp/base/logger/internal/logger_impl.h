@@ -13,8 +13,8 @@
 #include <memory>
 #include <vector>
 
-#include "hourly_file_sink.h"
-#include "logger.h"
+#include "base/logger/internal/hourly_file_sink.h"
+#include "base/logger/logger.h"
 
 namespace breeze
 {

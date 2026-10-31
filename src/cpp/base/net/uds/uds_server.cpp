@@ -1,4 +1,4 @@
-#include "uds_server.h"
+#include "base/net/uds/uds_server.h"
 
 #include <utility>
 
@@ -22,8 +22,8 @@ StreamServerOptions ToStreamOptions(UdsServerOptions&& o)
 UdsServer::UdsServer(EventLoopGroup& group,
                      const UdsEndpoint& endpoint,
                      UdsServerOptions options,
-                     ConnectionHandler& handler,
-                     const FrameCodecFactory& factory)
+                     IConnectionHandler& handler,
+                     const IFrameCodecFactory& factory)
     : StreamServer(group, endpoint.endpoint(), ToStreamOptions(std::move(options)), handler, factory)
 {
 }

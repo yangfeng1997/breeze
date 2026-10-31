@@ -1,9 +1,7 @@
-// Connection 接口：没有数据成员（守住 StreamConnection 的热字段布局）、能被与流无关的实现填满、
+// IConnection 接口：没有数据成员（守住 StreamConnection 的热字段布局）、能被与流无关的实现填满、
 // 业务回调只经接口就能工作。
 // 假连接代表将来的 RUdpConnection：没有 fd、不经 epoll。
 // 无测试框架依赖：失败即 abort。
-
-#include "connection.h"
 
 #include <cerrno>
 #include <cstdio>
@@ -13,9 +11,10 @@
 #include <type_traits>
 #include <vector>
 
-#include "net_client.h"
-#include "net_server.h"
-#include "shared_buffer.h"
+#include "base/buffer/shared_buffer.h"
+#include "base/net/connection/connection_interface.h"
+#include "base/net/connection/net_client_interface.h"
+#include "base/net/connection/net_server_interface.h"
 
 using namespace breeze;
 
@@ -29,13 +28,13 @@ using namespace breeze;
         }                                                                                                              \
     } while (0)
 
-// 接口只有虚函数：对象里只有一个 vptr（继承链 Connection → Pollable 上只有一个），不带任何数据。
+// 接口只有虚函数：对象里只有一个 vptr（继承链 IConnection → IPollable 上只有一个），不带任何数据。
 // 派生类的成员排在基类之后，基类一旦带上数据，StreamConnection 里"热字段集中在前两条缓存行"的布局就整体后移
 // （设计 §9.5）。这个断言守的就是这件事。
-static_assert(std::is_abstract_v<Connection>);
-static_assert(sizeof(Connection) == sizeof(void*), "Connection 接口不能带数据成员");
-static_assert(std::has_virtual_destructor_v<Connection>);
-static_assert(!std::is_copy_constructible_v<Connection> && !std::is_move_constructible_v<Connection>);
+static_assert(std::is_abstract_v<IConnection>);
+static_assert(sizeof(IConnection) == sizeof(void*), "IConnection 接口不能带数据成员");
+static_assert(std::has_virtual_destructor_v<IConnection>);
+static_assert(!std::is_copy_constructible_v<IConnection> && !std::is_move_constructible_v<IConnection>);
 
 namespace
 {
@@ -53,8 +52,8 @@ struct OtherContext final : ConnectionContext
 {
 };
 
-// 与流无关的 Connection：把调用记下来。
-class FakeConnection final : public Connection
+// 与流无关的 IConnection：把调用记下来。
+class FakeConnection final : public IConnection
 {
 public:
     explicit FakeConnection(ConnectionHandle h = ConnectionHandle{})
@@ -113,15 +112,15 @@ private:
 };
 
 // 业务回调只认接口：同一份代码对任何实现都工作。
-class EchoOnce final : public ConnectionHandler
+class EchoOnce final : public IConnectionHandler
 {
 public:
-    void OnConnected(Connection& c) noexcept override
+    void OnConnected(IConnection& c) noexcept override
     {
         c.SetContext(std::make_unique<NoteContext>(7));
         connected_handle = c.handle();
     }
-    void OnMessage(Connection& c, std::span<const std::byte> payload) noexcept override
+    void OnMessage(IConnection& c, std::span<const std::byte> payload) noexcept override
     {
         last_send = c.Send(payload);
         if (c.GetContext<NoteContext>()->value == 7)
@@ -129,7 +128,7 @@ public:
         if (messages == 2)
             c.CloseGracefully(std::chrono::milliseconds(50));
     }
-    void OnClosed(Connection&, CloseReason reason, int) noexcept override { closed_reason = reason; }
+    void OnClosed(IConnection&, CloseReason reason, int) noexcept override { closed_reason = reason; }
 
     ConnectionHandle connected_handle;
     SendResult last_send = SendResult::Closed;
@@ -140,7 +139,7 @@ public:
 void TestDispatchThroughInterface()
 {
     FakeConnection fake;
-    Connection& c = fake; // 经基类引用调用：真的是虚调用
+    IConnection& c = fake; // 经基类引用调用：真的是虚调用
     CHECK(c.IsConnected() && !c.IsPaused());
 
     CHECK(c.Send(SharedBuffer::CopyFrom(std::as_bytes(std::span("abc", 3)))) == SendResult::Ok);
@@ -161,7 +160,7 @@ void TestDispatchThroughInterface()
 void TestContextThroughInterface()
 {
     FakeConnection fake;
-    Connection& c = fake;
+    IConnection& c = fake;
     CHECK(c.GetContext<NoteContext>() == nullptr); // 没设过：空
     c.SetContext(std::make_unique<NoteContext>(42));
     CHECK(c.GetContext<NoteContext>() != nullptr && c.GetContext<NoteContext>()->value == 42);
@@ -174,14 +173,14 @@ void TestHandle()
     const ConnectionHandle h = ConnectionHandle::Make(1, 2, 3, 4);
     FakeConnection with(h);
     FakeConnection without;
-    const Connection& a = with;
-    const Connection& b = without;
+    const IConnection& a = with;
+    const IConnection& b = without;
     CHECK(a.handle() == h && a.handle().valid());
     CHECK(!b.handle().valid() && b.handle().raw() == 0); // 没有句柄：无效句柄
 }
 
-// 与流无关的服务端 / 客户端：NetModule 与业务只认 NetServer / NetClient，将来的 RUdpServer / RUdpClient 就是这个角色。
-class FakeServer final : public NetServer
+// 与流无关的服务端 / 客户端：NetModule 与业务只认 INetServer / INetClient，将来的 RUdpServer / RUdpClient 就是这个角色。
+class FakeServer final : public INetServer
 {
 public:
     explicit FakeServer(Endpoint ep)
@@ -204,7 +203,7 @@ private:
     Endpoint ep_;
 };
 
-class FakeClient final : public NetClient
+class FakeClient final : public INetClient
 {
 public:
     explicit FakeClient(Endpoint ep)
@@ -239,12 +238,12 @@ private:
 
 void TestServerAndClientInterfaces()
 {
-    static_assert(std::is_abstract_v<NetServer> && std::is_abstract_v<NetClient>);
-    static_assert(std::has_virtual_destructor_v<NetServer> && std::has_virtual_destructor_v<NetClient>);
-    static_assert(!std::is_copy_constructible_v<NetServer> && !std::is_copy_constructible_v<NetClient>);
+    static_assert(std::is_abstract_v<INetServer> && std::is_abstract_v<INetClient>);
+    static_assert(std::has_virtual_destructor_v<INetServer> && std::has_virtual_destructor_v<INetClient>);
+    static_assert(!std::is_copy_constructible_v<INetServer> && !std::is_copy_constructible_v<INetClient>);
 
     // 经基类指针持有、启停、销毁：NetModule 就是这样用的。
-    std::vector<std::unique_ptr<NetServer>> servers;
+    std::vector<std::unique_ptr<INetServer>> servers;
     servers.push_back(std::make_unique<FakeServer>(*Endpoint::Udp("127.0.0.1", 0)));
     servers.push_back(std::make_unique<FakeServer>(*Endpoint::Tcp("127.0.0.1", 0)));
     for (auto& s : servers)
@@ -256,7 +255,7 @@ void TestServerAndClientInterfaces()
         s->Stop();
     CHECK(static_cast<FakeServer&>(*servers[0]).starts == 1 && static_cast<FakeServer&>(*servers[0]).stops == 1);
 
-    std::unique_ptr<NetClient> c = std::make_unique<FakeClient>(*Endpoint::Udp("127.0.0.1", 9));
+    std::unique_ptr<INetClient> c = std::make_unique<FakeClient>(*Endpoint::Udp("127.0.0.1", 9));
     CHECK(c->Send(SharedBuffer::CopyFrom(std::as_bytes(std::span("a", 1)))) == SendResult::Closed &&
           !c->handle().valid());
     CHECK(c->Start() == 0 && c->handle().valid());
@@ -270,7 +269,7 @@ void TestHandlerOnlySeesInterface()
 {
     EchoOnce handler;
     FakeConnection fake(ConnectionHandle::Make(0, 0, 5, 1));
-    Connection& c = fake;
+    IConnection& c = fake;
     handler.OnConnected(c);
     CHECK(handler.connected_handle == c.handle());
 

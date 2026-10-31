@@ -2,7 +2,7 @@
 // 共用的 accept / 重连 / 背压逻辑由 stream_server_test、stream_client_test 覆盖，这里只测 TCP 这一层。
 // 无测试框架依赖：失败即 abort。
 
-#include "tcp_server.h"
+#include "base/net/tcp/tcp_server.h"
 
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -14,12 +14,12 @@
 #include <cstdlib>
 #include <type_traits>
 
-#include "event_loop_group.h"
-#include "length_prefix_codec.h"
-#include "net_test_util.h"
-#include "socket.h"
-#include "tcp_client.h"
-#include "uds_endpoint.h"
+#include "base/net/codec/length_prefix_codec.h"
+#include "base/net/loop/event_loop_group.h"
+#include "base/net/stream/internal/stream_socket.h"
+#include "base/net/tcp/tcp_client.h"
+#include "base/net/testing/net_test_util.h"
+#include "base/net/uds/uds_endpoint.h"
 
 using namespace breeze;
 using namespace breeze::testing;
@@ -34,15 +34,15 @@ static_assert(std::is_base_of_v<StreamServer, TcpServer> && std::is_base_of_v<St
 static_assert(std::has_virtual_destructor_v<StreamServer> && std::has_virtual_destructor_v<StreamClient>);
 template <typename Server, typename Ep, typename Opts>
 inline constexpr bool kServerCtor =
-    std::is_constructible_v<Server, EventLoopGroup&, const Ep&, Opts, ConnectionHandler&, const FrameCodecFactory&>;
+    std::is_constructible_v<Server, EventLoopGroup&, const Ep&, Opts, IConnectionHandler&, const IFrameCodecFactory&>;
 template <typename Client, typename Ep, typename Opts>
 inline constexpr bool kClientCtor = std::is_constructible_v<Client,
                                                             EventLoopGroup&,
                                                             const Ep&,
                                                             Opts,
                                                             ReconnectPolicy,
-                                                            ConnectionHandler&,
-                                                            const FrameCodecFactory&>;
+                                                            IConnectionHandler&,
+                                                            const IFrameCodecFactory&>;
 static_assert(kServerCtor<TcpServer, TcpEndpoint, TcpServerOptions>);
 static_assert(!kServerCtor<TcpServer, UdsEndpoint, TcpServerOptions> &&
               !kServerCtor<TcpServer, Endpoint, TcpServerOptions>);

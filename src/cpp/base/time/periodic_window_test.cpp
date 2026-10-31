@@ -1,7 +1,7 @@
 // PeriodicWindow：半开区间的边界、一次性 / 首尾相接 / 永久 / 无效窗口、负时间戳与接近前提上限的大数、
 // 与暴力参考实现的穷举对照、与 TimeUtil / Now 配合。无测试框架依赖：失败即 abort。
 
-#include "periodic_window.h"
+#include "base/time/periodic_window.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -9,8 +9,8 @@
 #include <optional>
 #include <vector>
 
-#include "now.h"
-#include "time_util.h"
+#include "base/time/now.h"
+#include "base/time/time_util.h"
 
 using namespace breeze;
 

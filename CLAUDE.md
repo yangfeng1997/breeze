@@ -15,7 +15,7 @@
 - `src/go/server/*svr` — 服务进程，`main` 只做装配，实现放 `internal/`。
   `go.mod` 在 `src/go/`，import 路径不带 `src/go` 前缀（`project/core/app`）；
   Go 命令要在 `src/go/` 下跑，或用 `go -C src/go ...`
-- `src/cpp` — C++ 侧，`CMakeLists.txt` 在此。`framework/app` 对照 Go 版
+- `src/cpp` — C++ 侧，`CMakeLists.txt` 在此。**所有 `#include` 都从 `src/cpp` 起算**（`#include "base/net/endpoint/endpoint.h"`），`src/cpp` 是唯一的 include 根，各库不配自己的 include 目录，扁平名编译不过。目录不拦，**include 约定由 `tools/check_includes.py` 守着**（`includes_test`）：`base/` 不能 include `framework/`；net 之外的非测试代码只许 include net 的公开头清单（`PUBLIC_HEADERS`），新增公开头要加进清单。`framework/app` 对照 Go 版
   `src/go/core/app` 实现，语义以后者的 CLAUDE.md 为准。
   `base/queue` 是 SPSC/MPSC 无锁队列（包 moodycamel，公开 API 不暴露其类型），网络库的底座；
   `base/buffer` 是 `SharedBuffer`（引用计数的不可变字节块切片，业务回调的消息类型）与 `Buffer`（带读写游标的缓冲），只依赖标准库，网络库与业务都用；
@@ -35,19 +35,19 @@
   `base/container` 是 `FlatHashMap` / `FlatHashSet`（Swiss table）与 `LinkedHashMap` / `LinkedHashSet`（保持插入顺序，可当 LRU），
   **插入可能让迭代器 / 引用失效、元素的移动构造必须 noexcept、`at()` 找不到键就 abort**，见 [docs/基础容器库.md](docs/基础容器库.md)；
   这几个库的 **tsan 同样没在本机跑过**，容器 bench 默认不构建：`cmake --preset release -DBREEZE_BUILD_CONTAINER_BENCH=ON`；
-  `base/net` 是 Reactor 网络库（仅 Linux）：`Endpoint` / `SharedBuffer` / `Buffer` / `FrameCodec` 等基础件，
-  `EventLoop` / `Connection` / `ConnectionHandle` / `EventLoopGroup` / `TcpServer` / `UdsServer` / `TcpClient` / `UdsClient`（基类 `StreamServer` / `StreamClient`，含重连）已完整，
+  `base/net` 是 Reactor 网络库（仅 Linux）：`Endpoint` / `SharedBuffer` / `Buffer` / `IFrameCodec` 等基础件，
+  `EventLoop` / `IConnection` / `ConnectionHandle` / `EventLoopGroup` / `TcpServer` / `UdsServer` / `TcpClient` / `UdsClient`（基类 `StreamServer` / `StreamClient`，含重连）已完整，
   `RUdpServer` / `RUdpClient`（可靠 UDP：KCP 之上的消息通道，凭控制面发的一次性票据握手、**不自动重连**、**v1 没有加密 / 不支持迁移 / 一个服务端只用一个 loop**，
-  KCP 来自 vcpkg，库是单独的 `breeze_net_rudp`，设计与威胁模型见 [docs/网络库设计.md](docs/网络库设计.md) §4.14，基线见 §9.7、优化见 §9.8、TCP / UDS / UDP / muduo 的完整压测数据见 §9.9：回环上相对裸 UDP 每条消息多约 0.8µs，空闲会话不占 CPU（静止的会话不参与定时器），在途数据在等重传的会话只被检查、不被推进（`rudp_updates` 统计真正推进的次数），每会话约 5.5KB，**容量上限是单 loop**），
+  KCP 来自 vcpkg，库是单独的 `breeze_net_rudp`，设计与威胁模型见 [docs/网络库设计.md](docs/网络库设计.md) §4.14，**UDP 不通时的回退（TCP 兜底、竞速、失败记忆）是业务的事，库不做，建议见 §4.15**，基线见 §9.7、优化见 §9.8、TCP / UDS / UDP / muduo 的完整压测数据见 §9.9：回环上相对裸 UDP 每条消息多约 0.8µs，空闲会话不占 CPU（静止的会话不参与定时器），在途数据在等重传的会话只被检查、不被推进（`rudp_updates` 统计真正推进的次数），每会话约 5.5KB，**容量上限是单 loop**），
   `framework/net` 有 `MainLoopExecutor`（IO 线程事件回投 App 主循环，带入口背压）与 `NetModule`（`udp://` 的 `AddServer` 与 `AddRUdpServer` 是 rudp 服务端；rudp 客户端用 `AddRUdpClient`，**不随模块启动**，业务拿到票据后自己 `Start()`）；
   **`NetModule` 的停机由 main 负责**：`App::Run` 返回后在同一个线程调 `NetModule::Shutdown()`。
-  `base/net` 的目录：公开 API 按概念分 `connection/` `endpoint/` `codec/` `loop/` `stream/`（TCP / UDS 共用的 `StreamServer` / `StreamClient` 基类）；每种传输一个目录，根上是公开的端点 / 选项 / 服务端 / 客户端，`internal/` 是私有实现：`tcp/`（`TcpServer` `TcpClient` `TcpEndpoint` `TcpOptions`）、`uds/`（`UdsServer` `UdsClient` `UdsEndpoint`），`rudp/`（`RUdpServer` `RUdpClient` `RUdpEndpoint` `RUdpTicket` `RUdpOptions` 与线格式 `rudp_protocol.h`，`internal/` 里是 `RUdpConnection` `KcpSession` `UdpSocket` `TicketTable`）；`connection/` 里的 `NetServer` / `NetClient` 是传输无关的服务端 / 客户端接口，`NetModule` 经它们持有；`internal/core`（所有传输共用）与 `internal/stream`（TCP / UDS 共用的实现）；`testing/` 放测试公共件与集成测试，顶层没有散放文件；TCP 专有的选项（keepalive 等）在 `TcpOptions`，UDS 的选项类型里没有；`Connection` 是纯接口（只有虚函数、不能带数据成员），具体类 `StreamConnection` 在 `internal/stream/`；内部头对使用方不可见（例外：公开头 `connection.h` 以路径引用 `internal/core/pollable.h`），测试用 CMake 的 `NET_INTERNAL_INCLUDE_DIRS`；依赖方向与命名规则见 [docs/网络库设计.md](docs/网络库设计.md) §2 / §4.13；
+  `base/net` 的目录**只按概念归类，不做访问控制**：`loop/`（EventLoop / EventLoopGroup、连接表、统计）、`socket/`（`UniqueFd`、地址互转）、`endpoint/`、`codec/`、`connection/`（`IConnection` 接口、句柄、回调、`INetServer` / `INetClient`）、`stream/`（TCP / UDS 共用的字节流：公开的 `StreamServer` / `StreamClient` 基类，`stream/internal/` 里是 `StreamConnection` / `Acceptor` / `Connector` 等实现）；每种传输一个目录，端点 / 选项 / 服务端 / 客户端与它私有的实现放在一起：`tcp/`（`TcpServer` `TcpClient` `TcpEndpoint` `TcpOptions` `tcp_socket`）、`uds/`（`UdsServer` `UdsClient` `UdsEndpoint` `uds_socket`），`rudp/`（`RUdpServer` `RUdpClient` `RUdpEndpoint` `RUdpTicket` `RUdpOptions`、线格式 `rudp_protocol.h`，`rudp/internal/` 里是 `RUdpConnection` `KcpSession` `UdpSocket` `TicketTable`）；`connection/` 里的 `INetServer` / `INetClient` 是传输无关的服务端 / 客户端接口，`NetModule` 经它们持有；`testing/` 放测试公共件、集成测试与不抛异常的检查脚本，顶层没有散放文件；TCP 专有的选项（keepalive 等）在 `TcpOptions`，UDS 的选项类型里没有；`IConnection` 是纯接口（只有虚函数、不能带数据成员），具体类 `StreamConnection` 在 `stream/internal/`；依赖方向与命名规则见 [docs/网络库设计.md](docs/网络库设计.md) §2 / §4.13；
   **tsan 没有在 WSL 本机跑过**（沙箱里起不来），上真机前见 [docs/网络库设计.md](docs/网络库设计.md) §11.2；
   基线 bench 默认不构建：`cmake --preset release -DBREEZE_BUILD_BENCH=ON`（联网拉 muduo 源码），跑 `src/cpp/bench/run_baseline.sh`（1 / 64 / 10000 连接闭环）与 `run_scale.sh`（1000 / 5000 / 10000 / 100000 连接的定速负载、内存、建连、拐点，`--rate`）（`TRANSPORTS="tcp udp"` 选传输，udp 是 rudp 的基线；`net_bench --mem-probe N` 测每连接内存）；
   `tsan` / `asan` 预设跑消毒器（`cmake --preset tsan`），`tsan.supp` 只压制 moodycamel 的 fence 误报。
   **本机没有 `protoc` 时不要跑全量构建**（`breeze_config_schemas` 要它），按 target 构建：`cmake --build build/cpp --target <名>`
 - `src/*/gen/<类别>/` — 生成代码输出目录，不进版本库；一类生成物一个子目录（现有 `config/`，策划表等以后各占一个）。
-  C++ 的 include 根是 `src/cpp/gen`：`#include "config/common_config.h"`。`python3 scripts/configure.py` 一次生成全部
+  C++ 从 `src/cpp` 起算：`#include "gen/config/common_config.h"`。`python3 scripts/configure.py` 一次生成全部
   并配置 cmake；C++ 构建在 schema 变动时也会自动重生成自己那份
 - `config/schema` — 配置 schema（`*.proto`，自定义 option 在 `options.proto`），配置结构的事实源；
   配置数据本身仍是 YAML：`config/common.yaml`（全量，带本机开发默认值，单独可读）+ `config/env/{dev,test,prod}.yaml`

@@ -1,7 +1,7 @@
 // 无测试框架依赖：失败即 abort。文件都写在 /tmp 下（软链在 DrvFs 上不可靠）。
 // Fatal 用例 fork 子进程：必须在父进程没有任何 Logger（即没有后台线程）时进行。
 
-#include "logger.h"
+#include "base/logger/logger.h"
 
 #include <fcntl.h>
 #include <sys/resource.h>
@@ -21,8 +21,8 @@
 #include <string>
 #include <thread>
 
-#include "hourly_file_sink.h"
-#include "logger_macros.h"
+#include "base/logger/internal/hourly_file_sink.h"
+#include "base/logger/logger_macros.h"
 
 using namespace breeze;
 namespace fs = std::filesystem;

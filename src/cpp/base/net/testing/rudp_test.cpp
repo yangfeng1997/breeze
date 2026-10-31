@@ -10,13 +10,13 @@
 #include <cstring>
 #include <thread>
 
-#include "event_loop_group.h"
-#include "group_access.h"
-#include "net_test_util.h"
-#include "rudp_client.h"
-#include "rudp_server.h"
-#include "rudp_test_util.h"
-#include "tcp_server.h"
+#include "base/net/loop/event_loop_group.h"
+#include "base/net/loop/group_access.h"
+#include "base/net/rudp/rudp_client.h"
+#include "base/net/rudp/rudp_server.h"
+#include "base/net/tcp/tcp_server.h"
+#include "base/net/testing/net_test_util.h"
+#include "base/net/testing/rudp_test_util.h"
 
 using namespace breeze;
 using namespace breeze::testing;
@@ -80,7 +80,7 @@ struct Env
 
 void EchoBack(EventRecorder& r)
 {
-    r.on_message = [](Connection& c, std::string_view sv) { Echo(c, sv); };
+    r.on_message = [](IConnection& c, std::string_view sv) { Echo(c, sv); };
 }
 
 std::string Numbered(int i, std::size_t pad = 0)
@@ -119,14 +119,14 @@ void TestPeerInfo()
     std::optional<Endpoint> server_saw, client_saw;
     bool creds = false;
     Env env;
-    env.srv.on_connected = [&](Connection& c)
+    env.srv.on_connected = [&](IConnection& c)
     {
         const std::lock_guard lk(mu);
         server_saw = c.peer().endpoint;
         creds = creds || c.peer().credentials.has_value();
     };
     EventRecorder cli;
-    cli.on_connected = [&](Connection& c)
+    cli.on_connected = [&](IConnection& c)
     {
         const std::lock_guard lk(mu);
         client_saw = c.peer().endpoint;
@@ -182,7 +182,7 @@ void TestBidirectionalBulk()
 {
     Env env;
     constexpr int kN = 500;
-    env.srv.on_connected = [](Connection& c)
+    env.srv.on_connected = [](IConnection& c)
     {
         for (int i = 0; i < kN; ++i)
         {
@@ -365,7 +365,7 @@ void TestPauseBackpressureThenResume()
 {
     std::atomic<int> got{0};
     Env env;
-    env.srv.on_message = [&](Connection& c, std::string_view)
+    env.srv.on_message = [&](IConnection& c, std::string_view)
     {
         if (got.fetch_add(1) + 1 == 5)
             c.PauseRead();
@@ -395,7 +395,7 @@ void TestPauseBackpressureThenResume()
 void TestSlowConsumerHighWater()
 {
     Env env;
-    env.srv.on_message = [](Connection& c, std::string_view) { c.PauseRead(); }; // 收到第一条就不再读
+    env.srv.on_message = [](IConnection& c, std::string_view) { c.PauseRead(); }; // 收到第一条就不再读
     EventRecorder cli;
     RUdpClientOptions co;
     co.connection.high_water_mark = 64 * 1024;
@@ -420,7 +420,7 @@ void TestPausedSessionIsNotIdleClosed()
     RUdpServerOptions so;
     so.connection.idle_timeout = 600ms;
     Env env(std::move(so));
-    env.srv.on_message = [](Connection& c, std::string_view) { c.PauseRead(); };
+    env.srv.on_message = [](IConnection& c, std::string_view) { c.PauseRead(); };
     EventRecorder cli;
     RUdpClientOptions co;
     co.ping_interval = 0ms; // 不发心跳：对端静默
@@ -616,7 +616,7 @@ void TestShutdownWithLiveTraffic()
         EventLoopGroup group(EventLoopGroupOptions{2, 256});
         CHECK(group.Start() == 0);
         EventRecorder srv, cli;
-        srv.on_message = [](Connection& c, std::string_view sv) { Echo(c, sv); };
+        srv.on_message = [](IConnection& c, std::string_view sv) { Echo(c, sv); };
         RUdpServer server(group, RUdpLoopback(), RUdpServerOptions{}, srv);
         CHECK(server.Start() == 0);
         std::vector<std::unique_ptr<RUdpClient>> clients;
@@ -729,8 +729,8 @@ void TestSharesGroupWithTcp()
     EventLoopGroup group(EventLoopGroupOptions{2, 256});
     CHECK(group.Start() == 0);
     EventRecorder tcp_srv, rudp_srv, rudp_cli;
-    tcp_srv.on_message = [](Connection& c, std::string_view sv) { Echo(c, sv); };
-    rudp_srv.on_message = [](Connection& c, std::string_view sv) { Echo(c, "R:" + std::string(sv)); };
+    tcp_srv.on_message = [](IConnection& c, std::string_view sv) { Echo(c, sv); };
+    rudp_srv.on_message = [](IConnection& c, std::string_view sv) { Echo(c, "R:" + std::string(sv)); };
     LengthPrefixCodecFactory factory(1 << 20);
     TcpServer tcp(group, *TcpEndpoint::Make("127.0.0.1", 0), TcpServerOptions{}, tcp_srv, factory);
     CHECK(tcp.Start() == 0);
@@ -767,8 +767,8 @@ void TestConnectionContext()
     };
     std::atomic<int> seen{0};
     Env env;
-    env.srv.on_connected = [](Connection& c) { c.SetContext(std::make_unique<Note>(42)); };
-    env.srv.on_message = [&](Connection& c, std::string_view) { seen = c.GetContext<Note>()->value; };
+    env.srv.on_connected = [](IConnection& c) { c.SetContext(std::make_unique<Note>(42)); };
+    env.srv.on_message = [&](IConnection& c, std::string_view) { seen = c.GetContext<Note>()->value; };
     EventRecorder cli;
     auto c = env.Connected(cli);
     CHECK(c->Send(Buf("x")) == SendResult::Ok);
@@ -788,7 +788,7 @@ void TestFlushOnSendLatency()
         RUdpServerOptions so;
         so.rudp.interval_ms = 100;
         Env env(std::move(so));
-        env.srv.on_message = [&](Connection&, std::string_view sv)
+        env.srv.on_message = [&](IConnection&, std::string_view sv)
         {
             const auto sent =
                 std::chrono::steady_clock::time_point(std::chrono::steady_clock::duration(std::stoll(std::string(sv))));
@@ -849,7 +849,7 @@ void TestBurstWithinWindowIsNotSlowConsumer()
     RUdpServerOptions so;
     so.connection.high_water_mark = 32 * 1024;
     Env env(std::move(so));
-    env.srv.on_connected = [](Connection& c)
+    env.srv.on_connected = [](IConnection& c)
     {
         const std::string m(1000, 'b');
         for (int i = 0; i < 150; ++i)
