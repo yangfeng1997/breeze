@@ -35,6 +35,7 @@
   `base/container` 是 `FlatHashMap` / `FlatHashSet`（Swiss table）与 `LinkedHashMap` / `LinkedHashSet`（保持插入顺序，可当 LRU），
   **插入可能让迭代器 / 引用失效、元素的移动构造必须 noexcept、`at()` 找不到键就 abort**，见 [docs/基础容器库.md](docs/基础容器库.md)；
   这几个库的 **tsan 同样没在本机跑过**，容器 bench 默认不构建：`cmake --preset release -DBREEZE_BUILD_CONTAINER_BENCH=ON`；
+  `base/shm`（仅 Linux）是 Sidecar 同机通道的底座：封印过的 memfd 里两条单向 SPSC 字节环 + eventfd（`ShmChannel` / `RingProducer` / `RingConsumer`），记录 64 字节对齐、环做镜像映射，**对端写的每个字节都当不可信输入**（接手校验必须对"对端还活着"安全，`RingStateValid` 有推导）；唤醒靠睡眠标志加 `seq_cst` 栅栏（Dekker），**测试里不要绑核**（亲和性会被新线程继承，锁步用例会慢到卡死）；**tsan 同样没在本机跑过，ARM 也没跑过**（x86 看不出 release / acquire 写错）；没有任何性能基准；设计与验证状态见 [docs/共享内存IPC设计.md](docs/共享内存IPC设计.md) §11 / §12；
   `base/net` 是 Reactor 网络库（仅 Linux）：`Endpoint` / `SharedBuffer` / `Buffer` / `FrameCodec` 等基础件，
   `EventLoop` / `Connection` / `ConnectionHandle` / `EventLoopGroup` / `TcpServer` / `UdsServer` / `TcpClient` / `UdsClient`（基类 `StreamServer` / `StreamClient`，含重连）已完整，
   `RUdpServer` / `RUdpClient`（可靠 UDP：KCP 之上的消息通道，凭控制面发的一次性票据握手、**不自动重连**、**v1 没有加密 / 不支持迁移 / 一个服务端只用一个 loop**，
@@ -62,7 +63,9 @@
 - `docs/` — 设计文档。服务间通信的基线是
   [docs/Actor模型与RPC设计.md](docs/Actor模型与RPC设计.md)：实现 RPC 或 actor 层前先读它。
   C++ 网络库（`base/queue` / `base/net` / `framework/net`）的设计基线是
-  [docs/网络库设计.md](docs/网络库设计.md)：动网络库前先读它
+  [docs/网络库设计.md](docs/网络库设计.md)：动网络库前先读它；
+  Sidecar 的同机共享内存通道（`memfd` + 两条 SPSC 环 + `eventfd`；**`base/shm` 已实现，握手 / 保留 / Reattach / 控制消息尚未实现**）见
+  [docs/共享内存IPC设计.md](docs/共享内存IPC设计.md)
 - `scripts/` — `configure.py`（生成代码 + 配置 cmake，只用标准库）与 Windows 环境脚本（**目录名拼写如此，勿"修正"**）
 - `build/`、`run/` — 构建产物，不进版本库
 

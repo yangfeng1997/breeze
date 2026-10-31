@@ -56,6 +56,7 @@ set(KERNEL_DIR framework/kernel)
 set(QUEUE_DIR base/queue)
 set(BUFFER_DIR base/buffer)
 set(THREAD_DIR base/thread)
+set(SHM_DIR base/shm)
 set(ASSERT_DIR base/assert)
 set(BACKTRACE_DIR base/backtrace)
 set(DEFER_DIR base/defer)
@@ -278,6 +279,19 @@ if(BREEZE_BUILD_NET)
   target_link_libraries(breeze_thread PUBLIC Threads::Threads PRIVATE breeze_logger)
   target_compile_options(breeze_thread PRIVATE -Wall -Wextra)
   breeze_apply_log_level(breeze_thread)
+
+  # 共享内存通道的底座（Sidecar 的同机通道，设计见 docs/共享内存IPC设计.md）：memfd 封印、镜像映射、SPSC 字节环、唤醒协议。
+  # 纯数据结构，不依赖 EventLoop 与网络，不写日志，错误以 errno / 状态码返回。用 memfd_create / eventfd，只支持 Linux。
+  # breeze_time 只 PRIVATE：时钟读数在 shm_ring.cpp 里，公开头不含它。
+  add_library(breeze_shm
+    ${SHM_DIR}/shm_defs.cpp
+    ${SHM_DIR}/shm_memfd.cpp
+    ${SHM_DIR}/shm_mirror_map.cpp
+    ${SHM_DIR}/shm_ring.cpp
+    ${SHM_DIR}/shm_channel.cpp)
+  target_include_directories(breeze_shm PUBLIC ${SHM_DIR})
+  target_link_libraries(breeze_shm PRIVATE breeze_time)
+  target_compile_options(breeze_shm PRIVATE -Wall -Wextra)
 
   # 内部头目录是 PRIVATE，日志同理只 PRIVATE，使用方看不到这个依赖；测试要直接用内部头时自己加 NET_INTERNAL_INCLUDE_DIRS。
   # PUBLIC 的 ${NET_DIR} 本身（不带子目录）只为下面那个例外保留。
@@ -604,6 +618,20 @@ if(BREEZE_BUILD_NET)
   breeze_thread_test(spin_lock_test)
   breeze_thread_test(wait_group_test)
   breeze_thread_test(thread_pool_test)
+
+  # base/shm 的测试：只依赖 breeze_shm。多进程用例用 fork；tsan 没有在本机跑过（设计文档 §12），真机上要补。
+  function(breeze_shm_test name)
+    add_executable(${name} ${SHM_DIR}/${name}.cpp)
+    target_link_libraries(${name} PRIVATE breeze_shm Threads::Threads)
+    target_compile_options(${name} PRIVATE -Wall -Wextra)
+    add_test(NAME ${name} COMMAND ${name})
+    set_tests_properties(${name} PROPERTIES ENVIRONMENT "${BREEZE_TEST_ENV}" TIMEOUT 240)
+  endfunction()
+
+  breeze_shm_test(shm_layout_test)
+  breeze_shm_test(shm_ring_test)
+  breeze_shm_test(shm_untrusted_test)
+  breeze_shm_test(shm_multiprocess_test)
 
   # base/backtrace 与 base/assert 的测试。符号名要 -rdynamic（ENABLE_EXPORTS），否则 dladdr 看不到可执行文件自己的函数。
   # logger 是 breeze_assert 的 PRIVATE 依赖，测试要读日志写到 stderr 的内容，不需要直接链它。
