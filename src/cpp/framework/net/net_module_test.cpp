@@ -1,9 +1,12 @@
-// NetModule 挂进真实的 App：业务回调在 App 主循环线程上、Wake 的预算耗尽能续跑、NetClient 经模块装配、
+// NetModule 挂进真实的 App：业务回调在 App 主循环线程上、Wake 的预算耗尽能续跑、StreamClient 经模块装配、
 // Start 失败时自清理且 Run 返回带 endpoint 与 strerror 的错误、非法 endpoint /
 // 错误阶段的错误、配置驱动的选项、停机排空。 无测试框架依赖：失败即 abort。
 
 #include "net_module.h"
 
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -120,10 +123,11 @@ private:
 class BizModule final : public Module
 {
 public:
-    BizModule(App& app, Biz& biz, std::string listen)
+    BizModule(App& app, Biz& biz, std::string listen, std::optional<StreamServerOptions> options = std::nullopt)
         : Module(app)
         , biz_(biz)
         , listen_(std::move(listen))
+        , options_(std::move(options))
     {
     }
 
@@ -133,7 +137,8 @@ public:
     Result<> Init() override
     {
         net_ = app().GetModule<NetModule>("net");
-        auto s = net_->AddServer(listen_, biz_, factory_);
+        auto s = options_ ? net_->AddServer(listen_, biz_, factory_, std::move(*options_))
+                          : net_->AddServer(listen_, biz_, factory_);
         if (!s)
             return std::unexpected(s.error());
         server_ = *s;
@@ -153,11 +158,54 @@ public:
 private:
     Biz& biz_;
     std::string listen_;
+    std::optional<StreamServerOptions> options_; // 有值就走显式选项的 AddServer 重载
     LengthPrefixCodecFactory factory_{1 << 20};
     NetModule* net_ = nullptr;
-    NetServer* server_ = nullptr;
+    StreamServer* server_ = nullptr;
     Endpoint bound_ = *Endpoint::Tcp("127.0.0.1", 1);
     std::atomic<bool> ready_{false};
+};
+
+// 依赖 net 的"客户端业务模块"：在 Init 里装配一个 client。
+class ClientModule final : public Module
+{
+public:
+    using Explicit = std::pair<StreamClientOptions, ReconnectPolicy>;
+
+    ClientModule(App& a,
+                 Biz& biz,
+                 const FrameCodecFactory& f,
+                 std::string target,
+                 StreamClient*& out,
+                 std::optional<Explicit> options = std::nullopt)
+        : Module(a)
+        , biz_(biz)
+        , f_(f)
+        , target_(std::move(target))
+        , out_(out)
+        , options_(std::move(options))
+    {
+    }
+    std::string_view Name() const override { return "cli"; }
+    std::vector<std::string_view> DependsOn() const override { return {"net"}; }
+    Result<> Init() override
+    {
+        auto* net = app().GetModule<NetModule>("net");
+        auto c = options_ ? net->AddClient(target_, biz_, f_, std::move(options_->first), options_->second)
+                          : net->AddClient(target_, biz_, f_);
+        if (!c)
+            return std::unexpected(c.error());
+        out_ = *c;
+        return {};
+    }
+    Result<> Start() override { return {}; }
+
+private:
+    Biz& biz_;
+    const FrameCodecFactory& f_;
+    std::string target_;
+    StreamClient*& out_;
+    std::optional<Explicit> options_;
 };
 
 NetModuleOptions SmallOptions(std::size_t wake_budget = 1024)
@@ -196,6 +244,41 @@ struct Runner
     std::atomic<bool> done{false};
     std::thread thread;
 };
+
+// 本进程里设了某个 TCP_KEEPIDLE 的 TCP socket（选项里取特殊值，别处不会碰巧相同）：验证选项真的传到了 socket 上。
+int FindTcpSocketWithKeepIdle(int idle_s)
+{
+    for (int fd = 0; fd < 1024; ++fd)
+    {
+        int v = 0;
+        socklen_t len = sizeof(v);
+        if (::getsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &v, &len) == 0 && v == idle_s)
+            return fd;
+    }
+    return -1;
+}
+
+int GetIntOpt(int fd, int level, int name)
+{
+    int v = -1;
+    socklen_t len = sizeof(v);
+    CHECK(::getsockopt(fd, level, name, &v, &len) == 0);
+    return v;
+}
+
+void CheckTcpOptions(int fd, int idle_s, int interval_s, int count, int user_timeout_ms)
+{
+    CHECK(GetIntOpt(fd, SOL_SOCKET, SO_KEEPALIVE) == 1);
+    CHECK(GetIntOpt(fd, IPPROTO_TCP, TCP_KEEPIDLE) == idle_s);
+    CHECK(GetIntOpt(fd, IPPROTO_TCP, TCP_KEEPINTVL) == interval_s);
+    CHECK(GetIntOpt(fd, IPPROTO_TCP, TCP_KEEPCNT) == count);
+    CHECK(GetIntOpt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT) == user_timeout_ms);
+}
+
+std::string AbstractUri(const char* tag)
+{
+    return std::string("unix-abstract://breeze-net-module-test-") + tag + "-" + std::to_string(::getpid());
+}
 
 // ---- 回调在主循环线程；Wake 预算耗尽能续跑 ----
 
@@ -265,7 +348,7 @@ void TestAssemblyAfterStartIsPhaseError()
 }
 
 // client 通路：先起 server 的 App 拿到端点，再起第二个 App，用 AddClient 连过去。
-void TestClientThroughModule()
+void TestClientThroughModule(const std::string& listen)
 {
     const LeakCheck leak;
     Biz server_biz;
@@ -275,7 +358,7 @@ void TestClientThroughModule()
     server_app.RegisterModule(
         [&](App& a)
         {
-            auto m = std::make_unique<BizModule>(a, server_biz, "tcp://127.0.0.1:0");
+            auto m = std::make_unique<BizModule>(a, server_biz, listen);
             bm = m.get();
             return m;
         });
@@ -286,36 +369,7 @@ void TestClientThroughModule()
     Biz client_biz;
     client_biz.echo = false;
     LengthPrefixCodecFactory factory(1 << 20);
-    NetClient* client = nullptr;
-    class ClientModule final : public Module
-    {
-    public:
-        ClientModule(App& a, Biz& biz, const FrameCodecFactory& f, std::string target, NetClient*& out)
-            : Module(a)
-            , biz_(biz)
-            , f_(f)
-            , target_(std::move(target))
-            , out_(out)
-        {
-        }
-        std::string_view Name() const override { return "cli"; }
-        std::vector<std::string_view> DependsOn() const override { return {"net"}; }
-        Result<> Init() override
-        {
-            auto c = app().GetModule<NetModule>("net")->AddClient(target_, biz_, f_);
-            if (!c)
-                return std::unexpected(c.error());
-            out_ = *c;
-            return {};
-        }
-        Result<> Start() override { return {}; }
-
-    private:
-        Biz& biz_;
-        const FrameCodecFactory& f_;
-        std::string target_;
-        NetClient*& out_;
-    };
+    StreamClient* client = nullptr;
     App client_app("net-client");
     client_app.RegisterModule([](App& a) { return std::make_unique<NetModule>(a, SmallOptions()); });
     client_app.RegisterModule([&](App& a)
@@ -329,6 +383,291 @@ void TestClientThroughModule()
     CHECK(client_biz.payloads()[0] == "ping");
     CHECK(client_biz.threads().size() == 1 && client_biz.threads()[0] == client_run.tid.load());
     CHECK(server_biz.threads().size() == 1 && server_biz.threads()[0] == server_run.tid.load());
+}
+
+// ---- 选项经 NetModule 传到类型化的服务端 / 客户端上（TCP 与 UDS 各走一支） ----
+
+// NetModuleOptions::tcp 是 AddServer / AddClient 不另给选项时的默认：服务端 accept 的与客户端发起的 TCP 连接都得到它。
+void TestModuleDefaultTcpOptionsReachSockets()
+{
+    const LeakCheck leak;
+    NetModuleOptions so = SmallOptions();
+    so.tcp.keepalive_idle = 53s;
+    so.tcp.keepalive_interval = 11s;
+    so.tcp.keepalive_count = 6;
+    so.tcp.tcp_user_timeout = 27000ms;
+    Biz server_biz;
+    App server_app("net-server");
+    server_app.RegisterModule([&](App& a) { return std::make_unique<NetModule>(a, so); });
+    BizModule* bm = nullptr;
+    server_app.RegisterModule(
+        [&](App& a)
+        {
+            auto m = std::make_unique<BizModule>(a, server_biz, "tcp://127.0.0.1:0");
+            bm = m.get();
+            return m;
+        });
+    Runner server_run(server_app);
+    CHECK(WaitUntil([&] { return bm != nullptr && bm->ready(); }));
+
+    NetModuleOptions co = SmallOptions();
+    co.tcp.keepalive_idle = 57s;
+    co.tcp.keepalive_interval = 13s;
+    co.tcp.keepalive_count = 4;
+    co.tcp.tcp_user_timeout = 29000ms;
+    Biz client_biz;
+    LengthPrefixCodecFactory factory(1 << 20);
+    StreamClient* client = nullptr;
+    App client_app("net-client");
+    client_app.RegisterModule([&](App& a) { return std::make_unique<NetModule>(a, co); });
+    client_app.RegisterModule(
+        [&](App& a) { return std::make_unique<ClientModule>(a, client_biz, factory, bm->bound().ToString(), client); });
+    Runner client_run(client_app);
+    CHECK(WaitUntil([&] { return client_biz.connected() == 1 && server_biz.connected() == 1; }));
+
+    const int server_fd = FindTcpSocketWithKeepIdle(53);
+    const int client_fd = FindTcpSocketWithKeepIdle(57);
+    CHECK(server_fd >= 0 && client_fd >= 0 && server_fd != client_fd);
+    CheckTcpOptions(server_fd, 53, 11, 6, 27000);
+    CheckTcpOptions(client_fd, 57, 13, 4, 29000);
+}
+
+// NetModuleOptions::connection 是 AddServer / AddClient 不另给选项时的默认：服务端 accept 的与客户端发起的连接都得到它。
+void TestModuleDefaultConnectionOptionsReach(const std::string& listen)
+{
+    const LeakCheck leak;
+    {
+        NetModuleOptions so = SmallOptions();
+        so.connection.idle_timeout = 300ms;
+        Biz biz;
+        App app("net-server");
+        app.RegisterModule([&](App& a) { return std::make_unique<NetModule>(a, so); });
+        BizModule* bm = nullptr;
+        app.RegisterModule(
+            [&](App& a)
+            {
+                auto m = std::make_unique<BizModule>(a, biz, listen);
+                bm = m.get();
+                return m;
+            });
+        Runner run(app);
+        CHECK(WaitUntil([&] { return bm != nullptr && bm->ready(); }));
+        TestClient idle(bm->bound());
+        CHECK(WaitUntil([&] { return biz.closed() == 1; }));
+        CHECK(biz.closed_list()[0].second == CloseReason::IdleTimeout);
+    }
+    {
+        Biz server_biz;
+        App server_app("net-server");
+        server_app.RegisterModule([](App& a) { return std::make_unique<NetModule>(a, SmallOptions()); });
+        BizModule* bm = nullptr;
+        server_app.RegisterModule(
+            [&](App& a)
+            {
+                auto m = std::make_unique<BizModule>(a, server_biz, listen);
+                bm = m.get();
+                return m;
+            });
+        Runner server_run(server_app);
+        CHECK(WaitUntil([&] { return bm != nullptr && bm->ready(); }));
+
+        NetModuleOptions co = SmallOptions();
+        co.connection.idle_timeout = 300ms;
+        Biz client_biz;
+        client_biz.echo = false;
+        LengthPrefixCodecFactory factory(1 << 20);
+        StreamClient* client = nullptr;
+        App client_app("net-client");
+        client_app.RegisterModule([&](App& a) { return std::make_unique<NetModule>(a, co); });
+        client_app.RegisterModule(
+            [&](App& a)
+            { return std::make_unique<ClientModule>(a, client_biz, factory, bm->bound().ToString(), client); });
+        Runner client_run(client_app);
+        CHECK(WaitUntil([&] { return client_biz.closed() >= 1; }));
+        CHECK(client_biz.closed_list()[0].second == CloseReason::IdleTimeout);
+    }
+}
+
+// 显式选项的 AddServer 重载：每个字段都要传到类型化的服务端上。accept_filter 与 idle_timeout 对两种传输都生效。
+void TestExplicitServerOptionsReachTypedServers(const std::string& listen)
+{
+    const LeakCheck leak;
+    Biz biz;
+    App app("net-test");
+    app.RegisterModule([](App& a) { return std::make_unique<NetModule>(a, SmallOptions()); });
+    std::atomic<int> filter_calls{0};
+    StreamServerOptions so;
+    so.connection.idle_timeout = 300ms;
+    so.accept_filter = [&](const PeerInfo&) noexcept { return filter_calls.fetch_add(1) != 0; }; // 第一条拒绝，之后放行
+    BizModule* bm = nullptr;
+    app.RegisterModule(
+        [&](App& a)
+        {
+            auto m = std::make_unique<BizModule>(a, biz, listen, std::move(so));
+            bm = m.get();
+            return m;
+        });
+    Runner run(app);
+    CHECK(WaitUntil([&] { return bm != nullptr && bm->ready(); }));
+
+    TestClient first(bm->bound());
+    CHECK(first.WaitClosed());
+    CHECK(bm->net()->group().GetStats().rejected_filter == 1);
+    CHECK(biz.connected() == 0);
+
+    TestClient second(bm->bound());
+    CHECK(WaitUntil([&] { return biz.connected() == 1; }));
+    CHECK(WaitUntil([&] { return biz.closed() == 1; })); // 什么都不发：idle_timeout 传到了连接上
+    CHECK(biz.closed_list()[0].second == CloseReason::IdleTimeout);
+}
+
+// 显式选项里的 tcp 只对 TCP 端点生效，经显式重载也要传到 socket 上。
+void TestExplicitServerTcpOptionsReachSocket()
+{
+    const LeakCheck leak;
+    Biz biz;
+    App app("net-test");
+    app.RegisterModule([](App& a) { return std::make_unique<NetModule>(a, SmallOptions()); });
+    StreamServerOptions so;
+    so.tcp.keepalive_idle = 59s;
+    so.tcp.keepalive_interval = 12s;
+    so.tcp.keepalive_count = 5;
+    so.tcp.tcp_user_timeout = 28000ms;
+    BizModule* bm = nullptr;
+    app.RegisterModule(
+        [&](App& a)
+        {
+            auto m = std::make_unique<BizModule>(a, biz, "tcp://127.0.0.1:0", std::move(so));
+            bm = m.get();
+            return m;
+        });
+    Runner run(app);
+    CHECK(WaitUntil([&] { return bm != nullptr && bm->ready(); }));
+    TestClient c(bm->bound());
+    CHECK(WaitUntil([&] { return biz.connected() == 1; }));
+    const int fd = FindTcpSocketWithKeepIdle(59);
+    CHECK(fd >= 0);
+    CheckTcpOptions(fd, 59, 12, 5, 28000);
+}
+
+// 显式选项的 AddClient 重载：on_connect_failed、connection、tcp 都要传到类型化的客户端上。
+void TestExplicitClientOptionsReachTypedClients(bool tcp)
+{
+    const LeakCheck leak;
+    // 一个"连不上"的对端：TCP 是先占一个端口再释放，UDS 是不存在的抽象名
+    std::string dead;
+    if (tcp)
+    {
+        UniqueFd fd;
+        std::optional<Endpoint> ep;
+        CHECK(sock::CreateStreamSocket(*Endpoint::Tcp("127.0.0.1", 0), fd) == 0);
+        CHECK(sock::Bind(fd.get(), *Endpoint::Tcp("127.0.0.1", 0)) == 0);
+        CHECK(sock::LocalEndpoint(fd.get(), ep) == 0 && ep.has_value());
+        dead = ep->ToString();
+    }
+    else
+        dead = AbstractUri("dead");
+
+    std::atomic<int> err{0};
+    std::atomic<int> retry{-1};
+    StreamClientOptions co;
+    co.on_connect_failed = [&](int e, bool will_retry) noexcept
+    {
+        retry = will_retry ? 1 : 0;
+        err = e;
+    };
+    Biz biz;
+    LengthPrefixCodecFactory factory(1 << 20);
+    StreamClient* client = nullptr;
+    App app("net-client");
+    app.RegisterModule([](App& a) { return std::make_unique<NetModule>(a, SmallOptions()); });
+    app.RegisterModule(
+        [&](App& a)
+        {
+            return std::make_unique<ClientModule>(
+                a, biz, factory, dead, client, ClientModule::Explicit{std::move(co), ReconnectPolicy{}});
+        });
+    Runner run(app);
+    CHECK(WaitUntil([&] { return err.load() != 0; }));
+    CHECK(err == ECONNREFUSED && retry == 1); // 抽象名没人监听时内核也是 ECONNREFUSED（路径型才是 ENOENT）
+}
+
+// connect_timeout ≤ 0 是不合法选项：显式选项传到类型化的客户端上，Start 失败，App::Run 报错返回。
+void TestExplicitClientConnectTimeoutReaches(const std::string& target)
+{
+    const LeakCheck leak;
+    StreamClientOptions co;
+    co.connect_timeout = 0ms;
+    Biz biz;
+    LengthPrefixCodecFactory factory(1 << 20);
+    StreamClient* client = nullptr;
+    App app("net-client");
+    app.RegisterModule([](App& a) { return std::make_unique<NetModule>(a, SmallOptions()); });
+    app.RegisterModule(
+        [&](App& a)
+        {
+            return std::make_unique<ClientModule>(
+                a, biz, factory, target, client, ClientModule::Explicit{std::move(co), ReconnectPolicy{}});
+        });
+    std::stop_source ss;
+    const auto r = app.Run(ss.get_token()); // 直接在本线程跑：Start 失败时立即返回
+    CHECK(!r);
+    CHECK(Has(r.error().msg, std::strerror(EINVAL)));
+}
+
+// 显式客户端选项里的 connection 与 tcp：idle_timeout 让客户端侧的连接以 IdleTimeout 关闭（TCP 与 UDS 都生效）；
+// tcp 只对 TCP 生效，传到 socket 上。
+void TestExplicitClientConnectionAndTcpOptionsReach(const std::string& listen)
+{
+    const bool is_tcp = listen.starts_with("tcp://");
+    const LeakCheck leak;
+    Biz server_biz;
+    App server_app("net-server");
+    server_app.RegisterModule([](App& a) { return std::make_unique<NetModule>(a, SmallOptions()); });
+    BizModule* bm = nullptr;
+    server_app.RegisterModule(
+        [&](App& a)
+        {
+            auto m = std::make_unique<BizModule>(a, server_biz, listen);
+            bm = m.get();
+            return m;
+        });
+    Runner server_run(server_app);
+    CHECK(WaitUntil([&] { return bm != nullptr && bm->ready(); }));
+
+    StreamClientOptions co;
+    co.tcp.keepalive_idle = 61s;
+    co.tcp.keepalive_interval = 14s;
+    co.tcp.keepalive_count = 3;
+    co.tcp.tcp_user_timeout = 26000ms;
+    co.connection.idle_timeout = 600ms;
+    Biz client_biz;
+    client_biz.echo = false;
+    LengthPrefixCodecFactory factory(1 << 20);
+    StreamClient* client = nullptr;
+    App client_app("net-client");
+    client_app.RegisterModule([](App& a) { return std::make_unique<NetModule>(a, SmallOptions()); });
+    client_app.RegisterModule(
+        [&](App& a)
+        {
+            return std::make_unique<ClientModule>(a,
+                                                  client_biz,
+                                                  factory,
+                                                  bm->bound().ToString(),
+                                                  client,
+                                                  ClientModule::Explicit{std::move(co), ReconnectPolicy{}});
+        });
+    Runner client_run(client_app);
+    CHECK(WaitUntil([&] { return client_biz.connected() >= 1; }));
+    if (is_tcp)
+    {
+        const int fd = FindTcpSocketWithKeepIdle(61);
+        CHECK(fd >= 0);
+        CheckTcpOptions(fd, 61, 14, 3, 26000);
+    }
+    // 什么都不发：客户端侧的连接被 idle_timeout 关闭
+    CHECK(WaitUntil([&] { return client_biz.closed() >= 1; }));
+    CHECK(client_biz.closed_list()[0].second == CloseReason::IdleTimeout);
 }
 
 // ---- 停机：Run 返回之后 main 调 Shutdown，业务看到每条连接的 OnClosed ----
@@ -443,9 +782,9 @@ void TestStartFailureRollsBackAndReportsEndpoint()
 {
     const LeakCheck leak;
     // 占住一个端口
-    Fd blocker;
+    UniqueFd blocker;
     const Endpoint any = *Endpoint::Tcp("127.0.0.1", 0);
-    CHECK(sock::Create(any, blocker) == 0 && sock::Bind(blocker.get(), any) == 0 &&
+    CHECK(sock::CreateStreamSocket(any, blocker) == 0 && sock::Bind(blocker.get(), any) == 0 &&
           sock::Listen(blocker.get(), 8) == 0);
     std::optional<Endpoint> taken;
     CHECK(sock::LocalEndpoint(blocker.get(), taken) == 0 && taken);
@@ -521,9 +860,8 @@ void TestOptionsFromConfig()
     const NetModuleOptions o = NetModuleOptionsFrom(c);
     CHECK(o.group.io_threads == 7 && o.group.max_connections_per_loop == 1000);
     CHECK(o.connection.high_water_mark == 4096 && o.connection.idle_timeout == 1500ms);
-    CHECK(o.connection.keepalive_idle == 30s && o.connection.keepalive_interval == 5s &&
-          o.connection.keepalive_count == 2);
-    CHECK(o.connection.tcp_user_timeout == 20000ms);
+    CHECK(o.tcp.keepalive_idle == 30s && o.tcp.keepalive_interval == 5s && o.tcp.keepalive_count == 2);
+    CHECK(o.tcp.tcp_user_timeout == 20000ms);
     CHECK(o.inbound.max_messages_per_conn == 10 && o.inbound.max_bytes_per_conn == 2048);
     CHECK(o.inbound.global_budget_bytes == 3u * 1024 * 1024);
     CHECK(o.wake_budget == 77 && o.shutdown_deadline == 1234ms);
@@ -547,8 +885,7 @@ void TestModuleReadsNetSectionFromConfig()
     const NetModuleOptions& o = net->options();
     CHECK(o.group.io_threads == 4 && o.group.max_connections_per_loop == 65536);
     CHECK(o.connection.high_water_mark == 262144 && o.connection.idle_timeout == 0ms);
-    CHECK(o.connection.keepalive_idle == 60s && o.connection.keepalive_interval == 10s &&
-          o.connection.keepalive_count == 3);
+    CHECK(o.tcp.keepalive_idle == 60s && o.tcp.keepalive_interval == 10s && o.tcp.keepalive_count == 3);
     CHECK(o.inbound.max_messages_per_conn == 256 && o.inbound.max_bytes_per_conn == 65536);
     CHECK(o.inbound.global_budget_bytes == 256ull * 1024 * 1024);
     CHECK(o.wake_budget == 1024 && o.shutdown_deadline == 5000ms);
@@ -571,7 +908,20 @@ int main()
 {
     TestCallbacksOnMainLoopAndWakeBudgetContinues();
     TestAssemblyAfterStartIsPhaseError();
-    TestClientThroughModule();
+    TestClientThroughModule("tcp://127.0.0.1:0");
+    TestClientThroughModule(AbstractUri("echo"));
+    TestModuleDefaultTcpOptionsReachSockets();
+    TestExplicitServerOptionsReachTypedServers("tcp://127.0.0.1:0");
+    TestExplicitServerOptionsReachTypedServers(AbstractUri("opts"));
+    TestExplicitServerTcpOptionsReachSocket();
+    TestExplicitClientOptionsReachTypedClients(/*tcp=*/true);
+    TestExplicitClientOptionsReachTypedClients(/*tcp=*/false);
+    TestExplicitClientConnectTimeoutReaches("tcp://127.0.0.1:1");
+    TestExplicitClientConnectTimeoutReaches(AbstractUri("timeout"));
+    TestExplicitClientConnectionAndTcpOptionsReach("tcp://127.0.0.1:0");
+    TestExplicitClientConnectionAndTcpOptionsReach(AbstractUri("cliopts"));
+    TestModuleDefaultConnectionOptionsReach("tcp://127.0.0.1:0");
+    TestModuleDefaultConnectionOptionsReach(AbstractUri("defconn"));
     TestShutdownDrainsEveryClosed();
     TestShutdownKeepsDrainingWhileWaiting();
     TestStartFailureRollsBackAndReportsEndpoint();

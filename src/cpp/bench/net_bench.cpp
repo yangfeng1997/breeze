@@ -43,11 +43,13 @@
 
 #include "app.h"
 #include "connection.h"
+#include "event_loop_thread.h"
 #include "group_access.h"
 #include "length_prefix_codec.h"
 #include "loop_server.h"
-#include "loop_thread.h"
 #include "net_module.h"
+#include "socket.h"
+#include "tcp_socket.h"
 
 #ifdef BREEZE_BENCH_MUDUO
 #include <muduo/base/Logging.h>
@@ -155,17 +157,17 @@ public:
 
     Endpoint Start(const Endpoint& ep, int cpu) override
     {
-        Fd lfd;
-        REQUIRE(sock::Create(ep, lfd) == 0);
+        UniqueFd lfd;
+        REQUIRE(sock::CreateStreamSocket(ep, lfd) == 0);
         if (ep.kind() == Endpoint::Kind::Tcp)
-            REQUIRE(sock::SetReuseAddr(lfd.get()) == 0);
+            REQUIRE(tcp::SetReuseAddr(lfd.get()) == 0);
         REQUIRE(sock::Bind(lfd.get(), ep) == 0);
         REQUIRE(sock::Listen(lfd.get(), 4096) == 0);
         std::optional<Endpoint> local;
         REQUIRE(sock::LocalEndpoint(lfd.get(), local) == 0 && local);
         tcp_ = ep.kind() == Endpoint::Kind::Tcp;
         lfd_ = std::move(lfd);
-        epfd_ = Fd(::epoll_create1(EPOLL_CLOEXEC));
+        epfd_ = UniqueFd(::epoll_create1(EPOLL_CLOEXEC));
         epoll_event ev{};
         ev.events = EPOLLIN;
         ev.data.ptr = nullptr; // 监听 fd 用空指针标记
@@ -184,7 +186,7 @@ public:
 private:
     struct Conn
     {
-        Fd fd;
+        UniqueFd fd;
         std::unique_ptr<std::byte[]> buf; // cold 模式下的每连接读缓冲
     };
     static constexpr std::size_t kColdCap = 2048;
@@ -205,12 +207,12 @@ private:
                 {
                     for (int k = 0; k < 64; ++k)
                     {
-                        Fd c;
+                        UniqueFd c;
                         std::optional<Endpoint> peer;
                         if (sock::Accept(lfd_.get(), c, peer) != 0)
                             break;
                         if (tcp_)
-                            (void)sock::SetNoDelay(c.get());
+                            (void)tcp::SetNoDelay(c.get());
                         auto conn = std::make_unique<Conn>();
                         if (opt_.cold)
                             conn->buf = std::make_unique_for_overwrite<std::byte[]>(kColdCap);
@@ -290,8 +292,8 @@ private:
     }
 
     RawOptions opt_;
-    Fd lfd_;
-    Fd epfd_;
+    UniqueFd lfd_;
+    UniqueFd epfd_;
     bool tcp_ = true;
     std::atomic<bool> stop_{false};
     std::thread thread_;
@@ -357,7 +359,7 @@ public:
 
 private:
     std::unique_ptr<ConnectionHandler> handler_;
-    LoopThread lt_{LoopOptions{LoopOptions::kNoGroup, 0, 1u << 16}}; // 连接表要装得下 10k 连接
+    EventLoopThread lt_{EventLoopOptions{EventLoopOptions::kNoGroup, 0, 1u << 16}}; // 连接表要装得下 10k 连接
     std::unique_ptr<LengthPrefixCodecFactory> factory_;
     std::unique_ptr<LoopServer> srv_;
 };
@@ -404,7 +406,7 @@ class MainLoopServer final : public EchoServer
         std::string listen_;
         LengthPrefixCodecFactory factory_{1024 * 1024};
         std::promise<Endpoint>& ready_;
-        NetServer* server_ = nullptr;
+        StreamServer* server_ = nullptr;
     };
 
 public:
@@ -481,8 +483,8 @@ public:
         std::uint16_t port = ep.port();
         if (port == 0)
         {
-            Fd probe;
-            REQUIRE(sock::Create(ep, probe) == 0);
+            UniqueFd probe;
+            REQUIRE(sock::CreateStreamSocket(ep, probe) == 0);
             REQUIRE(sock::Bind(probe.get(), ep) == 0);
             std::optional<Endpoint> local;
             REQUIRE(sock::LocalEndpoint(probe.get(), local) == 0 && local);
@@ -577,12 +579,12 @@ public:
     void Connect()
     {
         PinTo(cpu_);
-        epfd_ = Fd(::epoll_create1(EPOLL_CLOEXEC));
+        epfd_ = UniqueFd(::epoll_create1(EPOLL_CLOEXEC));
         conns_.resize(static_cast<std::size_t>(nconns_));
         for (int i = 0; i < nconns_; ++i)
         {
             Conn& c = conns_[static_cast<std::size_t>(i)];
-            REQUIRE(sock::Create(ep_, c.fd) == 0);
+            REQUIRE(sock::CreateStreamSocket(ep_, c.fd) == 0);
             int rc;
             // UDS 的非阻塞 connect 在对方 accept 队列满时返回 EAGAIN（TCP 是 SYN
             // 重传，不会走到这里）：等服务端消化一会儿再试。
@@ -590,9 +592,9 @@ public:
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             REQUIRE(rc == 0 || rc == EINPROGRESS);
             pollfd p{c.fd.get(), POLLOUT, 0};
-            REQUIRE(::poll(&p, 1, 10000) > 0 && sock::SoError(c.fd.get()) == 0);
+            REQUIRE(::poll(&p, 1, 10000) > 0 && sock::GetSocketError(c.fd.get()) == 0);
             if (ep_.kind() == Endpoint::Kind::Tcp)
-                (void)sock::SetNoDelay(c.fd.get());
+                (void)tcp::SetNoDelay(c.fd.get());
             c.rbuf.resize(frame_.size());
             epoll_event ev{};
             ev.events = EPOLLIN;
@@ -650,7 +652,7 @@ public:
 private:
     struct Conn
     {
-        Fd fd;
+        UniqueFd fd;
         std::vector<std::byte> rbuf;
         std::size_t got = 0;
         bool verified = false;
@@ -680,7 +682,7 @@ private:
     int nconns_;
     const std::vector<std::byte>& frame_;
     int cpu_;
-    Fd epfd_;
+    UniqueFd epfd_;
     std::vector<Conn> conns_;
     WorkerResult result_;
 };

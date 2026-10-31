@@ -18,8 +18,8 @@
 #include "app.h"
 #include "event_loop_group.h"
 #include "length_prefix_codec.h"
-#include "net_server.h"
 #include "net_test_util.h"
+#include "stream_server.h"
 
 using namespace breeze;
 using namespace breeze::testing;
@@ -87,9 +87,9 @@ InboundLimits Limits(std::size_t msgs, std::size_t bytes, std::size_t global)
     return l;
 }
 
-ServerOptions BigWater()
+StreamServerOptions BigWater()
 {
-    ServerOptions so;
+    StreamServerOptions so;
     so.connection.high_water_mark = 256ull << 20;
     return so;
 }
@@ -129,7 +129,7 @@ struct Fixture
     Recorder handler;
     LengthPrefixCodecFactory factory;
     EventLoopGroup group;
-    NetServer server;
+    StreamServer server;
 };
 
 // ---- 事件与所有权 ----
@@ -482,7 +482,7 @@ void TestStaleResumeDoesNotDisableBackpressure()
     Gate gate(executor.Wrap(handler), /*block_at=*/9);
     LengthPrefixCodecFactory factory(kMaxFrame);
     EventLoopGroup group({1, 8});
-    NetServer server(group, *Endpoint::Tcp("127.0.0.1", 0), BigWater(), gate, factory);
+    StreamServer server(group, *Endpoint::Tcp("127.0.0.1", 0), BigWater(), gate, factory);
     CHECK(group.Start() == 0);
     CHECK(server.Start() == 0);
 
@@ -538,7 +538,7 @@ void TestDestroyWithPendingEvents()
         MainLoopExecutor executor(app);
         LengthPrefixCodecFactory factory(kMaxFrame);
         EventLoopGroup group({2, 64});
-        NetServer server(group, *Endpoint::Tcp("127.0.0.1", 0), BigWater(), executor.Wrap(*handler), factory);
+        StreamServer server(group, *Endpoint::Tcp("127.0.0.1", 0), BigWater(), executor.Wrap(*handler), factory);
         CHECK(group.Start() == 0);
         CHECK(server.Start() == 0);
         TestClient c(server.endpoint());

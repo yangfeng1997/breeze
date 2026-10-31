@@ -62,7 +62,7 @@ public:
     void SetLimits(const InboundLimits& limits) { limits_ = limits; }
     const InboundLimits& limits() const noexcept { return limits_; }
 
-    // 交给 NetServer / NetClient 构造。同一个 handler 重复 Wrap 会得到不同的适配器，行为相同。
+    // 交给 StreamServer / StreamClient 构造。同一个 handler 重复 Wrap 会得到不同的适配器，行为相同。
     ConnectionHandler& Wrap(MainLoopHandler& handler);
 
     // 在主循环线程上分发至多 limit 个事件；返回 true = 可能仍有积压（分发了 limit 个），false = 已空。

@@ -36,10 +36,11 @@
   **插入可能让迭代器 / 引用失效、元素的移动构造必须 noexcept、`at()` 找不到键就 abort**，见 [docs/基础容器库.md](docs/基础容器库.md)；
   这几个库的 **tsan 同样没在本机跑过**，容器 bench 默认不构建：`cmake --preset release -DBREEZE_BUILD_CONTAINER_BENCH=ON`；
   `base/net` 是 Reactor 网络库（仅 Linux）：`Endpoint` / `SharedBuffer` / `Buffer` / `FrameCodec` 等基础件，
-  `EventLoop` / `Connection` / `ConnectionHandle` / `EventLoopGroup` / `NetServer` / `NetClient`（含重连）已完整，
+  `EventLoop` / `Connection` / `ConnectionHandle` / `EventLoopGroup` / `TcpServer` / `UdsServer` / `TcpClient` / `UdsClient`（基类 `StreamServer` / `StreamClient`，含重连）已完整，
   `framework/net` 有 `MainLoopExecutor`（IO 线程事件回投 App 主循环，带入口背压）与 `NetModule`；
   **`NetModule` 的停机由 main 负责**：`App::Run` 返回后在同一个线程调 `NetModule::Shutdown()`。
-  `base/net/internal/` 是不公开的实现，测试按需加私有 include 路径；
+  `base/net` 的目录：公开 API 按概念分 `connection/` `endpoint/` `codec/` `loop/` `stream/`（TCP / UDS 共用的 `StreamServer` / `StreamClient` 基类）；每种传输一个目录，根上是公开的端点 / 选项 / 服务端 / 客户端，`internal/` 是私有实现：`tcp/`（`TcpServer` `TcpClient` `TcpEndpoint` `TcpOptions`）、`uds/`（`UdsServer` `UdsClient` `UdsEndpoint`），将来加 `rudp/`；`internal/core`（所有传输共用）与 `internal/stream`（TCP / UDS 共用的实现）；`testing/` 放测试公共件与集成测试，顶层没有散放文件；TCP 专有的选项（keepalive 等）在 `TcpOptions`，UDS 的选项类型里没有；内部头对使用方不可见（例外：公开头 `connection.h` 以路径引用 `internal/core` 的三个头），测试用 CMake 的 `NET_INTERNAL_INCLUDE_DIRS`；依赖方向与命名规则见 [docs/网络库设计.md](docs/网络库设计.md) §2 / §4.13；
+  内部头对使用方不可见（例外：公开头 `connection.h` 以路径引用 `internal/core` 的三个头），测试用 CMake 的 `NET_INTERNAL_INCLUDE_DIRS`；依赖方向与命名规则见 [docs/网络库设计.md](docs/网络库设计.md) §2 / §4.13；
   **tsan 没有在 WSL 本机跑过**（沙箱里起不来），上真机前见 [docs/网络库设计.md](docs/网络库设计.md) §11.2；
   基线 bench 默认不构建：`cmake --preset release -DBREEZE_BUILD_BENCH=ON`（联网拉 muduo 源码），跑 `src/cpp/bench/run_baseline.sh`；
   `tsan` / `asan` 预设跑消毒器（`cmake --preset tsan`），`tsan.supp` 只压制 moodycamel 的 fence 误报。

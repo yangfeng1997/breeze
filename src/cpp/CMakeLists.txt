@@ -73,6 +73,17 @@ set(VARTYPE_DIR base/vartype)
 set(URI_DIR base/uri)
 set(FSM_DIR base/fsm)
 set(NET_DIR base/net)
+# net 的头文件目录。头文件用扁平名 include（与仓库其它库一致），所以下面所有目录之间文件名必须唯一。
+# 公开的（PUBLIC，使用方可见），按概念分：connection/（连接及其回调 / 句柄 / 选项）、endpoint/（地址与对端信息）、
+# codec/（分帧）、loop/（EventLoopGroup 与统计）、stream/（TCP / UDS 共用的服务端 / 客户端基类）、
+# tcp/ 与 uds/（各自的端点、选项、服务端、客户端；将来的 kcp/ 同理）。
+set(NET_PUBLIC_INCLUDE_DIRS ${NET_DIR}/connection ${NET_DIR}/endpoint ${NET_DIR}/codec ${NET_DIR}/loop
+                            ${NET_DIR}/stream ${NET_DIR}/tcp ${NET_DIR}/uds)
+# 内部的（PRIVATE）：internal/core（所有传输共用）、internal/stream（TCP / UDS 共用的字节流实现）、
+# tcp/internal、uds/internal（各自专有的 socket 选项与处理）。库自己与要直接用内部头的测试 / bench 加这几个路径。
+set(NET_INTERNAL_INCLUDE_DIRS ${NET_DIR}/internal/core ${NET_DIR}/internal/stream ${NET_DIR}/tcp/internal ${NET_DIR}/uds/internal)
+# 测试公共件（net_test_util.h）与跨组件的集成测试，只给测试用。
+set(NET_TESTING_DIR ${NET_DIR}/testing)
 set(NET_MODULE_DIR framework/net)
 
 # CLI11 只 PRIVATE 链接：公开头文件不含它，使用方看不到这个依赖。
@@ -265,26 +276,39 @@ if(BREEZE_BUILD_NET)
   target_compile_options(breeze_thread PRIVATE -Wall -Wextra)
   breeze_apply_log_level(breeze_thread)
 
-  # internal/ 是 PRIVATE：公开头不含它。日志同理只 PRIVATE，使用方看不到这个依赖；测试要直接用 internal/ 时自己加路径。
+  # 内部头目录是 PRIVATE，日志同理只 PRIVATE，使用方看不到这个依赖；测试要直接用内部头时自己加 NET_INTERNAL_INCLUDE_DIRS。
+  # PUBLIC 的 ${NET_DIR} 本身（不带子目录）只为下面那个例外保留。
+  # 例外：公开头 connection.h 以路径引用 internal/core/ 里的 connection_table.h / pollable.h / unique_fd.h
+  # （Connection 的基类与成员要完整类型），所以 PUBLIC 的 ${NET_DIR} 不能去掉，这三个头也不能依赖别的内部头。
   add_library(breeze_net
-    ${NET_DIR}/endpoint.cpp
-    ${NET_DIR}/length_prefix_codec.cpp
-    ${NET_DIR}/connection.cpp
-    ${NET_DIR}/connection_handle.cpp
-    ${NET_DIR}/event_loop_group.cpp
-    ${NET_DIR}/net_server.cpp
-    ${NET_DIR}/net_client.cpp
-    ${NET_DIR}/internal/connection_table.cpp
-    ${NET_DIR}/internal/group_registry.cpp
-    ${NET_DIR}/internal/socket.cpp
-    ${NET_DIR}/internal/event_loop.cpp
-    ${NET_DIR}/internal/acceptor.cpp
-    ${NET_DIR}/internal/loop_server.cpp
-    ${NET_DIR}/internal/transport.cpp
-    ${NET_DIR}/internal/connector.cpp)
-  target_include_directories(breeze_net PUBLIC ${NET_DIR} PRIVATE ${NET_DIR}/internal)
-  # breeze_queue 是 PUBLIC：internal/event_loop.h 里有 MpscQueue，要用 internal/ 的测试也得看得到它；
-  # breeze_buffer 同理：公开头里有 SharedBuffer / Buffer。breeze_thread：internal/loop_thread.h 里有 Thread，测试与 bench 要用。
+    ${NET_DIR}/endpoint/endpoint.cpp
+    ${NET_DIR}/codec/length_prefix_codec.cpp
+    ${NET_DIR}/connection/connection.cpp
+    ${NET_DIR}/connection/connection_handle.cpp
+    ${NET_DIR}/loop/event_loop_group.cpp
+    ${NET_DIR}/stream/stream_server.cpp
+    ${NET_DIR}/stream/stream_client.cpp
+    ${NET_DIR}/internal/core/unique_fd.cpp
+    ${NET_DIR}/internal/core/socket_address.cpp
+    ${NET_DIR}/internal/core/connection_table.cpp
+    ${NET_DIR}/internal/core/group_registry.cpp
+    ${NET_DIR}/internal/core/event_loop.cpp
+    ${NET_DIR}/internal/stream/socket.cpp
+    ${NET_DIR}/internal/stream/socket_config.cpp
+    ${NET_DIR}/internal/stream/acceptor.cpp
+    ${NET_DIR}/internal/stream/loop_server.cpp
+    ${NET_DIR}/internal/stream/connector.cpp
+    ${NET_DIR}/tcp/internal/tcp_socket.cpp
+    ${NET_DIR}/tcp/tcp_endpoint.cpp
+    ${NET_DIR}/tcp/tcp_server.cpp
+    ${NET_DIR}/tcp/tcp_client.cpp
+    ${NET_DIR}/uds/internal/uds_socket.cpp
+    ${NET_DIR}/uds/uds_endpoint.cpp
+    ${NET_DIR}/uds/uds_server.cpp
+    ${NET_DIR}/uds/uds_client.cpp)
+  target_include_directories(breeze_net PUBLIC ${NET_DIR} ${NET_PUBLIC_INCLUDE_DIRS} PRIVATE ${NET_INTERNAL_INCLUDE_DIRS})
+  # breeze_queue 是 PUBLIC：internal/core/event_loop.h 里有 MpscQueue，要用内部头的测试也得看得到它；
+  # breeze_buffer 同理：公开头里有 SharedBuffer / Buffer。breeze_thread：internal/core/event_loop_thread.h 里有 Thread，测试与 bench 要用。
   target_link_libraries(breeze_net PUBLIC Threads::Threads breeze_queue breeze_buffer breeze_thread PRIVATE breeze_logger)
   target_compile_options(breeze_net PRIVATE -Wall -Wextra)
   breeze_apply_log_level(breeze_net)
@@ -519,13 +543,19 @@ target_compile_options(shared_buffer_test PRIVATE -Wall -Wextra)
 add_test(NAME shared_buffer_test COMMAND shared_buffer_test)
 
 if(BREEZE_BUILD_NET)
-  # breeze_net_test(<名> [INTERNAL])：${NET_DIR}/<名>.cpp 编成同名测试。INTERNAL = 测试要直接用 internal/ 里的头。
+  # breeze_net_test(<名> [INTERNAL] [DIR <子目录>])：${NET_DIR}/[<子目录>/]<名>.cpp 编成同名测试，测试放在被测代码所在的目录，
+  # 跨组件的集成测试放 testing/。INTERNAL = 测试要直接用内部头（NET_INTERNAL_INCLUDE_DIRS）。所有测试都能用 testing/ 里的公共件。
   function(breeze_net_test name)
-    cmake_parse_arguments(A "INTERNAL" "" "" ${ARGN})
-    add_executable(${name} ${NET_DIR}/${name}.cpp)
+    cmake_parse_arguments(A "INTERNAL" "DIR" "" ${ARGN})
+    if(A_DIR)
+      add_executable(${name} ${NET_DIR}/${A_DIR}/${name}.cpp)
+    else()
+      add_executable(${name} ${NET_DIR}/${name}.cpp)
+    endif()
     target_link_libraries(${name} PRIVATE breeze_net)
+    target_include_directories(${name} PRIVATE ${NET_TESTING_DIR})
     if(A_INTERNAL)
-      target_include_directories(${name} PRIVATE ${NET_DIR}/internal)
+      target_include_directories(${name} PRIVATE ${NET_INTERNAL_INCLUDE_DIRS})
     endif()
     target_compile_options(${name} PRIVATE -Wall -Wextra)
     add_test(NAME ${name} COMMAND ${name})
@@ -566,25 +596,31 @@ if(BREEZE_BUILD_NET)
     set_tests_properties(${t} PROPERTIES ENVIRONMENT "${BREEZE_TEST_ENV}")
   endforeach()
 
-  breeze_net_test(endpoint_test)
-  breeze_net_test(codec_test)
-  breeze_net_test(socket_test INTERNAL)
-  breeze_net_test(event_loop_test INTERNAL)
-  breeze_net_test(connection_table_test INTERNAL)
-  breeze_net_test(group_registry_test INTERNAL)
-  breeze_net_test(event_loop_group_test INTERNAL)
-  breeze_net_test(connection_handle_test INTERNAL)
-  breeze_net_test(echo_test INTERNAL)
-  breeze_net_test(net_server_test INTERNAL)
-  breeze_net_test(net_client_test INTERNAL)
-  breeze_net_test(net_flow_test INTERNAL)
-  breeze_net_test(net_lifecycle_test INTERNAL)
+  breeze_net_test(endpoint_test DIR endpoint)
+  breeze_net_test(codec_test DIR codec)
+  breeze_net_test(unique_fd_test INTERNAL DIR internal/core)
+  breeze_net_test(event_loop_test INTERNAL DIR internal/core)
+  breeze_net_test(connection_table_test INTERNAL DIR internal/core)
+  breeze_net_test(group_registry_test INTERNAL DIR internal/core)
+  breeze_net_test(socket_test INTERNAL DIR internal/stream)
+  breeze_net_test(socket_config_test INTERNAL DIR internal/stream)
+  breeze_net_test(tcp_endpoint_test DIR tcp)
+  breeze_net_test(uds_endpoint_test DIR uds)
+  breeze_net_test(tcp_server_test INTERNAL DIR tcp)
+  breeze_net_test(uds_server_test INTERNAL DIR uds)
+  breeze_net_test(event_loop_group_test INTERNAL DIR loop)
+  breeze_net_test(connection_handle_test INTERNAL DIR connection)
+  breeze_net_test(stream_server_test INTERNAL DIR stream)
+  breeze_net_test(stream_client_test INTERNAL DIR stream)
+  breeze_net_test(echo_test INTERNAL DIR testing)
+  breeze_net_test(net_flow_test INTERNAL DIR testing)
+  breeze_net_test(net_lifecycle_test INTERNAL DIR testing)
 
-  # framework/net 的测试复用 base/net 的测试公共件（net_test_util.h 带 internal/ 里的 event_loop.h）。
+  # framework/net 的测试复用 base/net 的测试公共件（net_test_util.h 带内部的 event_loop.h 与 socket.h）。
   function(breeze_net_module_test name)
     add_executable(${name} ${NET_MODULE_DIR}/${name}.cpp)
     target_link_libraries(${name} PRIVATE breeze_net_module)
-    target_include_directories(${name} PRIVATE ${NET_DIR}/internal)
+    target_include_directories(${name} PRIVATE ${NET_INTERNAL_INCLUDE_DIRS} ${NET_TESTING_DIR})
     target_compile_options(${name} PRIVATE -Wall -Wextra)
     add_test(NAME ${name} COMMAND ${name})
     set_tests_properties(${name} PROPERTIES ENVIRONMENT "${BREEZE_TEST_ENV}")
@@ -597,7 +633,7 @@ if(BREEZE_BUILD_NET)
 
   # net 库内不抛、不 catch（设计 §4.11）。base/buffer 与 base/thread 是 net 的依赖（SharedBuffer 在 IO 线程分配、Thread 创建失败不抛），一并扫。
   add_test(NAME net_no_exceptions_test
-    COMMAND Python3::Interpreter -I ${CMAKE_SOURCE_DIR}/${NET_DIR}/check_no_exceptions.py
+    COMMAND Python3::Interpreter -I ${CMAKE_SOURCE_DIR}/${NET_TESTING_DIR}/check_no_exceptions.py
             ${CMAKE_SOURCE_DIR}/${NET_DIR} ${CMAKE_SOURCE_DIR}/${BUFFER_DIR} ${CMAKE_SOURCE_DIR}/${THREAD_DIR}
             ${CMAKE_SOURCE_DIR}/framework/net)
 endif()
@@ -639,7 +675,7 @@ if(BREEZE_BUILD_BENCH AND BREEZE_BUILD_NET)
   target_compile_options(muduo_bench PRIVATE -w -include ctime)
 
   add_executable(net_bench bench/net_bench.cpp)
-  target_include_directories(net_bench PRIVATE ${NET_DIR}/internal)
+  target_include_directories(net_bench PRIVATE ${NET_INTERNAL_INCLUDE_DIRS})
   target_link_libraries(net_bench PRIVATE breeze_net breeze_net_module breeze_logger muduo_bench)
   target_compile_definitions(net_bench PRIVATE BREEZE_BENCH_MUDUO=1)
   target_compile_options(net_bench PRIVATE -Wall -Wextra)
