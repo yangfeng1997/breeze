@@ -6,8 +6,8 @@
 
 #include <sys/socket.h>
 
-#include "stream_server.h"
-#include "uds_endpoint.h"
+#include "base/net/stream/stream_server.h"
+#include "base/net/uds/uds_endpoint.h"
 
 namespace breeze
 {
@@ -25,8 +25,8 @@ public:
     UdsServer(EventLoopGroup& group,
               const UdsEndpoint& endpoint,
               UdsServerOptions options,
-              ConnectionHandler& handler,
-              const FrameCodecFactory& factory);
+              IConnectionHandler& handler,
+              const IFrameCodecFactory& factory);
 
     // 实际绑定的地址（与构造时给的相同）。
     UdsEndpoint local_endpoint() const;

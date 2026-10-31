@@ -1,6 +1,6 @@
 // Thread：启停、tid 握手、线程名（含自动命名与截断）、绑核、创建失败返回 errno、误用即 FATAL。
 
-#include "thread.h"
+#include "base/thread/thread.h"
 
 #include <pthread.h>
 #include <sched.h>
@@ -15,8 +15,8 @@
 #include <string>
 #include <vector>
 
-#include "current_thread.h"
-#include "thread_test_util.h"
+#include "base/thread/current_thread.h"
+#include "base/thread/thread_test_util.h"
 
 using namespace breeze;
 using namespace breeze::testing;

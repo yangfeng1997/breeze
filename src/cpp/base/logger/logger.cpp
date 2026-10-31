@@ -1,4 +1,4 @@
-#include "logger.h"
+#include "base/logger/logger.h"
 
 #include <algorithm>
 #include <cctype>
@@ -12,7 +12,7 @@
 #include <sys/prctl.h>
 #endif
 
-#include "logger_impl.h"
+#include "base/logger/internal/logger_impl.h"
 
 namespace breeze
 {

@@ -50,7 +50,10 @@ set(ARGS_DIR base/args)
 set(CONFIG_DIR base/config)
 set(CONFIGGEN_DIR ${CMAKE_SOURCE_DIR}/../../tools/configgen)
 set(CONFIG_SCHEMA_ROOT ${CMAKE_SOURCE_DIR}/../../config/schema)  # 真实 schema 与 options.proto
-set(BREEZE_GEN_DIR ${CMAKE_SOURCE_DIR}/gen)  # 生成代码根目录，不进版本库；include 路径以它为根
+set(BREEZE_GEN_DIR ${CMAKE_SOURCE_DIR}/gen)  # 生成代码根目录，不进版本库
+# 所有 include 都从 src/cpp 起算：#include "base/net/endpoint/endpoint.h"、#include "gen/config/net_config.h"。
+# 不给各个库配自己的 include 目录，所以头文件名不必全局唯一，写成扁平名也编译不过。
+include_directories(${CMAKE_SOURCE_DIR})
 set(LOGGER_DIR base/logger)
 set(KERNEL_DIR framework/kernel)
 set(QUEUE_DIR base/queue)
@@ -74,33 +77,28 @@ set(VARTYPE_DIR base/vartype)
 set(URI_DIR base/uri)
 set(FSM_DIR base/fsm)
 set(NET_DIR base/net)
-# net 的头文件目录。头文件用扁平名 include（与仓库其它库一致），所以下面所有目录之间文件名必须唯一。
-# 公开的（PUBLIC，使用方可见），按概念分：connection/（连接及其回调 / 句柄 / 选项）、endpoint/（地址与对端信息）、
-# codec/（分帧）、loop/（EventLoopGroup 与统计）、stream/（TCP / UDS 共用的服务端 / 客户端基类）、
-# tcp/、uds/、rudp/（各自的端点、选项、服务端、客户端；rudp 还有线格式 rudp_protocol.h、准入票据与传输参数）。
-set(NET_PUBLIC_INCLUDE_DIRS ${NET_DIR}/connection ${NET_DIR}/endpoint ${NET_DIR}/codec ${NET_DIR}/loop
-                            ${NET_DIR}/stream ${NET_DIR}/tcp ${NET_DIR}/uds ${NET_DIR}/rudp)
-# 内部的（PRIVATE）：internal/core（所有传输共用）、internal/stream（TCP / UDS 共用的字节流实现）、
-# tcp/internal、uds/internal、rudp/internal（各自专有的 socket 选项与处理）。
-# 库自己与要直接用内部头的测试 / bench 加这几个路径。
-set(NET_INTERNAL_INCLUDE_DIRS ${NET_DIR}/internal/core ${NET_DIR}/internal/stream
-                              ${NET_DIR}/tcp/internal ${NET_DIR}/uds/internal ${NET_DIR}/rudp/internal)
+# net 的目录只用来按概念归类，不做访问控制：loop/（事件循环：EventLoop / EventLoopGroup、连接表、
+# IPollable、统计）、socket/（UniqueFd、Endpoint 与 sockaddr 互转、按协议族建 socket）、endpoint/（地址与对端信息）、
+# codec/（分帧）、connection/（连接及其回调 / 句柄 / 选项，INetServer / INetClient）、stream/（TCP / UDS 共用的字节流：
+# 服务端 / 客户端基类，以及 Acceptor / Connector / StreamConnection 等实现）、tcp/、uds/、rudp/（每种传输一个目录：
+# 端点、选项、服务端、客户端，以及各自专有的 socket 选项 / 会话 / 票据）。stream、rudp 的实现文件比公开文件多，放在各自的
+# internal/ 里与公开的服务端 / 客户端 / 端点 / 选项分开看，同样不做访问控制。外部代码只该 include 公开头，
+# 由 tools/check_includes.py 守着。
 # 测试公共件（net_test_util.h）与跨组件的集成测试，只给测试用。
 set(NET_TESTING_DIR ${NET_DIR}/testing)
 set(NET_MODULE_DIR framework/net)
 
 # CLI11 只 PRIVATE 链接：公开头文件不含它，使用方看不到这个依赖。
-# internal/ 里的 args_impl.h 含 CLI11，必须 PRIVATE，不能并入公开目录。
+# internal/ 里的 args_impl.h 含 CLI11，所以只能 PRIVATE 链接；使用方只该 include args_parser.h。
 add_library(breeze_args ${ARGS_DIR}/args_parser.cpp)
-target_include_directories(breeze_args PUBLIC ${ARGS_DIR} PRIVATE ${ARGS_DIR}/internal)
 target_link_libraries(breeze_args PRIVATE CLI11::CLI11)
 target_compile_options(breeze_args PRIVATE -Wall -Wextra)
 
 # breeze_config_schema(<target> SCHEMA_DIR <dir> [GEN_SUBDIR <名>] [INCLUDE <dir>...])
 # 用 tools/configgen 把目录下所有 schema（*.proto，不含 options.proto）生成 C++ 头文件，不进版本库。
 # <target> 是 INTERFACE 库，自带 breeze_config：
-#   给了 GEN_SUBDIR：生成到 ${BREEZE_GEN_DIR}/<名>/，include 根是 ${BREEZE_GEN_DIR}，
-#                    用 #include "<名>/<schema 文件名>_config.h"。scripts/configure.py 也写这个目录。
+#   给了 GEN_SUBDIR：生成到 ${BREEZE_GEN_DIR}/<名>/（src/cpp/gen/<名>/），从 src/cpp 起算，
+#                    用 #include "gen/<名>/<schema 文件名>_config.h"。scripts/configure.py 也写这个目录。
 #   没给：生成到构建目录，include 根就是它，用 #include "<schema 文件名>_config.h"（测试用的样例 schema 走这条）。
 # schema 改了会自动重新生成；内容没变不重写文件，不会触发无谓的重编。
 # options.proto（自定义 option）固定在 ${CONFIG_SCHEMA_ROOT}，会自动加进 proto 搜索路径。
@@ -112,7 +110,7 @@ function(breeze_config_schema target)
   list(FILTER schemas EXCLUDE REGEX "/options\\.proto$")
   if(A_GEN_SUBDIR)
     set(gen_dir ${BREEZE_GEN_DIR}/${A_GEN_SUBDIR})
-    set(include_root ${BREEZE_GEN_DIR})
+    set(include_root "")
   else()
     set(gen_dir ${CMAKE_CURRENT_BINARY_DIR}/gen/${target})
     set(include_root ${gen_dir})
@@ -138,33 +136,31 @@ function(breeze_config_schema target)
   add_custom_target(${target}_gen DEPENDS ${outputs})
   add_library(${target} INTERFACE)
   add_dependencies(${target} ${target}_gen)
-  target_include_directories(${target} INTERFACE ${include_root})
+  if(include_root)
+    target_include_directories(${target} INTERFACE ${include_root})
+  endif()
   target_link_libraries(${target} INTERFACE breeze_config)
 endfunction()
 
 # yaml-cpp 同理只 PRIVATE：config.h 不含它。
 add_library(breeze_config ${CONFIG_DIR}/config.cpp)
-target_include_directories(breeze_config PUBLIC ${CONFIG_DIR})
 target_link_libraries(breeze_config PRIVATE yaml-cpp::yaml-cpp)
 target_compile_options(breeze_config PRIVATE -Wall -Wextra)
 
 # spdlog 同理只 PRIVATE：logger.h / logger_macros.h 不含它，internal/ 里的头含它。
 add_library(breeze_logger ${LOGGER_DIR}/logger.cpp)
-target_include_directories(breeze_logger PUBLIC ${LOGGER_DIR} PRIVATE ${LOGGER_DIR}/internal)
 target_link_libraries(breeze_logger PRIVATE spdlog::spdlog)
 target_compile_options(breeze_logger PRIVATE -Wall -Wextra)
 
 # 无锁队列：模板必须在头文件里，所以 moodycamel 经 INTERFACE 传给使用方（与上面 PRIVATE 的 CLI11 不同）。
 # 公开 API 不出现 moodycamel 的类型，以后换实现使用方不动。
 add_library(breeze_queue INTERFACE)
-target_include_directories(breeze_queue INTERFACE ${QUEUE_DIR})
 target_link_libraries(breeze_queue INTERFACE
   concurrentqueue::concurrentqueue readerwriterqueue::readerwriterqueue Threads::Threads)
 
 # 通用字节缓冲：SharedBuffer（引用计数的不可变字节块上的切片）与 Buffer（带读写游标的缓冲）。不认识网络，业务也能直接用；
 # 只依赖标准库，不限平台。shared_buffer.cpp 用日志报编程错误，所以 breeze_logger 只 PRIVATE，使用方看不到这个依赖。
 add_library(breeze_buffer ${BUFFER_DIR}/shared_buffer.cpp ${BUFFER_DIR}/buffer.cpp)
-target_include_directories(breeze_buffer PUBLIC ${BUFFER_DIR})
 target_link_libraries(breeze_buffer PRIVATE breeze_logger)
 target_compile_options(breeze_buffer PRIVATE -Wall -Wextra)
 breeze_apply_log_level(breeze_buffer)
@@ -177,67 +173,53 @@ endif()
 
 # 小工具：DEFER、Singleton、NonCopyable。都只有头文件，只依赖标准库，不限平台。
 add_library(breeze_defer INTERFACE)
-target_include_directories(breeze_defer INTERFACE ${DEFER_DIR})
 add_library(breeze_singleton INTERFACE)
-target_include_directories(breeze_singleton INTERFACE ${SINGLETON_DIR})
 add_library(breeze_noncopyable INTERFACE)
-target_include_directories(breeze_noncopyable INTERFACE ${NONCOPYABLE_DIR})
 
 # 时间：TimeUtil（纯函数的日期计算）、Now（帧缓存时钟、可模拟的逻辑时间）与 PeriodicWindow（周期开放窗口，只有头文件）。
 # 用 localtime_r（POSIX），不限 Linux。
 add_library(breeze_time ${TIME_DIR}/time_util.cpp ${TIME_DIR}/now.cpp)
-target_include_directories(breeze_time PUBLIC ${TIME_DIR})
 target_compile_options(breeze_time PRIVATE -Wall -Wextra)
 
 # 耗时记录（TimeRecord）：单调时钟的秒表，可选地在析构时写日志。logger 只 PRIVATE：公开头不含它。
 add_library(breeze_time_record ${TIME_RECORD_DIR}/time_record.cpp)
-target_include_directories(breeze_time_record PUBLIC ${TIME_RECORD_DIR})
 target_link_libraries(breeze_time_record PRIVATE breeze_logger)
 target_compile_options(breeze_time_record PRIVATE -Wall -Wextra)
 
 # 分层时间轮（TimerWheel）：只依赖标准库，不限平台。
 add_library(breeze_timer ${TIMER_DIR}/timer_wheel.cpp)
-target_include_directories(breeze_timer PUBLIC ${TIMER_DIR})
 target_compile_options(breeze_timer PRIVATE -Wall -Wextra)
 
 # 容器：FlatHashMap / FlatHashSet（Swiss table）、LinkedHashMap / LinkedHashSet（保持插入顺序）。只有头文件，只依赖标准库。
 add_library(breeze_container INTERFACE)
-target_include_directories(breeze_container INTERFACE ${CONTAINER_DIR})
 
 # 消息统计（MessageStats）：按 id / 名字统计条数与字节，周期写日志。非线程安全。
 # 公开头含 flat_hash_map.h，所以 breeze_container 是 PUBLIC；logger 只 PRIVATE：公开头不含它。
 add_library(breeze_metrics ${METRICS_DIR}/message_stats.cpp)
-target_include_directories(breeze_metrics PUBLIC ${METRICS_DIR})
 target_link_libraries(breeze_metrics PUBLIC breeze_container PRIVATE breeze_logger)
 target_compile_options(breeze_metrics PRIVATE -Wall -Wextra)
 
 # 稳定的字节哈希（MurmurHash64A）：只有头文件，只依赖标准库，不限平台。
 add_library(breeze_hash INTERFACE)
-target_include_directories(breeze_hash INTERFACE ${HASH_DIR})
 
 # 有限状态机（fsm::Machine）：只有头文件，只依赖标准库（用 cxxabi 给状态名 demangle），不限平台。
 add_library(breeze_fsm INTERFACE)
-target_include_directories(breeze_fsm INTERFACE ${FSM_DIR})
 
 # URI 解析（RFC 3986）与百分号编解码：只依赖标准库，不限平台。
 add_library(breeze_uri ${URI_DIR}/uri.cpp)
-target_include_directories(breeze_uri PUBLIC ${URI_DIR})
 target_compile_options(breeze_uri PRIVATE -Wall -Wextra)
 
 # 弱类型值（VarType）：字符串存放、按需转数字 / 布尔。只有头文件，依赖 breeze_string 的严格数字解析。
 add_library(breeze_vartype INTERFACE)
-target_include_directories(breeze_vartype INTERFACE ${VARTYPE_DIR})
 target_link_libraries(breeze_vartype INTERFACE breeze_string)
 
 # 字符串工具（Split / Join / Trim / 数字解析……）：只依赖标准库，不限平台。
 add_library(breeze_string ${STRING_DIR}/string_util.cpp)
-target_include_directories(breeze_string PUBLIC ${STRING_DIR})
 target_compile_options(breeze_string PRIVATE -Wall -Wextra)
 
 # 伪随机数（xoshiro256**）：getrandom 取熵、pthread_atfork 让 fork 后重新播种，只支持 Linux，与网络库同一个开关。
 if(BREEZE_BUILD_NET)
   add_library(breeze_random ${RANDOM_DIR}/random_util.cpp)
-  target_include_directories(breeze_random PUBLIC ${RANDOM_DIR})
   target_compile_options(breeze_random PRIVATE -Wall -Wextra)
 endif()
 
@@ -245,7 +227,6 @@ endif()
 # 不依赖日志。dladdr 在较老的 glibc 里要 -ldl，所以 CMAKE_DL_LIBS 是 PUBLIC。
 if(BREEZE_BUILD_NET)
   add_library(breeze_backtrace ${BACKTRACE_DIR}/backtrace.cpp)
-  target_include_directories(breeze_backtrace PUBLIC ${BACKTRACE_DIR})
   target_link_libraries(breeze_backtrace PUBLIC ${CMAKE_DL_LIBS})
   target_compile_options(breeze_backtrace PRIVATE -Wall -Wextra)
 endif()
@@ -254,14 +235,12 @@ endif()
 # 断言库自己不分 Debug / Release：模式由使用方翻译单元的 NDEBUG（或 BREEZE_ASSERT_FATAL）在宏展开时决定。
 if(BREEZE_BUILD_NET)
   add_library(breeze_assert ${ASSERT_DIR}/assert_macros.cpp)
-  target_include_directories(breeze_assert PUBLIC ${ASSERT_DIR})
   target_link_libraries(breeze_assert PRIVATE breeze_backtrace breeze_logger)
   target_compile_options(breeze_assert PRIVATE -Wall -Wextra)
   breeze_apply_log_level(breeze_assert)
 
   # 事件总线：只有头文件。递归发布超限用 ASSERT_RET_VOID 处理，所以依赖 breeze_assert（仅 Linux）。
   add_library(breeze_event INTERFACE)
-  target_include_directories(breeze_event INTERFACE ${EVENT_DIR})
   target_link_libraries(breeze_event INTERFACE breeze_assert)
 endif()
 
@@ -274,45 +253,40 @@ if(BREEZE_BUILD_NET)
     ${THREAD_DIR}/current_thread.cpp
     ${THREAD_DIR}/wait_group.cpp
     ${THREAD_DIR}/thread_pool.cpp)
-  target_include_directories(breeze_thread PUBLIC ${THREAD_DIR})
   target_link_libraries(breeze_thread PUBLIC Threads::Threads PRIVATE breeze_logger)
   target_compile_options(breeze_thread PRIVATE -Wall -Wextra)
   breeze_apply_log_level(breeze_thread)
 
-  # 内部头目录是 PRIVATE，日志同理只 PRIVATE，使用方看不到这个依赖；测试要直接用内部头时自己加 NET_INTERNAL_INCLUDE_DIRS。
-  # PUBLIC 的 ${NET_DIR} 本身（不带子目录）只为下面那个例外保留。
-  # 例外：公开头 connection.h 以路径引用 internal/core/pollable.h（Connection 的基类），
-  # 所以 PUBLIC 的 ${NET_DIR} 不能去掉，pollable.h 也不能依赖别的内部头。
+  # 日志只 PRIVATE 链接，使用方看不到这个依赖。
   add_library(breeze_net
     ${NET_DIR}/endpoint/endpoint.cpp
     ${NET_DIR}/codec/length_prefix_codec.cpp
     ${NET_DIR}/connection/connection_handle.cpp
     ${NET_DIR}/loop/event_loop_group.cpp
+    ${NET_DIR}/loop/connection_table.cpp
+    ${NET_DIR}/loop/group_registry.cpp
+    ${NET_DIR}/loop/event_loop.cpp
+    ${NET_DIR}/socket/unique_fd.cpp
+    ${NET_DIR}/socket/socket_address.cpp
     ${NET_DIR}/stream/stream_server.cpp
     ${NET_DIR}/stream/stream_client.cpp
-    ${NET_DIR}/internal/core/unique_fd.cpp
-    ${NET_DIR}/internal/core/socket_address.cpp
-    ${NET_DIR}/internal/core/connection_table.cpp
-    ${NET_DIR}/internal/core/group_registry.cpp
-    ${NET_DIR}/internal/core/event_loop.cpp
-    ${NET_DIR}/internal/stream/socket.cpp
-    ${NET_DIR}/internal/stream/socket_config.cpp
-    ${NET_DIR}/internal/stream/acceptor.cpp
-    ${NET_DIR}/internal/stream/loop_server.cpp
-    ${NET_DIR}/internal/stream/connector.cpp
-    ${NET_DIR}/internal/stream/stream_connection.cpp
-    ${NET_DIR}/tcp/internal/tcp_socket.cpp
+    ${NET_DIR}/stream/internal/stream_socket.cpp
+    ${NET_DIR}/stream/internal/stream_socket_config.cpp
+    ${NET_DIR}/stream/internal/acceptor.cpp
+    ${NET_DIR}/stream/internal/loop_server.cpp
+    ${NET_DIR}/stream/internal/connector.cpp
+    ${NET_DIR}/stream/internal/stream_connection.cpp
+    ${NET_DIR}/tcp/tcp_socket.cpp
     ${NET_DIR}/tcp/tcp_endpoint.cpp
     ${NET_DIR}/tcp/tcp_server.cpp
     ${NET_DIR}/tcp/tcp_client.cpp
-    ${NET_DIR}/uds/internal/uds_socket.cpp
+    ${NET_DIR}/uds/uds_socket.cpp
     ${NET_DIR}/uds/uds_endpoint.cpp
     ${NET_DIR}/uds/uds_server.cpp
     ${NET_DIR}/uds/uds_client.cpp
     ${NET_DIR}/rudp/rudp_endpoint.cpp)
-  target_include_directories(breeze_net PUBLIC ${NET_DIR} ${NET_PUBLIC_INCLUDE_DIRS} PRIVATE ${NET_INTERNAL_INCLUDE_DIRS})
-  # breeze_queue 是 PUBLIC：internal/core/event_loop.h 里有 MpscQueue，要用内部头的测试也得看得到它；
-  # breeze_buffer 同理：公开头里有 SharedBuffer / Buffer。breeze_thread：internal/core/event_loop_thread.h 里有 Thread，测试与 bench 要用。
+  # breeze_queue 是 PUBLIC：event_loop.h 里有 MpscQueue；breeze_buffer 同理：公开头里有 SharedBuffer / Buffer；
+  # breeze_thread：event_loop_thread.h 里有 Thread，测试与 bench 要用。
   target_link_libraries(breeze_net PUBLIC Threads::Threads breeze_queue breeze_buffer breeze_thread PRIVATE breeze_logger)
   target_compile_options(breeze_net PRIVATE -Wall -Wextra)
   breeze_apply_log_level(breeze_net)
@@ -327,7 +301,6 @@ if(BREEZE_BUILD_NET)
     ${NET_DIR}/rudp/internal/udp_socket.cpp
     ${NET_DIR}/rudp/internal/kcp_session.cpp
     ${NET_DIR}/rudp/internal/rudp_connection.cpp)
-  target_include_directories(breeze_net_rudp PRIVATE ${NET_INTERNAL_INCLUDE_DIRS})
   target_link_libraries(breeze_net_rudp PUBLIC breeze_net PRIVATE kcp::kcp breeze_container breeze_logger)
   target_compile_options(breeze_net_rudp PRIVATE -Wall -Wextra)
   breeze_apply_log_level(breeze_net_rudp)
@@ -338,7 +311,6 @@ add_library(breeze_app
   ${APP_DIR}/lifecycle.cpp
   ${APP_DIR}/loop.cpp
   ${APP_DIR}/module.cpp)
-target_include_directories(breeze_app PUBLIC ${APP_DIR})
 target_link_libraries(breeze_app PUBLIC Threads::Threads PRIVATE breeze_logger)
 target_compile_options(breeze_app PRIVATE -Wall -Wextra)
 breeze_apply_log_level(breeze_app)
@@ -352,9 +324,8 @@ add_executable(args_test ${ARGS_DIR}/args_test.cpp)
 target_link_libraries(args_test PRIVATE breeze_args)
 add_test(NAME args_test COMMAND args_test)
 
-# 测试要直接喂 HourlyFileSink，所以也看得到 internal/ 与 spdlog，使用方则不行。
+# 测试要直接喂 HourlyFileSink（base/logger/internal/），所以也直接链接 spdlog，使用方则不行。
 add_executable(logger_test ${LOGGER_DIR}/logger_test.cpp)
-target_include_directories(logger_test PRIVATE ${LOGGER_DIR}/internal)
 target_link_libraries(logger_test PRIVATE breeze_logger spdlog::spdlog)
 add_test(NAME logger_test COMMAND logger_test)
 
@@ -364,7 +335,6 @@ breeze_config_schema(breeze_config_schemas SCHEMA_DIR ${CONFIG_SCHEMA_ROOT} GEN_
 # 内核模块：依赖 App（Module 基类）与 Logger；LoggerConfig 出现在 LogModule 的构造函数里，故 PUBLIC。
 # ConfigModule 的头文件里有 ArgsParser 与生成的 CommonConfig，所以 breeze_args / breeze_config_schemas 也是 PUBLIC。
 add_library(breeze_kernel ${KERNEL_DIR}/log_module.cpp ${KERNEL_DIR}/config_module.cpp)
-target_include_directories(breeze_kernel PUBLIC ${KERNEL_DIR})
 # log_config_yaml.h 同时用到 Logger 与 Config 的类型，所以两者都是 PUBLIC。
 target_link_libraries(breeze_kernel PUBLIC breeze_app breeze_logger breeze_config breeze_args breeze_config_schemas)
 target_compile_options(breeze_kernel PRIVATE -Wall -Wextra)
@@ -374,7 +344,6 @@ breeze_apply_log_level(breeze_kernel)
 # net.proto 生成的头文件经 breeze_config_schemas 传递。网络库只支持 Linux。
 if(BREEZE_BUILD_NET)
   add_library(breeze_net_module ${NET_MODULE_DIR}/main_loop_executor.cpp ${NET_MODULE_DIR}/net_module.cpp)
-  target_include_directories(breeze_net_module PUBLIC ${NET_MODULE_DIR})
   target_link_libraries(breeze_net_module PUBLIC breeze_net breeze_net_rudp breeze_kernel breeze_queue
                         breeze_config_schemas)
   target_compile_options(breeze_net_module PRIVATE -Wall -Wextra)
@@ -396,15 +365,13 @@ target_link_libraries(logger_strip_test PRIVATE breeze_logger)
 add_test(NAME logger_strip_test COMMAND logger_strip_test)
 
 # 鲁棒性（队列溢出、多后台线程、多线程压力、Shutdown 并发、滚动并发）与时区/夏令时。
-# 都要直接用 internal/ 里的 sink 和测试工具，所以与 logger_test 一样看得到 internal/ 与 spdlog。
+# 都要直接用 internal/ 里的 sink 和测试工具，所以与 logger_test 一样直接链接 spdlog。
 add_executable(logger_robust_test ${LOGGER_DIR}/logger_robust_test.cpp)
-target_include_directories(logger_robust_test PRIVATE ${LOGGER_DIR}/internal)
 target_link_libraries(logger_robust_test PRIVATE breeze_logger spdlog::spdlog Threads::Threads)
 add_test(NAME logger_robust_test COMMAND logger_robust_test)
 
 # TZ 环境变量只能在没有其它线程时改，所以单独一个进程。
 add_executable(logger_tz_test ${LOGGER_DIR}/logger_tz_test.cpp)
-target_include_directories(logger_tz_test PRIVATE ${LOGGER_DIR}/internal)
 target_link_libraries(logger_tz_test PRIVATE breeze_logger spdlog::spdlog)
 add_test(NAME logger_tz_test COMMAND logger_tz_test)
 
@@ -427,6 +394,11 @@ add_test(NAME configgen_cpp_test COMMAND configgen_cpp_test)
 add_test(NAME configgen_py_test
   COMMAND Python3::Interpreter -m unittest test_configgen -v
   WORKING_DIRECTORY ${CONFIGGEN_DIR})
+
+# include 约定（设计 §4.13）：base/ 不能依赖 framework/；外部代码只 include net 的公开头（测试与 bench 不受限）。
+# 整个 src/cpp 是 include 根，目录不拦，靠这个脚本守。
+add_test(NAME includes_test
+  COMMAND Python3::Interpreter -I ${CMAKE_SOURCE_DIR}/../../tools/check_includes.py ${CMAKE_SOURCE_DIR})
 
 add_executable(common_config_test ${KERNEL_DIR}/common_config_test.cpp)
 target_link_libraries(common_config_test PRIVATE breeze_config_schemas)
@@ -563,13 +535,12 @@ target_compile_options(shared_buffer_test PRIVATE -Wall -Wextra)
 add_test(NAME shared_buffer_test COMMAND shared_buffer_test)
 
 if(BREEZE_BUILD_NET)
-  # breeze_net_test(<名> [INTERNAL] [DIR <子目录>] [LIB <库>])：${NET_DIR}/[<子目录>/]<名>.cpp 编成同名测试，
+  # breeze_net_test(<名> [DIR <子目录>] [LIB <库>])：${NET_DIR}/[<子目录>/]<名>.cpp 编成同名测试，
   # 测试放在被测代码所在的目录，跨组件的集成测试放 testing/。
-  # INTERNAL = 测试要直接用内部头（NET_INTERNAL_INCLUDE_DIRS）；
   # LIB = 链接的库（默认 breeze_net，rudp 的测试用 breeze_net_rudp）。
-  # 所有测试都能用 testing/ 里的公共件。
+  # 测试公共件（base/net/testing/net_test_util.h）与别的头一样从 src/cpp 起算 include。
   function(breeze_net_test name)
-    cmake_parse_arguments(A "INTERNAL" "DIR;LIB" "" ${ARGN})
+    cmake_parse_arguments(A "" "DIR;LIB" "" ${ARGN})
     if(A_DIR)
       add_executable(${name} ${NET_DIR}/${A_DIR}/${name}.cpp)
     else()
@@ -579,10 +550,6 @@ if(BREEZE_BUILD_NET)
       target_link_libraries(${name} PRIVATE ${A_LIB})
     else()
       target_link_libraries(${name} PRIVATE breeze_net)
-    endif()
-    target_include_directories(${name} PRIVATE ${NET_TESTING_DIR})
-    if(A_INTERNAL)
-      target_include_directories(${name} PRIVATE ${NET_INTERNAL_INCLUDE_DIRS})
     endif()
     target_compile_options(${name} PRIVATE -Wall -Wextra)
     add_test(NAME ${name} COMMAND ${name})
@@ -625,41 +592,40 @@ if(BREEZE_BUILD_NET)
 
   breeze_net_test(endpoint_test DIR endpoint)
   breeze_net_test(codec_test DIR codec)
-  breeze_net_test(unique_fd_test INTERNAL DIR internal/core)
-  breeze_net_test(event_loop_test INTERNAL DIR internal/core)
-  breeze_net_test(connection_table_test INTERNAL DIR internal/core)
-  breeze_net_test(group_registry_test INTERNAL DIR internal/core)
-  breeze_net_test(socket_test INTERNAL DIR internal/stream)
-  breeze_net_test(socket_config_test INTERNAL DIR internal/stream)
+  breeze_net_test(unique_fd_test DIR socket)
+  breeze_net_test(event_loop_test DIR loop)
+  breeze_net_test(connection_table_test DIR loop)
+  breeze_net_test(group_registry_test DIR loop)
+  breeze_net_test(stream_socket_test DIR stream/internal)
+  breeze_net_test(stream_socket_config_test DIR stream/internal)
   breeze_net_test(tcp_endpoint_test DIR tcp)
   breeze_net_test(uds_endpoint_test DIR uds)
   breeze_net_test(rudp_endpoint_test DIR rudp)
-  breeze_net_test(socket_address_test INTERNAL DIR internal/core)
-  breeze_net_test(tcp_server_test INTERNAL DIR tcp)
-  breeze_net_test(uds_server_test INTERNAL DIR uds)
-  breeze_net_test(event_loop_group_test INTERNAL DIR loop)
-  breeze_net_test(connection_handle_test INTERNAL DIR connection)
+  breeze_net_test(socket_address_test DIR socket)
+  breeze_net_test(tcp_server_test DIR tcp)
+  breeze_net_test(uds_server_test DIR uds)
+  breeze_net_test(event_loop_group_test DIR loop)
+  breeze_net_test(connection_handle_test DIR connection)
   breeze_net_test(connection_test DIR connection)
-  breeze_net_test(stream_server_test INTERNAL DIR stream)
-  breeze_net_test(stream_client_test INTERNAL DIR stream)
-  breeze_net_test(echo_test INTERNAL DIR testing)
-  breeze_net_test(net_flow_test INTERNAL DIR testing)
-  breeze_net_test(net_lifecycle_test INTERNAL DIR testing)
+  breeze_net_test(stream_server_test DIR stream)
+  breeze_net_test(stream_client_test DIR stream)
+  breeze_net_test(echo_test DIR testing)
+  breeze_net_test(net_flow_test DIR testing)
+  breeze_net_test(net_lifecycle_test DIR testing)
 
   # rudp：协议与票据表是纯逻辑，不依赖 KCP；其余经 breeze_net_rudp。
   breeze_net_test(rudp_protocol_test DIR rudp LIB breeze_net_rudp)
-  breeze_net_test(ticket_table_test INTERNAL DIR rudp/internal LIB breeze_net_rudp)
-  breeze_net_test(kcp_session_test INTERNAL DIR rudp/internal LIB breeze_net_rudp)
-  breeze_net_test(udp_socket_test INTERNAL DIR rudp/internal LIB breeze_net_rudp)
-  breeze_net_test(rudp_server_test INTERNAL DIR rudp LIB breeze_net_rudp)
-  breeze_net_test(rudp_client_test INTERNAL DIR rudp LIB breeze_net_rudp)
-  breeze_net_test(rudp_test INTERNAL DIR testing LIB breeze_net_rudp)
+  breeze_net_test(ticket_table_test DIR rudp/internal LIB breeze_net_rudp)
+  breeze_net_test(kcp_session_test DIR rudp/internal LIB breeze_net_rudp)
+  breeze_net_test(udp_socket_test DIR rudp/internal LIB breeze_net_rudp)
+  breeze_net_test(rudp_server_test DIR rudp LIB breeze_net_rudp)
+  breeze_net_test(rudp_client_test DIR rudp LIB breeze_net_rudp)
+  breeze_net_test(rudp_test DIR testing LIB breeze_net_rudp)
 
-  # framework/net 的测试复用 base/net 的测试公共件（net_test_util.h 带内部的 event_loop.h 与 socket.h）。
+  # framework/net 的测试复用 base/net 的测试公共件（net_test_util.h 带 event_loop.h 与 stream_socket.h）。
   function(breeze_net_module_test name)
     add_executable(${name} ${NET_MODULE_DIR}/${name}.cpp)
     target_link_libraries(${name} PRIVATE breeze_net_module)
-    target_include_directories(${name} PRIVATE ${NET_INTERNAL_INCLUDE_DIRS} ${NET_TESTING_DIR})
     target_compile_options(${name} PRIVATE -Wall -Wextra)
     add_test(NAME ${name} COMMAND ${name})
     set_tests_properties(${name} PROPERTIES ENVIRONMENT "${BREEZE_TEST_ENV}")
@@ -714,7 +680,6 @@ if(BREEZE_BUILD_BENCH AND BREEZE_BUILD_NET)
   target_compile_options(muduo_bench PRIVATE -w -include ctime)
 
   add_executable(net_bench bench/net_bench.cpp)
-  target_include_directories(net_bench PRIVATE ${NET_INTERNAL_INCLUDE_DIRS})
   target_link_libraries(net_bench PRIVATE breeze_net breeze_net_rudp breeze_net_module breeze_logger muduo_bench)
   target_compile_definitions(net_bench PRIVATE BREEZE_BENCH_MUDUO=1)
   target_compile_options(net_bench PRIVATE -Wall -Wextra)

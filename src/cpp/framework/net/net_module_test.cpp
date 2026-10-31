@@ -2,7 +2,7 @@
 // Start 失败时自清理且 Run 返回带 endpoint 与 strerror 的错误、非法 endpoint /
 // 错误阶段的错误、配置驱动的选项、停机排空。 无测试框架依赖：失败即 abort。
 
-#include "net_module.h"
+#include "framework/net/net_module.h"
 
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -24,11 +24,11 @@
 #include <thread>
 #include <vector>
 
-#include "app.h"
-#include "config_module.h"
-#include "length_prefix_codec.h"
-#include "net_test_util.h"
-#include "rudp_test_util.h"
+#include "base/net/codec/length_prefix_codec.h"
+#include "base/net/testing/net_test_util.h"
+#include "base/net/testing/rudp_test_util.h"
+#include "framework/app/app.h"
+#include "framework/kernel/config_module.h"
 
 using namespace breeze;
 using namespace breeze::testing;
@@ -39,7 +39,7 @@ namespace
 bool Has(const std::string& s, std::string_view needle) { return s.find(needle) != std::string::npos; }
 
 // 业务 handler：记录事件与回调线程，收到消息原样回显（经句柄，任意线程可用）。
-class Biz final : public MainLoopHandler
+class Biz final : public IMainLoopHandler
 {
 public:
     void OnConnected(ConnectionHandle h, const PeerInfo&) override
@@ -155,7 +155,7 @@ public:
     bool ready() const { return ready_.load(std::memory_order_acquire); }
     const Endpoint& bound() const { return bound_; }
     NetModule* net() const { return net_; }
-    NetServer* server() const { return server_; }
+    INetServer* server() const { return server_; }
 
 private:
     Biz& biz_;
@@ -163,7 +163,7 @@ private:
     std::optional<StreamServerOptions> options_; // 有值就走显式选项的 AddServer 重载
     LengthPrefixCodecFactory factory_{1 << 20};
     NetModule* net_ = nullptr;
-    NetServer* server_ = nullptr;
+    INetServer* server_ = nullptr;
     Endpoint bound_ = *Endpoint::Tcp("127.0.0.1", 1);
     std::atomic<bool> ready_{false};
 };
@@ -176,9 +176,9 @@ public:
 
     ClientModule(App& a,
                  Biz& biz,
-                 const FrameCodecFactory& f,
+                 const IFrameCodecFactory& f,
                  std::string target,
-                 NetClient*& out,
+                 INetClient*& out,
                  std::optional<Explicit> options = std::nullopt)
         : Module(a)
         , biz_(biz)
@@ -204,9 +204,9 @@ public:
 
 private:
     Biz& biz_;
-    const FrameCodecFactory& f_;
+    const IFrameCodecFactory& f_;
     std::string target_;
-    NetClient*& out_;
+    INetClient*& out_;
     std::optional<Explicit> options_;
 };
 
@@ -448,7 +448,7 @@ void TestClientThroughModule(const std::string& listen)
     Biz client_biz;
     client_biz.echo = false;
     LengthPrefixCodecFactory factory(1 << 20);
-    NetClient* client = nullptr;
+    INetClient* client = nullptr;
     App client_app("net-client");
     client_app.RegisterModule([](App& a) { return std::make_unique<NetModule>(a, SmallOptions()); });
     client_app.RegisterModule([&](App& a)
@@ -496,7 +496,7 @@ void TestModuleDefaultTcpOptionsReachSockets()
     co.tcp.tcp_user_timeout = 29000ms;
     Biz client_biz;
     LengthPrefixCodecFactory factory(1 << 20);
-    NetClient* client = nullptr;
+    INetClient* client = nullptr;
     App client_app("net-client");
     client_app.RegisterModule([&](App& a) { return std::make_unique<NetModule>(a, co); });
     client_app.RegisterModule(
@@ -555,7 +555,7 @@ void TestModuleDefaultConnectionOptionsReach(const std::string& listen)
         Biz client_biz;
         client_biz.echo = false;
         LengthPrefixCodecFactory factory(1 << 20);
-        NetClient* client = nullptr;
+        INetClient* client = nullptr;
         App client_app("net-client");
         client_app.RegisterModule([&](App& a) { return std::make_unique<NetModule>(a, co); });
         client_app.RegisterModule(
@@ -657,7 +657,7 @@ void TestExplicitClientOptionsReachTypedClients(bool tcp)
     };
     Biz biz;
     LengthPrefixCodecFactory factory(1 << 20);
-    NetClient* client = nullptr;
+    INetClient* client = nullptr;
     App app("net-client");
     app.RegisterModule([](App& a) { return std::make_unique<NetModule>(a, SmallOptions()); });
     app.RegisterModule(
@@ -679,7 +679,7 @@ void TestExplicitClientConnectTimeoutReaches(const std::string& target)
     co.connect_timeout = 0ms;
     Biz biz;
     LengthPrefixCodecFactory factory(1 << 20);
-    NetClient* client = nullptr;
+    INetClient* client = nullptr;
     App app("net-client");
     app.RegisterModule([](App& a) { return std::make_unique<NetModule>(a, SmallOptions()); });
     app.RegisterModule(
@@ -723,7 +723,7 @@ void TestExplicitClientConnectionAndTcpOptionsReach(const std::string& listen)
     Biz client_biz;
     client_biz.echo = false;
     LengthPrefixCodecFactory factory(1 << 20);
-    NetClient* client = nullptr;
+    INetClient* client = nullptr;
     App client_app("net-client");
     client_app.RegisterModule([](App& a) { return std::make_unique<NetModule>(a, SmallOptions()); });
     client_app.RegisterModule(

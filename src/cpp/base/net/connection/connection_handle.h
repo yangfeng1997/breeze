@@ -17,8 +17,8 @@
 #include <functional>
 #include <string>
 
-#include "send_result.h"
-#include "shared_buffer.h"
+#include "base/buffer/shared_buffer.h"
+#include "base/net/connection/send_result.h"
 
 namespace breeze
 {
@@ -63,10 +63,10 @@ public:
     [[nodiscard]] SendResult Send(SharedBuffer payload) const;
     // 立即关闭，OnClosed 的原因是 LocalClose。对已过期的句柄是空操作。
     void Close() const;
-    // 优雅关闭（语义见 Connection::CloseGracefully）：此前经同一线程 Send 的数据先发完，再 shutdown(SHUT_WR)，
+    // 优雅关闭（语义见 IConnection::CloseGracefully）：此前经同一线程 Send 的数据先发完，再 shutdown(SHUT_WR)，
     // 对端未在 timeout 内关闭则强关。timeout 超过 49 天按 49 天算。
     void CloseGracefully(std::chrono::milliseconds timeout) const;
-    // 摘掉 / 恢复该连接的 EPOLLIN（语义见 Connection::PauseRead）。异步：投递给所属 loop，返回时尚未生效。
+    // 摘掉 / 恢复该连接的 EPOLLIN（语义见 IConnection::PauseRead）。异步：投递给所属 loop，返回时尚未生效。
     void PauseRead() const;
     void ResumeRead() const;
 

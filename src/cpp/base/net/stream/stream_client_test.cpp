@@ -2,7 +2,7 @@
 // connect_timeout（黑洞）、不可重试错误（回到 Idle，回调里 Start() 合法）、Stop / Start 语义、停机与析构。
 // 无测试框架依赖：失败即 abort。
 
-#include "stream_client.h"
+#include "base/net/stream/stream_client.h"
 
 #include <fcntl.h>
 #include <grp.h>
@@ -26,11 +26,11 @@
 #include <utility>
 #include <vector>
 
-#include "backoff.h"
-#include "event_loop_group.h"
-#include "length_prefix_codec.h"
-#include "net_test_util.h"
-#include "stream_server.h"
+#include "base/net/codec/length_prefix_codec.h"
+#include "base/net/loop/event_loop_group.h"
+#include "base/net/stream/internal/backoff.h"
+#include "base/net/stream/stream_server.h"
+#include "base/net/testing/net_test_util.h"
 
 using namespace breeze;
 using namespace breeze::testing;
@@ -68,8 +68,8 @@ private:
     std::vector<std::pair<int, bool>> v_;
 };
 
-// 接口：StreamClient 是 NetClient。
-static_assert(std::is_base_of_v<NetClient, StreamClient>);
+// 接口：StreamClient 是 INetClient。
+static_assert(std::is_base_of_v<INetClient, StreamClient>);
 
 // 服务端：group + 回显的 StreamServer。可以在固定端点上反复建起、销毁，模拟对端重启。
 struct EchoServer
@@ -261,11 +261,11 @@ void TestReconnectAfterPeerCloses()
 {
     const LeakCheck leak;
     EchoServer srv(*Endpoint::Tcp("127.0.0.1", 0), /*echo=*/false);
-    srv.rec.on_message = [](Connection& c, std::string_view) { c.Close(); };
+    srv.rec.on_message = [](IConnection& c, std::string_view) { c.Close(); };
     std::atomic<int> send_after_closed_in_callback{-1}; // 被钩子引用：要比 cs 活得久（IO 线程到 cs 析构才停）
     ClientSide cs;
     StreamClient c(cs.group, srv.server.endpoint(), {}, FastPolicy(), cs.rec, cs.factory);
-    cs.rec.on_closed = [&](Connection&, CloseReason)
+    cs.rec.on_closed = [&](IConnection&, CloseReason)
     {
         // 断开立即 OnClosed：回调里句柄已清，Send 立即 Closed
         send_after_closed_in_callback = static_cast<int>(c.Send(Buf("late")));
@@ -477,12 +477,12 @@ void TestStopThenStartNeverOverlaps(const Endpoint& ep)
     std::vector<char> log; // 全局事件顺序：C = OnConnected，X = OnClosed
     ClientSide cs;
     StreamClient c(cs.group, srv.server.endpoint(), {}, FastPolicy(), cs.rec, cs.factory);
-    cs.rec.on_connected = [&](Connection&)
+    cs.rec.on_connected = [&](IConnection&)
     {
         const std::lock_guard lk(mu);
         log.push_back('C');
     };
-    cs.rec.on_closed = [&](Connection&, CloseReason)
+    cs.rec.on_closed = [&](IConnection&, CloseReason)
     {
         const std::lock_guard lk(mu);
         log.push_back('X');

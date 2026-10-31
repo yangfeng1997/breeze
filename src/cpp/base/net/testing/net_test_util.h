@@ -16,22 +16,22 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
-#include <unordered_map>
 #include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
-#include "buffer.h"
-#include "connection.h"
-#include "connection_handler.h"
-#include "endpoint.h"
-#include "event_loop.h"
-#include "length_prefix_codec.h"
-#include "shared_buffer.h"
-#include "socket.h"
+#include "base/buffer/buffer.h"
+#include "base/buffer/shared_buffer.h"
+#include "base/net/codec/length_prefix_codec.h"
+#include "base/net/connection/connection_handler_interface.h"
+#include "base/net/connection/connection_interface.h"
+#include "base/net/endpoint/endpoint.h"
+#include "base/net/loop/event_loop.h"
+#include "base/net/stream/internal/stream_socket.h"
 
 #define CHECK(...)                                                                                                     \
     do                                                                                                                 \
@@ -71,10 +71,7 @@ inline SharedBuffer Buf(std::string_view s)
 inline std::string Str(std::span<const std::byte> b) { return {reinterpret_cast<const char*>(b.data()), b.size()}; }
 
 // 回显：EventRecorder::on_message 的常用实现，用视图版 Send 直接从读缓冲写回。
-inline void Echo(Connection& c, std::string_view sv)
-{
-    (void)c.Send(std::as_bytes(std::span(sv)));
-}
+inline void Echo(IConnection& c, std::string_view sv) { (void)c.Send(std::as_bytes(std::span(sv))); }
 
 // 临时目录，放 UDS 的 socket 文件；析构时清掉里面的文件与目录本身。
 class TempDir
@@ -165,7 +162,7 @@ struct LeakCheck
 
 // 线程安全地记录连接事件。可选的钩子在 IO 线程上、记录之后调用（要回显、要在回调里关连接 / 暂停读时用）。
 // CheckInvariants 验证设计 §7 第 2 条：每条连接 OnConnected 先于一切，恰一个 OnClosed 且在最后一个 OnMessage 之后。
-class EventRecorder final : public ConnectionHandler
+class EventRecorder final : public IConnectionHandler
 {
 public:
     struct Closed
@@ -180,11 +177,11 @@ public:
         std::string payload;
     };
 
-    std::function<void(Connection&)> on_connected;
-    std::function<void(Connection&, std::string_view)> on_message;
-    std::function<void(Connection&, CloseReason)> on_closed;
+    std::function<void(IConnection&)> on_connected;
+    std::function<void(IConnection&, std::string_view)> on_message;
+    std::function<void(IConnection&, CloseReason)> on_closed;
 
-    void OnConnected(Connection& c) noexcept override
+    void OnConnected(IConnection& c) noexcept override
     {
         {
             const std::lock_guard lk(mu_);
@@ -194,7 +191,7 @@ public:
         if (on_connected)
             on_connected(c);
     }
-    void OnMessage(Connection& c, std::span<const std::byte> payload) noexcept override
+    void OnMessage(IConnection& c, std::span<const std::byte> payload) noexcept override
     {
         const std::string s = Str(payload);
         {
@@ -205,7 +202,7 @@ public:
         if (on_message)
             on_message(c, s);
     }
-    void OnClosed(Connection& c, CloseReason r, int err) noexcept override
+    void OnClosed(IConnection& c, CloseReason r, int err) noexcept override
     {
         {
             const std::lock_guard lk(mu_);

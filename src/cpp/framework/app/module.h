@@ -7,7 +7,7 @@
 #include <string_view>
 #include <vector>
 
-#include "errors.h"
+#include "framework/app/errors.h"
 
 namespace breeze
 {

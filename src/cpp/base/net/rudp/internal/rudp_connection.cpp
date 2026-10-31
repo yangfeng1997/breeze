@@ -1,13 +1,13 @@
-#include "rudp_connection.h"
+#include "base/net/rudp/internal/rudp_connection.h"
 
 #include <algorithm>
 #include <cerrno>
 #include <limits>
 #include <vector>
 
-#include "internal/core/event_loop.h"
-#include "logger.h"
-#include "logger_macros.h"
+#include "base/logger/logger.h"
+#include "base/logger/logger_macros.h"
+#include "base/net/loop/event_loop.h"
 
 namespace breeze
 {
@@ -26,7 +26,7 @@ RUdpConnection* RUdpConnection::Create(EventLoop& loop,
                                        socklen_t peer_len,
                                        std::uint32_t conv,
                                        PeerInfo peer,
-                                       ConnectionHandler& handler,
+                                       IConnectionHandler& handler,
                                        Owner& owner,
                                        const ConnectionOptions& conn_options,
                                        const RUdpOptions& rudp_options)
@@ -67,7 +67,7 @@ RUdpConnection::RUdpConnection(EventLoop& loop,
                                std::uint32_t conv,
                                std::unique_ptr<KcpSession> kcp,
                                PeerInfo peer,
-                               ConnectionHandler& handler,
+                               IConnectionHandler& handler,
                                Owner& owner,
                                const ConnectionOptions& conn_options,
                                const RUdpOptions& rudp_options,

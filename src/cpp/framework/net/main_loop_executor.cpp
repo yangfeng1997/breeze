@@ -1,12 +1,12 @@
-#include "main_loop_executor.h"
+#include "framework/net/main_loop_executor.h"
 
 #include <algorithm>
 
-#include "connection.h"
-#include "connection_context.h"
-#include "logger.h"
-#include "logger_macros.h"
-#include "peer_info.h"
+#include "base/logger/logger.h"
+#include "base/logger/logger_macros.h"
+#include "base/net/connection/connection_context.h"
+#include "base/net/connection/connection_interface.h"
+#include "base/net/endpoint/peer_info.h"
 
 namespace breeze
 {
@@ -42,30 +42,30 @@ struct MainLoopExecutor::Event
     CloseReason reason = CloseReason::LocalClose;
     int err = 0;
     ConnectionHandle handle;
-    MainLoopHandler* handler = nullptr;
+    IMainLoopHandler* handler = nullptr;
     std::shared_ptr<ConnState> state; // 仅 Message
     SharedBuffer msg;                 // 仅 Message
     std::unique_ptr<PeerInfo> peer;   // 仅 Connected
 };
 
-class MainLoopExecutor::Adapter final : public ConnectionHandler
+class MainLoopExecutor::Adapter final : public IConnectionHandler
 {
 public:
-    Adapter(MainLoopExecutor& exec, MainLoopHandler& handler)
+    Adapter(MainLoopExecutor& exec, IMainLoopHandler& handler)
         : exec_(exec)
         , handler_(handler)
     {
     }
-    void OnConnected(Connection& c) noexcept override { exec_.OnConnected(c, handler_); }
-    void OnMessage(Connection& c, std::span<const std::byte> payload) noexcept override
+    void OnConnected(IConnection& c) noexcept override { exec_.OnConnected(c, handler_); }
+    void OnMessage(IConnection& c, std::span<const std::byte> payload) noexcept override
     {
         exec_.OnMessage(c, payload, handler_);
     }
-    void OnClosed(Connection& c, CloseReason r, int e) noexcept override { exec_.OnClosed(c, r, e, handler_); }
+    void OnClosed(IConnection& c, CloseReason r, int e) noexcept override { exec_.OnClosed(c, r, e, handler_); }
 
 private:
     MainLoopExecutor& exec_;
-    MainLoopHandler& handler_;
+    IMainLoopHandler& handler_;
 };
 
 MainLoopExecutor::MainLoopExecutor(App& app, InboundLimits limits)
@@ -78,7 +78,7 @@ MainLoopExecutor::MainLoopExecutor(App& app, InboundLimits limits)
 // 在这里定义：销毁队列、适配器、事件需要它们是完整类型。未分发的事件直接随队列销毁，不回调业务。
 MainLoopExecutor::~MainLoopExecutor() = default;
 
-ConnectionHandler& MainLoopExecutor::Wrap(MainLoopHandler& handler)
+IConnectionHandler& MainLoopExecutor::Wrap(IMainLoopHandler& handler)
 {
     adapters_.push_back(std::make_unique<Adapter>(*this, handler));
     return *adapters_.back();
@@ -139,7 +139,7 @@ void MainLoopExecutor::Push(ConnectionHandle h, Event&& ev)
     app_.Notify(); // 已有 token 时只是一次原子交换
 }
 
-void MainLoopExecutor::OnConnected(Connection& c, MainLoopHandler& h)
+void MainLoopExecutor::OnConnected(IConnection& c, IMainLoopHandler& h)
 {
     auto st = std::make_shared<ConnState>();
     st->handle = c.handle();
@@ -155,7 +155,7 @@ void MainLoopExecutor::OnConnected(Connection& c, MainLoopHandler& h)
     Push(c.handle(), std::move(ev));
 }
 
-void MainLoopExecutor::OnMessage(Connection& c, std::span<const std::byte> payload, MainLoopHandler& h)
+void MainLoopExecutor::OnMessage(IConnection& c, std::span<const std::byte> payload, IMainLoopHandler& h)
 {
     const std::shared_ptr<ConnState>& st = c.GetContext<StateContext>()->state;
     const std::uint64_t len = payload.size();
@@ -176,7 +176,7 @@ void MainLoopExecutor::OnMessage(Connection& c, std::span<const std::byte> paylo
     MaybePause(c, st);
 }
 
-void MainLoopExecutor::OnClosed(Connection& c, CloseReason reason, int sys_errno, MainLoopHandler& h)
+void MainLoopExecutor::OnClosed(IConnection& c, CloseReason reason, int sys_errno, IMainLoopHandler& h)
 {
     Event ev;
     ev.kind = Event::Kind::Closed;
@@ -190,7 +190,7 @@ void MainLoopExecutor::OnClosed(Connection& c, CloseReason reason, int sys_errno
 // 超限就暂停本连接。暂停与恢复由 IO 线程（这里）和主循环线程（Release / ResumeGlobalWaiters）各自判断，
 // 用 paused 的 exchange 仲裁，所以必须自己重查一次：主线程可能在我们翻转 paused 之前就把积压消费光了，
 // 它看到 paused 还是 false，不会替我们恢复。
-void MainLoopExecutor::MaybePause(Connection& c, const std::shared_ptr<ConnState>& st)
+void MainLoopExecutor::MaybePause(IConnection& c, const std::shared_ptr<ConnState>& st)
 {
     if (st->paused.load(std::memory_order_relaxed))
         return;

@@ -6,8 +6,8 @@
 
 #include <chrono>
 
-#include "stream_client.h"
-#include "uds_endpoint.h"
+#include "base/net/stream/stream_client.h"
+#include "base/net/uds/uds_endpoint.h"
 
 namespace breeze
 {
@@ -27,8 +27,8 @@ public:
               const UdsEndpoint& peer,
               UdsClientOptions options,
               ReconnectPolicy policy,
-              ConnectionHandler& handler,
-              const FrameCodecFactory& factory);
+              IConnectionHandler& handler,
+              const IFrameCodecFactory& factory);
 
     // 对端地址（构造时给的）。
     UdsEndpoint peer() const;

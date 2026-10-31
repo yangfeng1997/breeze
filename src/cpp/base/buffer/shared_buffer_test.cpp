@@ -1,6 +1,6 @@
 // 无测试框架依赖：失败即 abort。并发用例靠 tsan 预设抓数据竞争（cmake --preset tsan）。
 
-#include "shared_buffer.h"
+#include "base/buffer/shared_buffer.h"
 
 #include <cstdint>
 #include <cstdio>

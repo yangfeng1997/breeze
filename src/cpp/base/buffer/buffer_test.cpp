@@ -1,6 +1,6 @@
 // 无测试框架依赖：失败即 abort。
 
-#include "buffer.h"
+#include "base/buffer/buffer.h"
 
 #include <cstdio>
 #include <cstdlib>

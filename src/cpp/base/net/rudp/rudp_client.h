@@ -22,16 +22,16 @@
 #include <memory>
 #include <mutex>
 
-#include "connection_handle.h"
-#include "connection_handler.h"
-#include "connection_options.h"
-#include "event_loop_group.h"
-#include "net_client.h"
-#include "rudp_endpoint.h"
-#include "rudp_options.h"
-#include "rudp_ticket.h"
-#include "send_result.h"
-#include "shared_buffer.h"
+#include "base/buffer/shared_buffer.h"
+#include "base/net/connection/connection_handle.h"
+#include "base/net/connection/connection_handler_interface.h"
+#include "base/net/connection/connection_options.h"
+#include "base/net/connection/net_client_interface.h"
+#include "base/net/connection/send_result.h"
+#include "base/net/loop/event_loop_group.h"
+#include "base/net/rudp/rudp_endpoint.h"
+#include "base/net/rudp/rudp_options.h"
+#include "base/net/rudp/rudp_ticket.h"
 
 namespace breeze
 {
@@ -50,13 +50,13 @@ struct RUdpClientOptions
     ConnectFailedCallback on_connect_failed;
 };
 
-class RUdpClient final : public NetClient
+class RUdpClient final : public INetClient
 {
 public:
     RUdpClient(EventLoopGroup& group,
                const RUdpEndpoint& server,
                RUdpClientOptions options,
-               ConnectionHandler& handler);
+               IConnectionHandler& handler);
     ~RUdpClient() override;
 
     RUdpClient(const RUdpClient&) = delete;

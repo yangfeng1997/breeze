@@ -1,6 +1,6 @@
 // 无测试框架依赖：失败即 abort。
 
-#include "config.h"
+#include "base/config/config.h"
 
 #include <unistd.h>
 

@@ -1,6 +1,6 @@
 // this_thread：tid 缓存、线程名、IsMainThread，以及 fork 之后的缓存重置。
 
-#include "current_thread.h"
+#include "base/thread/current_thread.h"
 
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -13,8 +13,8 @@
 #include <string>
 #include <vector>
 
-#include "thread.h"
-#include "thread_test_util.h"
+#include "base/thread/thread.h"
+#include "base/thread/thread_test_util.h"
 
 using namespace breeze;
 using namespace breeze::testing;

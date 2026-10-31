@@ -1,7 +1,7 @@
 // Defer：执行时机与顺序、Dismiss / Run、移动后只执行一次、异常展开时也执行、宏的唯一变量名。
 // 无测试框架依赖：失败即 abort。
 
-#include "defer.h"
+#include "base/defer/defer.h"
 
 #include <cstdio>
 #include <cstdlib>

@@ -2,7 +2,7 @@
 // 设计与威胁模型见 docs/网络库设计.md §4.14。
 //
 // 与 TcpServer 的区别：
-// - 没有 codec / FrameCodecFactory：消息自带边界，handler 每次收到完整的一条。
+// - 没有 codec / IFrameCodecFactory：消息自带边界，handler 每次收到完整的一条。
 // - 准入靠票据：控制面（login / gate）经可信通道把 RUdpTicket 发给客户端，服务端用 IssueTicket / AddTicket 登记；
 //   客户端握手时出示，一次有效。没登记的来源发什么都建不起会话。
 // - 一个 socket、一个 loop：所有会话都在 Start 时选定的那个 loop 上（要横向扩展就多开几个服务端、监听不同端口）。
@@ -20,13 +20,13 @@
 #include <memory>
 #include <optional>
 
-#include "connection_handler.h"
-#include "connection_options.h"
-#include "event_loop_group.h"
-#include "net_server.h"
-#include "rudp_endpoint.h"
-#include "rudp_options.h"
-#include "rudp_ticket.h"
+#include "base/net/connection/connection_handler_interface.h"
+#include "base/net/connection/connection_options.h"
+#include "base/net/connection/net_server_interface.h"
+#include "base/net/loop/event_loop_group.h"
+#include "base/net/rudp/rudp_endpoint.h"
+#include "base/net/rudp/rudp_options.h"
+#include "base/net/rudp/rudp_ticket.h"
 
 namespace breeze
 {
@@ -43,13 +43,13 @@ struct RUdpServerOptions
     std::size_t max_pending_tickets = 65536;
 };
 
-class RUdpServer final : public NetServer
+class RUdpServer final : public INetServer
 {
 public:
     RUdpServer(EventLoopGroup& group,
                const RUdpEndpoint& endpoint,
                RUdpServerOptions options,
-               ConnectionHandler& handler);
+               IConnectionHandler& handler);
     ~RUdpServer() override;
 
     RUdpServer(const RUdpServer&) = delete;

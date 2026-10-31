@@ -1,7 +1,7 @@
 // TimeRecord：秒表语义、析构时记日志（名字、耗时、创建位置）、慢操作阈值、Cancel / SetName、宏。
 // 日志写到 stderr（没有默认 logger 时的兜底），用重定向 fd 2 的办法读回来。无测试框架依赖：失败即 abort。
 
-#include "time_record.h"
+#include "base/time_record/time_record.h"
 
 #include <unistd.h>
 

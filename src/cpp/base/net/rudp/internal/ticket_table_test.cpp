@@ -1,7 +1,7 @@
 // 准入票据表：一次性、过期、token 错不烧票据、容量、conv 冲突、并发签发与取用。
 // 时间都由测试传入（TicketTable 的 now 参数），不睡觉。无测试框架依赖：失败即 abort。
 
-#include "ticket_table.h"
+#include "base/net/rudp/internal/ticket_table.h"
 
 #include <atomic>
 #include <cstdio>

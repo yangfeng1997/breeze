@@ -2,7 +2,7 @@
 // 每连接 / 全局的入口背压（上界、恢复、不丢不乱序），以及小限额下的并发压力（专打"丢恢复"这类竞态）。
 // 无测试框架依赖：失败即 abort；并发用例带超时，卡死（比如丢了恢复）也会 abort 而不是挂住 ctest。
 
-#include "main_loop_executor.h"
+#include "framework/net/main_loop_executor.h"
 
 #include <atomic>
 #include <chrono>
@@ -15,11 +15,11 @@
 #include <unordered_map>
 #include <vector>
 
-#include "app.h"
-#include "event_loop_group.h"
-#include "length_prefix_codec.h"
-#include "net_test_util.h"
-#include "stream_server.h"
+#include "base/net/codec/length_prefix_codec.h"
+#include "base/net/loop/event_loop_group.h"
+#include "base/net/stream/stream_server.h"
+#include "base/net/testing/net_test_util.h"
+#include "framework/app/app.h"
 
 using namespace breeze;
 using namespace breeze::testing;
@@ -30,7 +30,7 @@ namespace
 constexpr std::size_t kMaxFrame = 1 << 20;
 
 // 记录主循环上收到的事件。所有回调都应当在同一个线程（调 Drain 的线程）上。
-class Recorder final : public MainLoopHandler
+class Recorder final : public IMainLoopHandler
 {
 public:
     struct Ev
@@ -440,16 +440,16 @@ void TestHysteresisBetweenHighAndLowWater()
 //      生效——连接物理上恢复读，标志却是 true，MaybePause 从此直接返回，这条连接的入站不再受限。
 // 用一个"门"把 IO 线程卡在第 9 帧之后，让 2 在 3 之前确定发生。之后主线程不再消费，客户端继续灌：
 // 在途必须被钉住（再次暂停），而不是无界增长。
-class Gate final : public ConnectionHandler
+class Gate final : public IConnectionHandler
 {
 public:
-    Gate(ConnectionHandler& inner, int block_at)
+    Gate(IConnectionHandler& inner, int block_at)
         : inner_(inner)
         , block_at_(block_at)
     {
     }
-    void OnConnected(Connection& c) noexcept override { inner_.OnConnected(c); }
-    void OnMessage(Connection& c, std::span<const std::byte> payload) noexcept override
+    void OnConnected(IConnection& c) noexcept override { inner_.OnConnected(c); }
+    void OnMessage(IConnection& c, std::span<const std::byte> payload) noexcept override
     {
         inner_.OnMessage(c, payload);
         if (seen_.fetch_add(1) + 1 == block_at_)
@@ -459,13 +459,13 @@ public:
                 std::this_thread::sleep_for(100us);
         }
     }
-    void OnClosed(Connection& c, CloseReason r, int e) noexcept override { inner_.OnClosed(c, r, e); }
+    void OnClosed(IConnection& c, CloseReason r, int e) noexcept override { inner_.OnClosed(c, r, e); }
 
     bool blocked() const { return blocked_.load(); }
     void Release() { release_ = true; }
 
 private:
-    ConnectionHandler& inner_;
+    IConnectionHandler& inner_;
     const int block_at_;
     std::atomic<int> seen_{0};
     std::atomic<bool> blocked_{false};

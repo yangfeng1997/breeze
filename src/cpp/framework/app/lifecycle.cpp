@@ -2,8 +2,8 @@
 // 启动阶段只有"往前走"一种状态推进，不维护逐模块账本；补偿代码只在失败时跑一次，
 // 永远缺真实执行路径，与其维护不如把"失败就退出"说清楚。
 
-#include "app.h"
-#include "logger_macros.h"
+#include "base/logger/logger_macros.h"
+#include "framework/app/app.h"
 
 namespace breeze
 {

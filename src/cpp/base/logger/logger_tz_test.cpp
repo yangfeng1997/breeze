@@ -6,8 +6,8 @@
 #include <filesystem>
 #include <string>
 
-#include "hourly_file_sink.h"
-#include "logger_test_util.h"
+#include "base/logger/internal/hourly_file_sink.h"
+#include "base/logger/internal/logger_test_util.h"
 
 using namespace breeze;
 using namespace breeze::testutil;

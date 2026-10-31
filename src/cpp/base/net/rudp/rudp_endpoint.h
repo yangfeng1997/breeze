@@ -10,7 +10,7 @@
 #include <string_view>
 #include <utility>
 
-#include "endpoint.h"
+#include "base/net/endpoint/endpoint.h"
 
 namespace breeze
 {
@@ -30,7 +30,7 @@ public:
     bool IsIPv6() const noexcept { return ep_.IsIPv6(); }
     std::string ToString() const { return ep_.ToString(); }
 
-    // 通用形式：PeerInfo、日志、NetServer / NetClient 接口都用它。
+    // 通用形式：PeerInfo、日志、INetServer / INetClient 接口都用它。
     const Endpoint& endpoint() const noexcept { return ep_; }
 
     bool operator==(const RUdpEndpoint&) const = default;

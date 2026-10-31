@@ -1,10 +1,10 @@
-#include "assert_macros.h"
+#include "base/assert/assert_macros.h"
 
 #include <format>
 #include <string>
 
-#include "backtrace.h"
-#include "logger_macros.h"
+#include "base/backtrace/backtrace.h"
+#include "base/logger/logger_macros.h"
 
 namespace breeze::detail
 {

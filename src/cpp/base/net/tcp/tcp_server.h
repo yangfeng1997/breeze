@@ -6,9 +6,9 @@
 
 #include <sys/socket.h>
 
-#include "stream_server.h"
-#include "tcp_endpoint.h"
-#include "tcp_options.h"
+#include "base/net/stream/stream_server.h"
+#include "base/net/tcp/tcp_endpoint.h"
+#include "base/net/tcp/tcp_options.h"
 
 namespace breeze
 {
@@ -27,8 +27,8 @@ public:
     TcpServer(EventLoopGroup& group,
               const TcpEndpoint& endpoint,
               TcpServerOptions options,
-              ConnectionHandler& handler,
-              const FrameCodecFactory& factory);
+              IConnectionHandler& handler,
+              const IFrameCodecFactory& factory);
 
     // 实际绑定的地址：端口填 0 时，Start 成功之后这里是系统分配的端口。Start 之前就是构造时给的端点。
     TcpEndpoint local_endpoint() const;

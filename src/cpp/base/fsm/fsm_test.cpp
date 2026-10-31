@@ -2,7 +2,7 @@
 // 循环保护、Start 语义、异常、状态类型的要求，以及随机操作下的不变量。
 // 状态的成员函数都定义在所有状态之后（见 fsm.h 开头的说明）。无测试框架依赖：失败即 abort。
 
-#include "fsm.h"
+#include "base/fsm/fsm.h"
 
 #include <cstdint>
 #include <cstdio>

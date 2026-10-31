@@ -16,12 +16,12 @@
 #include <utility>
 #include <vector>
 
-#include "connection.h"
-#include "event_loop_group.h"
-#include "group_access.h"
-#include "length_prefix_codec.h"
-#include "loop_server.h"
-#include "net_test_util.h"
+#include "base/net/codec/length_prefix_codec.h"
+#include "base/net/connection/connection_interface.h"
+#include "base/net/loop/event_loop_group.h"
+#include "base/net/loop/group_access.h"
+#include "base/net/stream/internal/loop_server.h"
+#include "base/net/testing/net_test_util.h"
 
 using namespace breeze;
 using namespace breeze::testing;
@@ -30,16 +30,16 @@ namespace
 {
 
 // 记录每条连接的句柄与关闭原因；默认不回显（要回显的用例自己开）。
-class Recorder final : public ConnectionHandler
+class Recorder final : public IConnectionHandler
 {
 public:
-    void OnConnected(Connection& c) noexcept override
+    void OnConnected(IConnection& c) noexcept override
     {
         const std::lock_guard lk(mu_);
         handles_.push_back(c.handle());
     }
-    void OnMessage(Connection&, std::span<const std::byte>) noexcept override {}
-    void OnClosed(Connection& c, CloseReason r, int) noexcept override
+    void OnMessage(IConnection&, std::span<const std::byte>) noexcept override {}
+    void OnClosed(IConnection& c, CloseReason r, int) noexcept override
     {
         const std::lock_guard lk(mu_);
         closed_.emplace_back(c.handle(), r);
@@ -80,7 +80,7 @@ private:
 class GroupServer
 {
 public:
-    explicit GroupServer(ConnectionHandler& h, EventLoopGroupOptions go = {1, 64}, ConnectionOptions co = {})
+    explicit GroupServer(IConnectionHandler& h, EventLoopGroupOptions go = {1, 64}, ConnectionOptions co = {})
         : group(go)
         , factory(4 * 1024 * 1024)
     {

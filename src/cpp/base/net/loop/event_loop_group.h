@@ -15,7 +15,7 @@
 #include <memory>
 #include <vector>
 
-#include "net_stats.h"
+#include "base/net/loop/net_stats.h"
 
 namespace breeze
 {
@@ -64,7 +64,7 @@ public:
     }
 
 private:
-    friend struct GroupAccess; // 内部与测试通过 internal/core/group_access.h 取 loop
+    friend struct GroupAccess; // 内部与测试通过 group_access.h 取 loop
 
     enum class State : std::uint8_t
     {

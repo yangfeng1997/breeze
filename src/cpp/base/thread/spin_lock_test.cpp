@@ -1,6 +1,6 @@
 // SpinLock：互斥、try_lock、与标准库的 Guard 配合、线程数多于核数时仍然能做完（自旋之后让出 CPU）。
 
-#include "spin_lock.h"
+#include "base/thread/spin_lock.h"
 
 #include <atomic>
 #include <chrono>
@@ -9,8 +9,8 @@
 #include <thread>
 #include <vector>
 
-#include "thread.h"
-#include "thread_test_util.h"
+#include "base/thread/thread.h"
+#include "base/thread/thread_test_util.h"
 
 using namespace breeze;
 using namespace breeze::testing;

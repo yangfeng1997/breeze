@@ -1,14 +1,14 @@
-#include "rudp_client.h"
+#include "base/net/rudp/rudp_client.h"
 
 #include <cerrno>
 #include <thread>
 #include <utility>
 
-#include "group_access.h"
-#include "logger.h"
-#include "logger_macros.h"
-#include "rudp_connection.h"
-#include "udp_socket.h"
+#include "base/logger/logger.h"
+#include "base/logger/logger_macros.h"
+#include "base/net/loop/group_access.h"
+#include "base/net/rudp/internal/rudp_connection.h"
+#include "base/net/rudp/internal/udp_socket.h"
 
 namespace breeze
 {
@@ -41,7 +41,7 @@ static_assert(std::is_same_v<decltype(RUdpTicket::token), rudp::Token>);
 
 // 状态：Idle → Handshaking → Connected → Closing → Idle。Closing 是 Stop 关掉了连接、但它的 OnClosed 还没回调的间隙：
 // 这期间 Start 要等 OnClosed 之后再开始，否则旧连接的收尾会拆掉新连接的 socket 与定时器。
-struct RUdpClient::Impl final : DatagramHandler, RUdpConnection::Owner, ConnectionHandler
+struct RUdpClient::Impl final : IDatagramHandler, RUdpConnection::Owner, IConnectionHandler
 {
     enum class State : std::uint8_t
     {
@@ -51,7 +51,7 @@ struct RUdpClient::Impl final : DatagramHandler, RUdpConnection::Owner, Connecti
         Closing,
     };
 
-    Impl(EventLoopGroup& g, Endpoint ep, RUdpClientOptions o, ConnectionHandler& h, std::atomic<std::uint64_t>& hd)
+    Impl(EventLoopGroup& g, Endpoint ep, RUdpClientOptions o, IConnectionHandler& h, std::atomic<std::uint64_t>& hd)
         : group(g)
         , server(std::move(ep))
         , options(std::move(o))
@@ -64,7 +64,7 @@ struct RUdpClient::Impl final : DatagramHandler, RUdpConnection::Owner, Connecti
     EventLoopGroup& group;
     Endpoint server;
     RUdpClientOptions options;
-    ConnectionHandler& handler;
+    IConnectionHandler& handler;
     std::atomic<std::uint64_t>& handle;
 
     std::mutex ticket_mu; // SetTicket（任意线程）与 Start（读）
@@ -100,9 +100,9 @@ struct RUdpClient::Impl final : DatagramHandler, RUdpConnection::Owner, Connecti
     void OnAccepted();
     void ArmTick();
     void ArmPing();
-    void HandleClosed(Connection& c, CloseReason reason, int err);
+    void HandleClosed(IConnection& c, CloseReason reason, int err);
 
-    // DatagramHandler
+    // IDatagramHandler
     void OnDatagram(const sockaddr_storage&, socklen_t, std::span<const std::byte> data) override;
     void OnSocketError(int err) override
     {
@@ -117,13 +117,13 @@ struct RUdpClient::Impl final : DatagramHandler, RUdpConnection::Owner, Connecti
     }
     // 客户端只有一条会话，定时器一直在跑，不需要活跃表。
     void OnConnectionWake(RUdpConnection&) noexcept override {}
-    // ConnectionHandler：转发给业务，OnClosed 时先收尾
-    void OnConnected(Connection& c) noexcept override { handler.OnConnected(c); }
-    void OnMessage(Connection& c, std::span<const std::byte> payload) noexcept override
+    // IConnectionHandler：转发给业务，OnClosed 时先收尾
+    void OnConnected(IConnection& c) noexcept override { handler.OnConnected(c); }
+    void OnMessage(IConnection& c, std::span<const std::byte> payload) noexcept override
     {
         handler.OnMessage(c, payload);
     }
-    void OnClosed(Connection& c, CloseReason reason, int err) noexcept override { HandleClosed(c, reason, err); }
+    void OnClosed(IConnection& c, CloseReason reason, int err) noexcept override { HandleClosed(c, reason, err); }
 };
 
 // ---- 握手 ----
@@ -316,7 +316,7 @@ void RUdpClient::Impl::CancelRunTimers()
 
 // ---- 连接结束（NotifyClosed 里经转发器到这里）----
 
-void RUdpClient::Impl::HandleClosed(Connection& c, CloseReason reason, int err)
+void RUdpClient::Impl::HandleClosed(IConnection& c, CloseReason reason, int err)
 {
     handle.store(0, std::memory_order_release); // 先清句柄：回调里的 Send 得到 Closed
     conn = nullptr;
@@ -367,7 +367,7 @@ void RUdpClient::Impl::StopOnLoop()
 RUdpClient::RUdpClient(EventLoopGroup& group,
                        const RUdpEndpoint& server,
                        RUdpClientOptions options,
-                       ConnectionHandler& handler)
+                       IConnectionHandler& handler)
     : server_(server.endpoint())
     , impl_(std::make_unique<Impl>(group, server.endpoint(), std::move(options), handler, handle_))
 {
