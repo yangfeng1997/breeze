@@ -33,12 +33,12 @@
 #include "shared_buffer.h"
 #include "socket.h"
 
-#define CHECK(cond)                                                                                                    \
+#define CHECK(...)                                                                                                     \
     do                                                                                                                 \
     {                                                                                                                  \
-        if (!(cond))                                                                                                   \
+        if (!(__VA_ARGS__))                                                                                            \
         {                                                                                                              \
-            std::fprintf(stderr, "%s:%d: CHECK failed: %s\n", __FILE__, __LINE__, #cond);                              \
+            std::fprintf(stderr, "%s:%d: CHECK failed: %s\n", __FILE__, __LINE__, #__VA_ARGS__);                       \
             std::abort();                                                                                              \
         }                                                                                                              \
     } while (0)

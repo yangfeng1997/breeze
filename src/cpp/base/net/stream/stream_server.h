@@ -30,11 +30,6 @@
 namespace breeze
 {
 
-// 接受前过滤：在 accept 所在 IO 线程运行，返回 false 就立即关闭这条连接（不产生任何回调，计入 rejected_filter）。
-// UDS 的 PeerInfo 带 credentials（uid / gid / pid），可据此校验对端身份。必须非阻塞、noexcept。
-// 放在 StreamServerOptions 而不是 ConnectionHandler：StreamClient 也用后者。
-using AcceptFilter = std::move_only_function<bool(const PeerInfo&) noexcept>;
-
 struct StreamServerOptions
 {
     ConnectionOptions connection; // 水位、idle_timeout：对每条被接受的连接生效

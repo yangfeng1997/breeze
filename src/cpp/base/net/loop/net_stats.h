@@ -31,6 +31,9 @@ struct NetStats
     std::uint64_t rejected_full = 0;         // 所有 loop 的连接表都满
     std::uint64_t rejected_fd_exhausted = 0; // accept 遇 EMFILE / ENFILE
     std::uint64_t rejected_resource = 0;     // 新连接登记 epoll 失败（ENOSPC / ENOMEM）
+    // rudp 的握手与数据报（字节流传输恒为 0）：
+    std::uint64_t rejected_ticket = 0;   // Hello 被拒：票据不存在 / 已过期 / 已用过 / token 不对（也计入不了 accepted）
+    std::uint64_t datagrams_dropped = 0; // 被丢弃的数据报：格式不对、来源没有会话、KCP 不认
 
     std::uint64_t bytes_in = 0;     // read 到的字节
     std::uint64_t bytes_out = 0;    // 实际写进 socket 的字节（含帧头）

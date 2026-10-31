@@ -30,6 +30,7 @@ endif()
 find_package(Threads REQUIRED)
 find_package(CLI11 CONFIG REQUIRED)
 find_package(concurrentqueue CONFIG REQUIRED)
+find_package(kcp CONFIG REQUIRED)                # rudp 内部用（ARQ，只在 breeze_net_rudp 里 PRIVATE 链接）
 find_package(readerwriterqueue CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
 find_package(yaml-cpp CONFIG REQUIRED)
@@ -76,12 +77,14 @@ set(NET_DIR base/net)
 # net 的头文件目录。头文件用扁平名 include（与仓库其它库一致），所以下面所有目录之间文件名必须唯一。
 # 公开的（PUBLIC，使用方可见），按概念分：connection/（连接及其回调 / 句柄 / 选项）、endpoint/（地址与对端信息）、
 # codec/（分帧）、loop/（EventLoopGroup 与统计）、stream/（TCP / UDS 共用的服务端 / 客户端基类）、
-# tcp/、uds/、rudp/（各自的端点、选项、服务端、客户端；rudp 现在只有端点）。
+# tcp/、uds/、rudp/（各自的端点、选项、服务端、客户端；rudp 还有线格式 rudp_protocol.h、准入票据与传输参数）。
 set(NET_PUBLIC_INCLUDE_DIRS ${NET_DIR}/connection ${NET_DIR}/endpoint ${NET_DIR}/codec ${NET_DIR}/loop
                             ${NET_DIR}/stream ${NET_DIR}/tcp ${NET_DIR}/uds ${NET_DIR}/rudp)
 # 内部的（PRIVATE）：internal/core（所有传输共用）、internal/stream（TCP / UDS 共用的字节流实现）、
-# tcp/internal、uds/internal（各自专有的 socket 选项与处理）。库自己与要直接用内部头的测试 / bench 加这几个路径。
-set(NET_INTERNAL_INCLUDE_DIRS ${NET_DIR}/internal/core ${NET_DIR}/internal/stream ${NET_DIR}/tcp/internal ${NET_DIR}/uds/internal)
+# tcp/internal、uds/internal、rudp/internal（各自专有的 socket 选项与处理）。
+# 库自己与要直接用内部头的测试 / bench 加这几个路径。
+set(NET_INTERNAL_INCLUDE_DIRS ${NET_DIR}/internal/core ${NET_DIR}/internal/stream
+                              ${NET_DIR}/tcp/internal ${NET_DIR}/uds/internal ${NET_DIR}/rudp/internal)
 # 测试公共件（net_test_util.h）与跨组件的集成测试，只给测试用。
 set(NET_TESTING_DIR ${NET_DIR}/testing)
 set(NET_MODULE_DIR framework/net)
@@ -313,6 +316,21 @@ if(BREEZE_BUILD_NET)
   target_link_libraries(breeze_net PUBLIC Threads::Threads breeze_queue breeze_buffer breeze_thread PRIVATE breeze_logger)
   target_compile_options(breeze_net PRIVATE -Wall -Wextra)
   breeze_apply_log_level(breeze_net)
+
+  # rudp 单独一个库：KCP 只在这里 PRIVATE 链接，不用 rudp 的使用方（只用 TCP / UDS）不背这个依赖。
+  # 端点（RudpEndpoint）仍在 breeze_net：它只是地址类型，NetModule 解析端点字符串要用。
+  add_library(breeze_net_rudp
+    ${NET_DIR}/rudp/rudp_protocol.cpp
+    ${NET_DIR}/rudp/rudp_server.cpp
+    ${NET_DIR}/rudp/rudp_client.cpp
+    ${NET_DIR}/rudp/internal/ticket_table.cpp
+    ${NET_DIR}/rudp/internal/udp_socket.cpp
+    ${NET_DIR}/rudp/internal/kcp_session.cpp
+    ${NET_DIR}/rudp/internal/rudp_connection.cpp)
+  target_include_directories(breeze_net_rudp PRIVATE ${NET_INTERNAL_INCLUDE_DIRS})
+  target_link_libraries(breeze_net_rudp PUBLIC breeze_net PRIVATE kcp::kcp breeze_container breeze_logger)
+  target_compile_options(breeze_net_rudp PRIVATE -Wall -Wextra)
+  breeze_apply_log_level(breeze_net_rudp)
 endif()
 
 add_library(breeze_app
@@ -357,7 +375,8 @@ breeze_apply_log_level(breeze_kernel)
 if(BREEZE_BUILD_NET)
   add_library(breeze_net_module ${NET_MODULE_DIR}/main_loop_executor.cpp ${NET_MODULE_DIR}/net_module.cpp)
   target_include_directories(breeze_net_module PUBLIC ${NET_MODULE_DIR})
-  target_link_libraries(breeze_net_module PUBLIC breeze_net breeze_kernel breeze_queue breeze_config_schemas)
+  target_link_libraries(breeze_net_module PUBLIC breeze_net breeze_net_rudp breeze_kernel breeze_queue
+                        breeze_config_schemas)
   target_compile_options(breeze_net_module PRIVATE -Wall -Wextra)
   breeze_apply_log_level(breeze_net_module)
 endif()
@@ -544,16 +563,23 @@ target_compile_options(shared_buffer_test PRIVATE -Wall -Wextra)
 add_test(NAME shared_buffer_test COMMAND shared_buffer_test)
 
 if(BREEZE_BUILD_NET)
-  # breeze_net_test(<名> [INTERNAL] [DIR <子目录>])：${NET_DIR}/[<子目录>/]<名>.cpp 编成同名测试，测试放在被测代码所在的目录，
-  # 跨组件的集成测试放 testing/。INTERNAL = 测试要直接用内部头（NET_INTERNAL_INCLUDE_DIRS）。所有测试都能用 testing/ 里的公共件。
+  # breeze_net_test(<名> [INTERNAL] [DIR <子目录>] [LIB <库>])：${NET_DIR}/[<子目录>/]<名>.cpp 编成同名测试，
+  # 测试放在被测代码所在的目录，跨组件的集成测试放 testing/。
+  # INTERNAL = 测试要直接用内部头（NET_INTERNAL_INCLUDE_DIRS）；
+  # LIB = 链接的库（默认 breeze_net，rudp 的测试用 breeze_net_rudp）。
+  # 所有测试都能用 testing/ 里的公共件。
   function(breeze_net_test name)
-    cmake_parse_arguments(A "INTERNAL" "DIR" "" ${ARGN})
+    cmake_parse_arguments(A "INTERNAL" "DIR;LIB" "" ${ARGN})
     if(A_DIR)
       add_executable(${name} ${NET_DIR}/${A_DIR}/${name}.cpp)
     else()
       add_executable(${name} ${NET_DIR}/${name}.cpp)
     endif()
-    target_link_libraries(${name} PRIVATE breeze_net)
+    if(A_LIB)
+      target_link_libraries(${name} PRIVATE ${A_LIB})
+    else()
+      target_link_libraries(${name} PRIVATE breeze_net)
+    endif()
     target_include_directories(${name} PRIVATE ${NET_TESTING_DIR})
     if(A_INTERNAL)
       target_include_directories(${name} PRIVATE ${NET_INTERNAL_INCLUDE_DIRS})
@@ -620,6 +646,15 @@ if(BREEZE_BUILD_NET)
   breeze_net_test(net_flow_test INTERNAL DIR testing)
   breeze_net_test(net_lifecycle_test INTERNAL DIR testing)
 
+  # rudp：协议与票据表是纯逻辑，不依赖 KCP；其余经 breeze_net_rudp。
+  breeze_net_test(rudp_protocol_test DIR rudp LIB breeze_net_rudp)
+  breeze_net_test(ticket_table_test INTERNAL DIR rudp/internal LIB breeze_net_rudp)
+  breeze_net_test(kcp_session_test INTERNAL DIR rudp/internal LIB breeze_net_rudp)
+  breeze_net_test(udp_socket_test INTERNAL DIR rudp/internal LIB breeze_net_rudp)
+  breeze_net_test(rudp_server_test INTERNAL DIR rudp LIB breeze_net_rudp)
+  breeze_net_test(rudp_client_test INTERNAL DIR rudp LIB breeze_net_rudp)
+  breeze_net_test(rudp_test INTERNAL DIR testing LIB breeze_net_rudp)
+
   # framework/net 的测试复用 base/net 的测试公共件（net_test_util.h 带内部的 event_loop.h 与 socket.h）。
   function(breeze_net_module_test name)
     add_executable(${name} ${NET_MODULE_DIR}/${name}.cpp)
@@ -680,7 +715,7 @@ if(BREEZE_BUILD_BENCH AND BREEZE_BUILD_NET)
 
   add_executable(net_bench bench/net_bench.cpp)
   target_include_directories(net_bench PRIVATE ${NET_INTERNAL_INCLUDE_DIRS})
-  target_link_libraries(net_bench PRIVATE breeze_net breeze_net_module breeze_logger muduo_bench)
+  target_link_libraries(net_bench PRIVATE breeze_net breeze_net_rudp breeze_net_module breeze_logger muduo_bench)
   target_compile_definitions(net_bench PRIVATE BREEZE_BENCH_MUDUO=1)
   target_compile_options(net_bench PRIVATE -Wall -Wextra)
 endif()

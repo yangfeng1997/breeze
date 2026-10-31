@@ -5,6 +5,7 @@
   "dependencies": [
     "cli11",
     "concurrentqueue",
+    "kcp",
     "readerwriterqueue",
     "spdlog",
     "yaml-cpp"

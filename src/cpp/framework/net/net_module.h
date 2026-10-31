@@ -30,6 +30,9 @@
 #include "module.h"
 #include "net_client.h"
 #include "net_server.h"
+#include "rudp_client.h"
+#include "rudp_options.h"
+#include "rudp_server.h"
 #include "stream_client.h"
 #include "stream_server.h"
 #include "tcp_client.h"
@@ -46,6 +49,7 @@ struct NetModuleOptions
     EventLoopGroupOptions group;
     ConnectionOptions connection; // AddServer / AddClient 不另给选项时用它
     TcpOptions tcp;               // 同上，只对 TCP 端点生效
+    RudpOptions rudp; // 同上，只对 udp:// 端点（rudp）生效；net.proto 里还没有 rudp 段，配置驱动的构造用代码里的默认值
     InboundLimits inbound;
     std::size_t wake_budget = 1024;
     std::chrono::milliseconds shutdown_deadline{5000};
@@ -70,8 +74,13 @@ public:
     bool Wake() override;
 
     // 装配：Init 之后、Start 之前（通常在依赖 net 的模块的 Init 里）。endpoint 是 tcp://ip:port | unix:///path |
-    // unix-abstract://name（配置里直接写字符串）；不合法返回错误并带上原字符串。返回的指针在模块存活期内有效。
+    // unix-abstract://name | udp://ip:port（配置里直接写字符串）；不合法返回错误并带上原字符串。
+    // 返回的指针在模块存活期内有效。
     // 之后经 NetClient::Send / ConnectionHandle 发送；handler 与 factory 要比 Shutdown 活得久。
+    // udp:// 的 AddServer 装配的是 rudp 服务端（用模块的 connection 与 rudp 默认选项；显式选项里只有 connection 与
+    // accept_filter 对它有意义），factory 对它被忽略：rudp 的消息自带边界，没有 codec。要签发票据就要拿到 RudpServer，
+    // 用 AddRudpServer（或对返回的 NetServer* 做 dynamic_cast）。
+    // AddClient 不收 udp://：rudp 客户端要凭票据握手，用 AddRudpClient。
     Result<NetServer*> AddServer(std::string_view endpoint, MainLoopHandler& handler, const FrameCodecFactory& factory);
     Result<NetServer*> AddServer(std::string_view endpoint,
                                  MainLoopHandler& handler,
@@ -83,6 +92,17 @@ public:
                                  const FrameCodecFactory& factory,
                                  StreamClientOptions options,
                                  ReconnectPolicy policy);
+
+    // rudp（可靠 UDP，KCP 之上）：设计与准入模型见 rudp/rudp_server.h、rudp_client.h。
+    // 服务端随模块启动；没给选项时用 NetModuleOptions 的 connection 与 rudp。rudp 选项不合法返回错误。
+    Result<RudpServer*> AddRudpServer(const RudpEndpoint& endpoint, MainLoopHandler& handler);
+    Result<RudpServer*> AddRudpServer(const RudpEndpoint& endpoint,
+                                      MainLoopHandler& handler,
+                                      RudpServerOptions options);
+    // 客户端**不随模块启动**：票据要等控制面发下来，业务拿到后（构造时给，或 SetTicket）自己调 Start()，
+    // 每次断线都要新票据（不自动重连）。随 group 一起停。没给选项时用 NetModuleOptions 的 connection 与 rudp。
+    Result<RudpClient*> AddRudpClient(const RudpEndpoint& server, MainLoopHandler& handler);
+    Result<RudpClient*> AddRudpClient(const RudpEndpoint& server, MainLoopHandler& handler, RudpClientOptions options);
 
     // main 在 App::Run 返回之后调：group 优雅关闭（到 shutdown_deadline 强关），再把事件 Drain 到空。
     // 在主循环线程（调 Run 的线程）上调用。对没 Start 成功的、以及重复调用都是空操作。
@@ -114,6 +134,7 @@ private:
     std::unique_ptr<EventLoopGroup> group_;
     std::vector<std::unique_ptr<NetServer>> servers_;
     std::vector<std::unique_ptr<NetClient>> clients_;
+    std::vector<std::unique_ptr<RudpClient>> rudp_clients_; // 不随模块启动，见 AddRudpClient
 };
 
 } // namespace breeze

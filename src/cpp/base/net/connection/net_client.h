@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <functional>
+
 #include "connection_handle.h"
 #include "endpoint.h"
 #include "send_result.h"
@@ -11,6 +13,12 @@
 
 namespace breeze
 {
+
+// 每次连接尝试失败时回调（IO 线程，必须非阻塞、noexcept）：OnClosed 只在连接建立之后才有，连不上要靠它观察。
+// will_retry 为 false 表示遇到不可重试的错误（字节流：EACCES / EPERM / EAFNOSUPPORT / EBADF / EFAULT / ENOTSOCK / EINVAL /
+// ENAMETOOLONG；rudp：握手超时）：状态已回到 Idle，此后不再尝试，需要调用方显式 Start() 重来（回调里直接调 Start() 是合法的）。
+// 放在各客户端的选项里而不是 ConnectionHandler：服务端也用后者。
+using ConnectFailedCallback = std::move_only_function<void(int sys_errno, bool will_retry) noexcept>;
 
 class NetClient
 {
