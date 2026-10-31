@@ -76,9 +76,9 @@ set(NET_DIR base/net)
 # net 的头文件目录。头文件用扁平名 include（与仓库其它库一致），所以下面所有目录之间文件名必须唯一。
 # 公开的（PUBLIC，使用方可见），按概念分：connection/（连接及其回调 / 句柄 / 选项）、endpoint/（地址与对端信息）、
 # codec/（分帧）、loop/（EventLoopGroup 与统计）、stream/（TCP / UDS 共用的服务端 / 客户端基类）、
-# tcp/ 与 uds/（各自的端点、选项、服务端、客户端；将来的 kcp/ 同理）。
+# tcp/、uds/、rudp/（各自的端点、选项、服务端、客户端；rudp 现在只有端点）。
 set(NET_PUBLIC_INCLUDE_DIRS ${NET_DIR}/connection ${NET_DIR}/endpoint ${NET_DIR}/codec ${NET_DIR}/loop
-                            ${NET_DIR}/stream ${NET_DIR}/tcp ${NET_DIR}/uds)
+                            ${NET_DIR}/stream ${NET_DIR}/tcp ${NET_DIR}/uds ${NET_DIR}/rudp)
 # 内部的（PRIVATE）：internal/core（所有传输共用）、internal/stream（TCP / UDS 共用的字节流实现）、
 # tcp/internal、uds/internal（各自专有的 socket 选项与处理）。库自己与要直接用内部头的测试 / bench 加这几个路径。
 set(NET_INTERNAL_INCLUDE_DIRS ${NET_DIR}/internal/core ${NET_DIR}/internal/stream ${NET_DIR}/tcp/internal ${NET_DIR}/uds/internal)
@@ -278,12 +278,11 @@ if(BREEZE_BUILD_NET)
 
   # 内部头目录是 PRIVATE，日志同理只 PRIVATE，使用方看不到这个依赖；测试要直接用内部头时自己加 NET_INTERNAL_INCLUDE_DIRS。
   # PUBLIC 的 ${NET_DIR} 本身（不带子目录）只为下面那个例外保留。
-  # 例外：公开头 connection.h 以路径引用 internal/core/ 里的 connection_table.h / pollable.h / unique_fd.h
-  # （Connection 的基类与成员要完整类型），所以 PUBLIC 的 ${NET_DIR} 不能去掉，这三个头也不能依赖别的内部头。
+  # 例外：公开头 connection.h 以路径引用 internal/core/pollable.h（Connection 的基类），
+  # 所以 PUBLIC 的 ${NET_DIR} 不能去掉，pollable.h 也不能依赖别的内部头。
   add_library(breeze_net
     ${NET_DIR}/endpoint/endpoint.cpp
     ${NET_DIR}/codec/length_prefix_codec.cpp
-    ${NET_DIR}/connection/connection.cpp
     ${NET_DIR}/connection/connection_handle.cpp
     ${NET_DIR}/loop/event_loop_group.cpp
     ${NET_DIR}/stream/stream_server.cpp
@@ -298,6 +297,7 @@ if(BREEZE_BUILD_NET)
     ${NET_DIR}/internal/stream/acceptor.cpp
     ${NET_DIR}/internal/stream/loop_server.cpp
     ${NET_DIR}/internal/stream/connector.cpp
+    ${NET_DIR}/internal/stream/stream_connection.cpp
     ${NET_DIR}/tcp/internal/tcp_socket.cpp
     ${NET_DIR}/tcp/tcp_endpoint.cpp
     ${NET_DIR}/tcp/tcp_server.cpp
@@ -305,7 +305,8 @@ if(BREEZE_BUILD_NET)
     ${NET_DIR}/uds/internal/uds_socket.cpp
     ${NET_DIR}/uds/uds_endpoint.cpp
     ${NET_DIR}/uds/uds_server.cpp
-    ${NET_DIR}/uds/uds_client.cpp)
+    ${NET_DIR}/uds/uds_client.cpp
+    ${NET_DIR}/rudp/rudp_endpoint.cpp)
   target_include_directories(breeze_net PUBLIC ${NET_DIR} ${NET_PUBLIC_INCLUDE_DIRS} PRIVATE ${NET_INTERNAL_INCLUDE_DIRS})
   # breeze_queue 是 PUBLIC：internal/core/event_loop.h 里有 MpscQueue，要用内部头的测试也得看得到它；
   # breeze_buffer 同理：公开头里有 SharedBuffer / Buffer。breeze_thread：internal/core/event_loop_thread.h 里有 Thread，测试与 bench 要用。
@@ -606,10 +607,13 @@ if(BREEZE_BUILD_NET)
   breeze_net_test(socket_config_test INTERNAL DIR internal/stream)
   breeze_net_test(tcp_endpoint_test DIR tcp)
   breeze_net_test(uds_endpoint_test DIR uds)
+  breeze_net_test(rudp_endpoint_test DIR rudp)
+  breeze_net_test(socket_address_test INTERNAL DIR internal/core)
   breeze_net_test(tcp_server_test INTERNAL DIR tcp)
   breeze_net_test(uds_server_test INTERNAL DIR uds)
   breeze_net_test(event_loop_group_test INTERNAL DIR loop)
   breeze_net_test(connection_handle_test INTERNAL DIR connection)
+  breeze_net_test(connection_test DIR connection)
   breeze_net_test(stream_server_test INTERNAL DIR stream)
   breeze_net_test(stream_client_test INTERNAL DIR stream)
   breeze_net_test(echo_test INTERNAL DIR testing)

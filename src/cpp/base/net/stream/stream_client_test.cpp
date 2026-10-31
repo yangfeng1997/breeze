@@ -68,6 +68,9 @@ private:
     std::vector<std::pair<int, bool>> v_;
 };
 
+// 接口：StreamClient 是 NetClient。
+static_assert(std::is_base_of_v<NetClient, StreamClient>);
+
 // 服务端：group + 回显的 StreamServer。可以在固定端点上反复建起、销毁，模拟对端重启。
 struct EchoServer
 {
@@ -179,6 +182,18 @@ void TestPolicyValidity()
     CHECK(!(ReconnectPolicy{10ms, 100ms, 0.5, 0.1}.Valid()));  // multiplier < 1
     CHECK(!(ReconnectPolicy{10ms, 100ms, 2.0, -0.1}.Valid()));
     CHECK(!(ReconnectPolicy{10ms, 100ms, 2.0, 1.5}.Valid()));
+}
+
+// UDP 是数据报端点，字节流的客户端不收它：Start 返回 EPROTONOSUPPORT（先于 group 的状态检查）。
+void TestDatagramEndpointIsRejected()
+{
+    const LeakCheck leak;
+    ClientSide cs;
+    StreamClient c(cs.group, *Endpoint::Udp("127.0.0.1", 9), {}, ReconnectPolicy{}, cs.rec, cs.factory);
+    CHECK(c.Start() == EPROTONOSUPPORT);
+    CHECK(c.endpoint().kind() == Endpoint::Kind::Udp);
+    CHECK(!c.handle().valid() && c.Send(Buf("x")) == SendResult::Closed); // 没有任何连接尝试
+    CHECK(cs.group.GetStats().connected == 0);
 }
 
 void TestInvalidOptionsReturnEinval()
@@ -636,6 +651,7 @@ int main(int argc, char** argv)
     TestBackoffSequence();
     TestPolicyValidity();
     TestInvalidOptionsReturnEinval();
+    TestDatagramEndpointIsRejected();
     TestSendBeforeConnectedIsClosed();
     {
         TempDir dir;

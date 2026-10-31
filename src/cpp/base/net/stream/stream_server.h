@@ -23,6 +23,7 @@
 #include "endpoint.h"
 #include "event_loop_group.h"
 #include "frame_codec.h"
+#include "net_server.h"
 #include "peer_info.h"
 #include "tcp_options.h"
 
@@ -42,7 +43,7 @@ struct StreamServerOptions
     int backlog = SOMAXCONN;    // 内核还会按 net.core.somaxconn 截断
 };
 
-class StreamServer
+class StreamServer : public NetServer
 {
 public:
     StreamServer(EventLoopGroup& group,
@@ -50,20 +51,21 @@ public:
                  StreamServerOptions options,
                  ConnectionHandler& handler,
                  const FrameCodecFactory& factory);
-    virtual ~StreamServer(); // TcpServer / UdsServer 经基类指针销毁
+    ~StreamServer() override; // TcpServer / UdsServer 经基类指针销毁
 
     StreamServer(const StreamServer&) = delete;
     StreamServer& operator=(const StreamServer&) = delete;
 
     // group 必须已 Start（否则是编程错误，LOG_FATAL）；只能调用一次。阻塞到 bind / listen 在 IO 线程上完成。
-    // 0 = 成功，否则 errno（EADDRINUSE、EACCES、ENAMETOOLONG……），失败时已回滚；group 正在 / 已经停机返回 ESHUTDOWN。
-    [[nodiscard]] int Start();
+    // 0 = 成功，否则 errno（EADDRINUSE、EACCES、ENAMETOOLONG……），失败时已回滚；group 正在 / 已经停机返回 ESHUTDOWN；
+    // 端点是 UDP（数据报）返回 EPROTONOSUPPORT：字节流的服务端不收它。
+    [[nodiscard]] int Start() override;
 
     // 只停 accept，已接受的连接继续服务，由 EventLoopGroup::Shutdown 收尾。异步；对没 Start 过的对象是空操作。
-    void Stop();
+    void Stop() override;
 
     // 实际绑定的地址：端口填 0 时 Start 成功之后这里是系统分配的端口。Start 之前就是构造时给的 endpoint。
-    const Endpoint& endpoint() const noexcept { return endpoint_; }
+    const Endpoint& endpoint() const noexcept override { return endpoint_; }
 
 private:
     struct Impl;

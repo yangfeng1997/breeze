@@ -26,7 +26,7 @@ std::optional<UdsEndpoint> UdsEndpoint::Parse(std::string_view text)
 
 std::optional<UdsEndpoint> UdsEndpoint::From(const Endpoint& ep)
 {
-    if (ep.kind() == Endpoint::Kind::Tcp)
+    if (ep.kind() != Endpoint::Kind::Unix && ep.kind() != Endpoint::Kind::UnixAbstract)
         return std::nullopt;
     return UdsEndpoint(ep);
 }

@@ -70,6 +70,8 @@ StreamClient::~StreamClient()
 int StreamClient::Start()
 {
     Impl& m = *impl_;
+    if (endpoint_.kind() == Endpoint::Kind::Udp)
+        return EPROTONOSUPPORT; // 数据报端点要数据报的客户端（rudp），字节流的不收
     if (!m.group.running())
     {
         // 回调里 Start()（文档允许）可能恰好撞上停机：返回 ESHUTDOWN，不是编程错误。

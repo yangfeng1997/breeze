@@ -3,6 +3,7 @@
 #include <cerrno>
 #include <cstring>
 #include <format>
+#include <optional>
 
 #include "config_module.h"
 #include "logger_macros.h"
@@ -79,9 +80,9 @@ Result<> NetModule::CheckPhase(std::string_view what) const
     return {};
 }
 
-Result<StreamServer*> NetModule::AddServer(std::string_view endpoint,
-                                           MainLoopHandler& handler,
-                                           const FrameCodecFactory& factory)
+Result<NetServer*> NetModule::AddServer(std::string_view endpoint,
+                                        MainLoopHandler& handler,
+                                        const FrameCodecFactory& factory)
 {
     StreamServerOptions so;
     so.connection = options_.connection;
@@ -89,10 +90,10 @@ Result<StreamServer*> NetModule::AddServer(std::string_view endpoint,
     return AddServer(endpoint, handler, factory, std::move(so));
 }
 
-Result<StreamServer*> NetModule::AddServer(std::string_view endpoint,
-                                           MainLoopHandler& handler,
-                                           const FrameCodecFactory& factory,
-                                           StreamServerOptions options)
+Result<NetServer*> NetModule::AddServer(std::string_view endpoint,
+                                        MainLoopHandler& handler,
+                                        const FrameCodecFactory& factory,
+                                        StreamServerOptions options)
 {
     if (auto r = CheckPhase("AddServer"); !r)
         return std::unexpected(r.error());
@@ -100,9 +101,16 @@ Result<StreamServer*> NetModule::AddServer(std::string_view endpoint,
     if (!ep)
         return Fail(
             Errc::Module,
-            std::format("net: 监听端点 '{}' 不合法（tcp://ip:port | unix:///path | unix-abstract://name）", endpoint));
+            std::format(
+                "net: 监听端点 '{}' 不合法（tcp://ip:port | udp://ip:port | unix:///path | unix-abstract://name）",
+                endpoint));
+    const auto tcp = TcpEndpoint::From(*ep);
+    const auto uds = tcp ? std::optional<UdsEndpoint>{} : UdsEndpoint::From(*ep);
+    if (!tcp && !uds)
+        return Fail(Errc::Module,
+                    std::format("net: 监听端点 '{}' 是数据报传输（udp），需要 rudp 服务端，还没有实现", endpoint));
     ConnectionHandler& wrapped = executor_.Wrap(handler);
-    if (const auto tcp = TcpEndpoint::From(*ep))
+    if (tcp)
     {
         TcpServerOptions o;
         o.connection = options.connection;
@@ -113,20 +121,19 @@ Result<StreamServer*> NetModule::AddServer(std::string_view endpoint,
     }
     else
     {
-        // 不是 TCP 就是 UDS（Endpoint 只有这两类）；options.tcp 对 UDS 没有意义，这里丢掉。
+        // options.tcp 对 UDS 没有意义，这里丢掉。
         UdsServerOptions o;
         o.connection = options.connection;
         o.accept_filter = std::move(options.accept_filter);
         o.backlog = options.backlog;
-        servers_.push_back(
-            std::make_unique<UdsServer>(*group_, *UdsEndpoint::From(*ep), std::move(o), wrapped, factory));
+        servers_.push_back(std::make_unique<UdsServer>(*group_, *uds, std::move(o), wrapped, factory));
     }
     return servers_.back().get();
 }
 
-Result<StreamClient*> NetModule::AddClient(std::string_view endpoint,
-                                           MainLoopHandler& handler,
-                                           const FrameCodecFactory& factory)
+Result<NetClient*> NetModule::AddClient(std::string_view endpoint,
+                                        MainLoopHandler& handler,
+                                        const FrameCodecFactory& factory)
 {
     StreamClientOptions co;
     co.connection = options_.connection;
@@ -134,11 +141,11 @@ Result<StreamClient*> NetModule::AddClient(std::string_view endpoint,
     return AddClient(endpoint, handler, factory, std::move(co), ReconnectPolicy{});
 }
 
-Result<StreamClient*> NetModule::AddClient(std::string_view endpoint,
-                                           MainLoopHandler& handler,
-                                           const FrameCodecFactory& factory,
-                                           StreamClientOptions options,
-                                           ReconnectPolicy policy)
+Result<NetClient*> NetModule::AddClient(std::string_view endpoint,
+                                        MainLoopHandler& handler,
+                                        const FrameCodecFactory& factory,
+                                        StreamClientOptions options,
+                                        ReconnectPolicy policy)
 {
     if (auto r = CheckPhase("AddClient"); !r)
         return std::unexpected(r.error());
@@ -146,9 +153,16 @@ Result<StreamClient*> NetModule::AddClient(std::string_view endpoint,
     if (!ep)
         return Fail(
             Errc::Module,
-            std::format("net: 对端端点 '{}' 不合法（tcp://ip:port | unix:///path | unix-abstract://name）", endpoint));
+            std::format(
+                "net: 对端端点 '{}' 不合法（tcp://ip:port | udp://ip:port | unix:///path | unix-abstract://name）",
+                endpoint));
+    const auto tcp = TcpEndpoint::From(*ep);
+    const auto uds = tcp ? std::optional<UdsEndpoint>{} : UdsEndpoint::From(*ep);
+    if (!tcp && !uds)
+        return Fail(Errc::Module,
+                    std::format("net: 对端端点 '{}' 是数据报传输（udp），需要 rudp 客户端，还没有实现", endpoint));
     ConnectionHandler& wrapped = executor_.Wrap(handler);
-    if (const auto tcp = TcpEndpoint::From(*ep))
+    if (tcp)
     {
         TcpClientOptions o;
         o.connection = options.connection;
@@ -159,13 +173,12 @@ Result<StreamClient*> NetModule::AddClient(std::string_view endpoint,
     }
     else
     {
-        // 不是 TCP 就是 UDS；options.tcp 对 UDS 没有意义，这里丢掉。
+        // options.tcp 对 UDS 没有意义，这里丢掉。
         UdsClientOptions o;
         o.connection = options.connection;
         o.connect_timeout = options.connect_timeout;
         o.on_connect_failed = std::move(options.on_connect_failed);
-        clients_.push_back(
-            std::make_unique<UdsClient>(*group_, *UdsEndpoint::From(*ep), std::move(o), policy, wrapped, factory));
+        clients_.push_back(std::make_unique<UdsClient>(*group_, *uds, std::move(o), policy, wrapped, factory));
     }
     return clients_.back().get();
 }

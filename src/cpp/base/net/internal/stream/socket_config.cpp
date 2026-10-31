@@ -30,6 +30,8 @@ void ConfigureSocket(int fd, Endpoint::Kind kind, const TcpOptions& tcp, PeerInf
         }
         return;
     }
+    if (kind == Endpoint::Kind::Udp)
+        return; // 数据报没有"连接"：这个函数只给字节流用，UDP 端点不该走到这里
     PeerCredentials cred;
     if (uds::GetPeerCredentials(fd, cred) == 0)
         info.credentials = cred;

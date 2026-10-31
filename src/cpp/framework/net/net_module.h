@@ -1,4 +1,5 @@
-// 网络模块：装配 EventLoopGroup、StreamServer / StreamClient 与 MainLoopExecutor，把连接事件回投 App 主循环。
+// 网络模块：装配 EventLoopGroup、各传输的服务端 / 客户端（经 NetServer / NetClient 接口持有）与 MainLoopExecutor，
+// 把连接事件回投 App 主循环。
 // 设计见 docs/网络库设计.md §5。这里只做装配，不含 IO 逻辑。
 //
 // 用法：业务模块 DependsOn("net")，在自己的 Init 里 AddServer / AddClient（传 MainLoopHandler 与 FrameCodecFactory）；
@@ -27,6 +28,8 @@
 #include "main_loop_executor.h"
 #include "main_loop_handler.h"
 #include "module.h"
+#include "net_client.h"
+#include "net_server.h"
 #include "stream_client.h"
 #include "stream_server.h"
 #include "tcp_client.h"
@@ -68,22 +71,18 @@ public:
 
     // 装配：Init 之后、Start 之前（通常在依赖 net 的模块的 Init 里）。endpoint 是 tcp://ip:port | unix:///path |
     // unix-abstract://name（配置里直接写字符串）；不合法返回错误并带上原字符串。返回的指针在模块存活期内有效。
-    // 之后经 StreamClient::Send / ConnectionHandle 发送；handler 与 factory 要比 Shutdown 活得久。
-    Result<StreamServer*> AddServer(std::string_view endpoint,
-                                    MainLoopHandler& handler,
-                                    const FrameCodecFactory& factory);
-    Result<StreamServer*> AddServer(std::string_view endpoint,
-                                    MainLoopHandler& handler,
-                                    const FrameCodecFactory& factory,
-                                    StreamServerOptions options);
-    Result<StreamClient*> AddClient(std::string_view endpoint,
-                                    MainLoopHandler& handler,
-                                    const FrameCodecFactory& factory);
-    Result<StreamClient*> AddClient(std::string_view endpoint,
-                                    MainLoopHandler& handler,
-                                    const FrameCodecFactory& factory,
-                                    StreamClientOptions options,
-                                    ReconnectPolicy policy);
+    // 之后经 NetClient::Send / ConnectionHandle 发送；handler 与 factory 要比 Shutdown 活得久。
+    Result<NetServer*> AddServer(std::string_view endpoint, MainLoopHandler& handler, const FrameCodecFactory& factory);
+    Result<NetServer*> AddServer(std::string_view endpoint,
+                                 MainLoopHandler& handler,
+                                 const FrameCodecFactory& factory,
+                                 StreamServerOptions options);
+    Result<NetClient*> AddClient(std::string_view endpoint, MainLoopHandler& handler, const FrameCodecFactory& factory);
+    Result<NetClient*> AddClient(std::string_view endpoint,
+                                 MainLoopHandler& handler,
+                                 const FrameCodecFactory& factory,
+                                 StreamClientOptions options,
+                                 ReconnectPolicy policy);
 
     // main 在 App::Run 返回之后调：group 优雅关闭（到 shutdown_deadline 强关），再把事件 Drain 到空。
     // 在主循环线程（调 Run 的线程）上调用。对没 Start 成功的、以及重复调用都是空操作。
@@ -113,8 +112,8 @@ private:
     // 仍运行时会同步停掉自己。
     MainLoopExecutor executor_;
     std::unique_ptr<EventLoopGroup> group_;
-    std::vector<std::unique_ptr<StreamServer>> servers_;
-    std::vector<std::unique_ptr<StreamClient>> clients_;
+    std::vector<std::unique_ptr<NetServer>> servers_;
+    std::vector<std::unique_ptr<NetClient>> clients_;
 };
 
 } // namespace breeze

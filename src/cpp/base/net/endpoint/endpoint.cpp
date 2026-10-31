@@ -80,6 +80,14 @@ std::optional<Endpoint> Endpoint::Tcp(std::string_view ip, std::uint16_t port)
     return Endpoint(Kind::Tcp, std::move(parsed->text), port);
 }
 
+std::optional<Endpoint> Endpoint::Udp(std::string_view ip, std::uint16_t port)
+{
+    auto parsed = ParseIp(ip);
+    if (!parsed)
+        return std::nullopt;
+    return Endpoint(Kind::Udp, std::move(parsed->text), port);
+}
+
 std::optional<Endpoint> Endpoint::Unix(std::string_view path)
 {
     if (!ValidUnixName(path) || path.front() != '/')
@@ -97,7 +105,17 @@ std::optional<Endpoint> Endpoint::UnixAbstract(std::string_view name)
 std::optional<Endpoint> Endpoint::Parse(std::string_view text)
 {
     std::string_view rest = text;
+    // tcp:// 与 udp:// 的主机与端口写法完全一样：下面共用一段解析，只有最后的种类不同。
+    Kind ip_kind = Kind::Tcp;
+    bool is_ip = false;
     if (ConsumePrefix(rest, "tcp://"))
+        is_ip = true;
+    else if (ConsumePrefix(rest, "udp://"))
+    {
+        is_ip = true;
+        ip_kind = Kind::Udp;
+    }
+    if (is_ip)
     {
         std::string_view host;
         std::string_view port_text;
@@ -124,7 +142,7 @@ std::optional<Endpoint> Endpoint::Parse(std::string_view text)
         // 方括号里必须是 v6，没有方括号必须是 v4：避免 "::1:80" 这类有歧义的写法。
         if (!port || !ip || ip->v6 != want_v6)
             return std::nullopt;
-        return Endpoint(Kind::Tcp, ip->text, *port);
+        return Endpoint(ip_kind, ip->text, *port);
     }
     if (ConsumePrefix(rest, "unix-abstract://"))
         return UnixAbstract(rest);
@@ -138,8 +156,12 @@ std::string Endpoint::ToString() const
     switch (kind_)
     {
         case Kind::Tcp:
-            return IsIPv6() ? "tcp://[" + address_ + "]:" + std::to_string(port_)
-                            : "tcp://" + address_ + ":" + std::to_string(port_);
+        case Kind::Udp:
+        {
+            const char* scheme = kind_ == Kind::Tcp ? "tcp://" : "udp://";
+            return IsIPv6() ? scheme + ("[" + address_ + "]:" + std::to_string(port_))
+                            : scheme + (address_ + ":" + std::to_string(port_));
+        }
         case Kind::Unix:
             return "unix://" + address_;
         case Kind::UnixAbstract:

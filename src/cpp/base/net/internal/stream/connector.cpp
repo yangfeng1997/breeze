@@ -5,11 +5,11 @@
 #include <cerrno>
 #include <chrono>
 
-#include "connection.h"
 #include "logger.h"
 #include "logger_macros.h"
 #include "socket.h"
 #include "socket_config.h"
+#include "stream_connection.h"
 #include "tcp_socket.h"
 
 namespace breeze
@@ -206,7 +206,8 @@ void Connector::OnSocketConnected(UniqueFd fd)
     info.endpoint = endpoint_;
     ConfigureSocket(fd.get(), endpoint_.kind(), tcp_options_, info);
 
-    Connection* c = loop_.NewConnection(std::move(fd), std::move(info), forwarder_, factory_.Create(), conn_options_);
+    StreamConnection* c =
+        StreamConnection::Create(loop_, std::move(fd), std::move(info), forwarder_, factory_.Create(), conn_options_);
     // 句柄先于 OnConnected 发布：OnConnected 里就能经 StreamClient::Send 发数据。
     handle_.store(c->handle().raw(), std::memory_order_release);
     phase_ = Phase::Connected;

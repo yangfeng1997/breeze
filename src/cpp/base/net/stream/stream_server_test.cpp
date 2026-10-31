@@ -337,6 +337,27 @@ void TestOptionsReachConnections()
 
 // ---- 统计 ----
 
+// 接口：StreamServer 是 NetServer；NetModule 与业务经 NetServer 统一持有各种服务端。
+static_assert(std::is_base_of_v<NetServer, StreamServer>);
+
+// UDP 是数据报端点，字节流的服务端不收它：Start 返回 EPROTONOSUPPORT，不会悄悄建一个 TCP 监听
+// （地址写法与 TCP 相同，不拦住的话 "udp://1.2.3.4:80" 会变成 1.2.3.4:80 的 TCP 监听）。
+// 这个检查先于 group 的状态检查，group 没起来也不是编程错误。
+void TestDatagramEndpointIsRejected()
+{
+    const LeakCheck leak;
+    EventRecorder rec;
+    LengthPrefixCodecFactory factory(kMaxFrame);
+    EventLoopGroup group({1, 8});
+    StreamServer s(group, *Endpoint::Udp("127.0.0.1", 0), {}, rec, factory);
+    CHECK(s.Start() == EPROTONOSUPPORT); // group 还没 Start
+    CHECK(group.Start() == 0);
+    CHECK(s.Start() == EPROTONOSUPPORT);
+    CHECK(s.endpoint().kind() == Endpoint::Kind::Udp);
+    CHECK(group.GetStats().connections == 0 && group.GetStats().accepted == 0);
+    s.Stop(); // 没起来过：空操作
+}
+
 void TestStatsAddUp()
 {
     const LeakCheck leak;
@@ -421,6 +442,7 @@ int main()
     TestStopBeforeStartIsNoop();
     TestDestructorReleasesPort();
     TestOptionsReachConnections();
+    TestDatagramEndpointIsRejected();
     TestStatsAddUp();
     TestManyConnections();
     std::puts("stream_server_test: ok");

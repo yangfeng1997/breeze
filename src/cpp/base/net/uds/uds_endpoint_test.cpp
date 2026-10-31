@@ -64,7 +64,13 @@ void TestParse()
     CHECK(a.has_value() && a->is_abstract() && a->address() == "name");
 
     // TCP 的写法、相对路径、不认识的 scheme、空串：都得到 nullopt
-    for (const char* bad : {"tcp://127.0.0.1:80", "unix://relative", "unix://", "unix-abstract://", "file:///a", ""})
+    for (const char* bad : {"tcp://127.0.0.1:80",
+                            "udp://127.0.0.1:80",
+                            "unix://relative",
+                            "unix://",
+                            "unix-abstract://",
+                            "file:///a",
+                            ""})
         CHECK(!UdsEndpoint::Parse(bad).has_value());
 
     // 与 ToString 互逆
@@ -83,6 +89,7 @@ void TestFromGenericEndpoint()
 
     // TCP 的端点转不了
     CHECK(!UdsEndpoint::From(*Endpoint::Tcp("127.0.0.1", 80)).has_value());
+    CHECK(!UdsEndpoint::From(*Endpoint::Udp("127.0.0.1", 80)).has_value()); // 以前"不是 TCP 就是 UDS"，UDP 会漏进来
 }
 
 } // namespace

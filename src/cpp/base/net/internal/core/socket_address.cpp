@@ -21,6 +21,7 @@ socklen_t ToSockaddr(const Endpoint& ep, sockaddr_storage& ss)
     switch (ep.kind())
     {
         case Endpoint::Kind::Tcp:
+        case Endpoint::Kind::Udp:
             if (ep.IsIPv6())
             {
                 auto* a = reinterpret_cast<sockaddr_in6*>(&ss);
@@ -55,8 +56,19 @@ socklen_t ToSockaddr(const Endpoint& ep, sockaddr_storage& ss)
     return 0;
 }
 
+namespace
+{
+
+// IP 类地址按调用方要的种类（Tcp / Udp）构造；字节流的 accept / getsockname 要 Tcp，数据报的 recvfrom 要 Udp。
+std::optional<Endpoint> MakeIp(Endpoint::Kind ip_kind, const char* ip, std::uint16_t port)
+{
+    return ip_kind == Endpoint::Kind::Udp ? Endpoint::Udp(ip, port) : Endpoint::Tcp(ip, port);
+}
+
+} // namespace
+
 // 地址族不认识、未命名的 UDS 对端、或不满足 Endpoint 约束的地址，都得到 nullopt。
-std::optional<Endpoint> FromSockaddr(const sockaddr_storage& ss, socklen_t len)
+std::optional<Endpoint> FromSockaddr(const sockaddr_storage& ss, socklen_t len, Endpoint::Kind ip_kind)
 {
     switch (ss.ss_family)
     {
@@ -65,14 +77,14 @@ std::optional<Endpoint> FromSockaddr(const sockaddr_storage& ss, socklen_t len)
             const auto* a = reinterpret_cast<const sockaddr_in*>(&ss);
             char buf[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &a->sin_addr, buf, sizeof(buf));
-            return Endpoint::Tcp(buf, ntohs(a->sin_port));
+            return MakeIp(ip_kind, buf, ntohs(a->sin_port));
         }
         case AF_INET6:
         {
             const auto* a = reinterpret_cast<const sockaddr_in6*>(&ss);
             char buf[INET6_ADDRSTRLEN];
             inet_ntop(AF_INET6, &a->sin6_addr, buf, sizeof(buf));
-            return Endpoint::Tcp(buf, ntohs(a->sin6_port));
+            return MakeIp(ip_kind, buf, ntohs(a->sin6_port));
         }
         case AF_UNIX:
         {
@@ -92,7 +104,7 @@ std::optional<Endpoint> FromSockaddr(const sockaddr_storage& ss, socklen_t len)
 
 int CreateSocket(const Endpoint& ep, int type, UniqueFd& out)
 {
-    const int domain = ep.kind() == Endpoint::Kind::Tcp ? (ep.IsIPv6() ? AF_INET6 : AF_INET) : AF_UNIX;
+    const int domain = ep.IsIp() ? (ep.IsIPv6() ? AF_INET6 : AF_INET) : AF_UNIX;
     const int fd = ::socket(domain, type | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0)
         return errno;

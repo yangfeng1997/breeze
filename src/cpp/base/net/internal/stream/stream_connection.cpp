@@ -1,4 +1,4 @@
-#include "connection.h"
+#include "stream_connection.h"
 
 #include <sys/epoll.h>
 #include <sys/socket.h>
@@ -50,15 +50,34 @@ ssize_t SendIov(int fd, iovec* iov, int cnt)
 
 } // namespace
 
-Connection::Connection(EventLoop& loop,
-                       UniqueFd fd,
-                       PeerInfo peer,
-                       ConnectionHandler& handler,
-                       std::unique_ptr<FrameCodec> codec,
-                       const ConnectionOptions& options,
-                       ConnectionTable::Slot& slot,
-                       std::uint32_t slot_index,
-                       ConnectionHandle handle)
+StreamConnection* StreamConnection::Create(EventLoop& loop,
+                                           UniqueFd fd,
+                                           PeerInfo peer,
+                                           ConnectionHandler& handler,
+                                           std::unique_ptr<FrameCodec> codec,
+                                           const ConnectionOptions& options)
+{
+    loop.AssertInLoopThread();
+    ConnectionTable& table = loop.table();
+    const std::uint32_t slot = table.Allocate(options.high_water_mark);
+    const std::uint32_t generation = table.slot(slot).generation.load(std::memory_order_relaxed);
+    const ConnectionHandle handle = loop.MakeHandle(slot, generation);
+    std::unique_ptr<StreamConnection> conn(new StreamConnection(
+        loop, std::move(fd), std::move(peer), handler, std::move(codec), options, table.slot(slot), slot, handle));
+    StreamConnection* raw = conn.get();
+    table.Install(slot, std::move(conn));
+    return raw;
+}
+
+StreamConnection::StreamConnection(EventLoop& loop,
+                                   UniqueFd fd,
+                                   PeerInfo peer,
+                                   ConnectionHandler& handler,
+                                   std::unique_ptr<FrameCodec> codec,
+                                   const ConnectionOptions& options,
+                                   ConnectionTable::Slot& slot,
+                                   std::uint32_t slot_index,
+                                   ConnectionHandle handle)
     : loop_(loop)
     , fd_(std::move(fd))
     , handler_(handler)
@@ -73,9 +92,9 @@ Connection::Connection(EventLoop& loop,
 {
 }
 
-Connection::~Connection() = default;
+StreamConnection::~StreamConnection() = default;
 
-bool Connection::Establish()
+bool StreamConnection::Establish()
 {
     loop_.AssertInLoopThread();
     if (const int err = loop_.Add(this, fd_.get(), EPOLLIN | EPOLLRDHUP); err != 0)
@@ -101,7 +120,7 @@ bool Connection::Establish()
 
 // ---- 事件分发：HUP（无 IN）→ ERR → IN/RDHUP → OUT ----
 
-void Connection::OnEvents(std::uint32_t events)
+void StreamConnection::OnEvents(std::uint32_t events)
 {
     // 同一轮里本连接可能已经在别的回调里被关闭：对象还在（延后销毁），但不再处理任何事件。
     if (state_ == State::Disconnected)
@@ -126,7 +145,7 @@ void Connection::OnEvents(std::uint32_t events)
 // ---- 读：水平触发，每次就绪只 read 一次 ----
 
 // 从 data 开头起把能解的帧都解出来，返回消耗的字节数。一次解一帧：两帧之间要检查连接是否已经在回调里被关闭。
-std::size_t Connection::DecodeAll(std::span<const std::byte> data)
+std::size_t StreamConnection::DecodeAll(std::span<const std::byte> data)
 {
     std::size_t total = 0;
     std::uint64_t messages = 0;
@@ -152,7 +171,7 @@ std::size_t Connection::DecodeAll(std::span<const std::byte> data)
     return total;
 }
 
-void Connection::HandleRead()
+void StreamConnection::HandleRead()
 {
     static thread_local std::byte buf[kReadBytes];
 
@@ -222,11 +241,11 @@ int FillIov(
 
 } // namespace
 
-SendResult Connection::Send(SharedBuffer payload) { return SendImpl(payload.bytes(), &payload, false); }
+SendResult StreamConnection::Send(SharedBuffer payload) { return SendImpl(payload.bytes(), &payload, false); }
 
-SendResult Connection::Send(std::span<const std::byte> payload) { return SendImpl(payload, nullptr, false); }
+SendResult StreamConnection::Send(std::span<const std::byte> payload) { return SendImpl(payload, nullptr, false); }
 
-void Connection::SendFromTask(SharedBuffer payload)
+void StreamConnection::SendFromTask(SharedBuffer payload)
 {
     if (state_ != State::Connected)
         return; // 连接已标记关闭：槽回收时 pending_bytes 会清零，这里不用减
@@ -234,7 +253,7 @@ void Connection::SendFromTask(SharedBuffer payload)
 }
 
 // owned 非空：调用方交来的 SharedBuffer，入队时直接接管；为空：payload 只是个视图，入队时才拷贝。
-SendResult Connection::SendImpl(std::span<const std::byte> payload, SharedBuffer* owned, bool counted)
+SendResult StreamConnection::SendImpl(std::span<const std::byte> payload, SharedBuffer* owned, bool counted)
 {
     loop_.AssertInLoopThread();
     if (state_ != State::Connected)
@@ -303,7 +322,7 @@ SendResult Connection::SendImpl(std::span<const std::byte> payload, SharedBuffer
     return SendResult::Ok;
 }
 
-void Connection::HandleWrite()
+void StreamConnection::HandleWrite()
 {
     while (!out_.empty())
     {
@@ -349,7 +368,7 @@ void Connection::HandleWrite()
         ShutdownWrite(); // 优雅关闭：该发的都发完了，告诉对端我们这边结束
 }
 
-void Connection::SetWriteInterest(bool want)
+void StreamConnection::SetWriteInterest(bool want)
 {
     if (want == want_write_ || !registered_)
         return;
@@ -360,7 +379,7 @@ void Connection::SetWriteInterest(bool want)
 // epoll 的关注事件由两个独立的开关合成：读（PauseRead 摘掉）与写（队列非空才有）。
 // 暂停时连 EPOLLRDHUP 一起摘：它水平触发，对端半关闭后会一直就绪，保留着就是空转。
 // EPOLLERR / EPOLLHUP 不需要订阅，内核总会报，所以暂停的连接遇到 RST 照样被关掉。
-void Connection::ApplyInterest()
+void StreamConnection::ApplyInterest()
 {
     if (!registered_)
         return;
@@ -370,7 +389,7 @@ void Connection::ApplyInterest()
     loop_.Mod(this, fd_.get(), ev);
 }
 
-void Connection::ShutdownWrite()
+void StreamConnection::ShutdownWrite()
 {
     if (::shutdown(fd_.get(), SHUT_WR) != 0 && errno != ENOTCONN) // ENOTCONN：对端已经断了，随后的 HUP / ERR 会收尾
         CloseWith(CloseReason::IoError, errno);
@@ -378,7 +397,7 @@ void Connection::ShutdownWrite()
 
 // ---- 流控与优雅关闭 ----
 
-void Connection::PauseRead()
+void StreamConnection::PauseRead()
 {
     loop_.AssertInLoopThread();
     if (state_ != State::Connected || paused_)
@@ -390,7 +409,7 @@ void Connection::PauseRead()
         loop_.SetIdlePaused(slot_index_, true);
 }
 
-void Connection::ResumeRead()
+void StreamConnection::ResumeRead()
 {
     loop_.AssertInLoopThread();
     if (!paused_)
@@ -404,7 +423,7 @@ void Connection::ResumeRead()
         loop_.SetIdlePaused(slot_index_, false);
 }
 
-void Connection::CloseGracefully(std::chrono::milliseconds timeout)
+void StreamConnection::CloseGracefully(std::chrono::milliseconds timeout)
 {
     loop_.AssertInLoopThread();
     if (state_ != State::Connected)
@@ -425,9 +444,9 @@ void Connection::CloseGracefully(std::chrono::milliseconds timeout)
 
 // ---- 关闭：标记 → 本轮分发之后回调 OnClosed → 销毁 ----
 
-void Connection::Close() { CloseWith(CloseReason::LocalClose, 0); }
+void StreamConnection::Close() { CloseWith(CloseReason::LocalClose, 0); }
 
-void Connection::CloseWith(CloseReason reason, int sys_errno)
+void StreamConnection::CloseWith(CloseReason reason, int sys_errno)
 {
     if (state_ == State::Disconnected)
         return;
@@ -460,7 +479,7 @@ void Connection::CloseWith(CloseReason reason, int sys_errno)
     loop_.QueueClose(this);
 }
 
-void Connection::NotifyClosed()
+void StreamConnection::NotifyClosed()
 {
     if (!notified_connected_)
         return;

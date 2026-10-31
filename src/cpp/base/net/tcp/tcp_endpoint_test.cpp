@@ -54,8 +54,14 @@ void TestParse()
     CHECK(b.has_value() && b->IsIPv6() && b->port() == 80);
 
     // 别的传输的写法、缺方括号的 v6、不认识的 scheme、空串：都得到 nullopt
-    for (const char* bad :
-         {"tcp://::1:80", "unix:///a.sock", "unix-abstract://x", "http://1.2.3.4:80", "", "tcp://", "1.2.3.4:80"})
+    for (const char* bad : {"tcp://::1:80",
+                            "unix:///a.sock",
+                            "unix-abstract://x",
+                            "udp://1.2.3.4:80",
+                            "http://1.2.3.4:80",
+                            "",
+                            "tcp://",
+                            "1.2.3.4:80"})
         CHECK(!TcpEndpoint::Parse(bad).has_value());
 
     // 与 ToString 互逆
@@ -73,6 +79,7 @@ void TestFromGenericEndpoint()
     // UDS 的端点转不了
     CHECK(!TcpEndpoint::From(*Endpoint::Unix("/tmp/a.sock")).has_value());
     CHECK(!TcpEndpoint::From(*Endpoint::UnixAbstract("a")).has_value());
+    CHECK(!TcpEndpoint::From(*Endpoint::Udp("10.0.0.1", 7000)).has_value()); // 同样的地址与端口，UDP 也不是 TCP
 }
 
 void TestEquality()

@@ -1,4 +1,4 @@
-// UDS 端点：路径或抽象名。是 Endpoint 的类型化外壳：UdsServer / UdsClient 只收它，传不进 TCP 的端点。
+// UDS 端点：路径或抽象名。是 Endpoint 的类型化外壳：UdsServer / UdsClient 只收它，传不进 TCP / UDP 的端点。
 // 校验规则同 Endpoint::Unix / UnixAbstract（路径必须是绝对路径、都不能含 '\0'、长度 ≤107），拿到手的一定合法。
 
 #pragma once

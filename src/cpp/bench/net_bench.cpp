@@ -406,7 +406,7 @@ class MainLoopServer final : public EchoServer
         std::string listen_;
         LengthPrefixCodecFactory factory_{1024 * 1024};
         std::promise<Endpoint>& ready_;
-        StreamServer* server_ = nullptr;
+        NetServer* server_ = nullptr;
     };
 
 public:

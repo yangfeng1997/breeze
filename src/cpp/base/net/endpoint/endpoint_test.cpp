@@ -44,6 +44,47 @@ void TestTcpV6()
     CHECK(Endpoint::Parse("tcp://[0:0:0:0:0:0:0:1]:9") == ep);
 }
 
+// UDP 与 TCP 的地址写法、校验、规范化完全一样，只有种类（与 scheme）不同。
+void TestUdp()
+{
+    const auto v4 = Endpoint::Parse("udp://127.0.0.1:8080");
+    CHECK(v4.has_value() && v4->kind() == Endpoint::Kind::Udp);
+    CHECK(v4->address() == "127.0.0.1" && v4->port() == 8080 && !v4->IsIPv6() && v4->IsIp());
+    CHECK(v4->ToString() == "udp://127.0.0.1:8080");
+    CHECK(Endpoint::Udp("127.0.0.1", 8080) == v4);
+
+    const auto v6 = Endpoint::Parse("udp://[::1]:9");
+    CHECK(v6.has_value() && v6->IsIPv6() && v6->IsIp() && v6->ToString() == "udp://[::1]:9");
+    CHECK(Endpoint::Parse("udp://[0:0:0:0:0:0:0:1]:9") == v6); // 规范化
+
+    // 同样的约束：只接 IP 字面量、方括号里必须是 v6、端口 0..65535
+    for (const char* bad : {"udp://localhost:80",
+                            "udp://::1:80",
+                            "udp://[1.2.3.4]:80",
+                            "udp://1.2.3.4",
+                            "udp://1.2.3.4:65536",
+                            "udp://1.2.3.4:",
+                            "udp://",
+                            "udp:/1.2.3.4:80"})
+        CHECK(!Endpoint::Parse(bad).has_value());
+    CHECK(!Endpoint::Udp("localhost", 80).has_value() && !Endpoint::Udp("", 80).has_value());
+    CHECK(Endpoint::Parse("udp://1.2.3.4:0").has_value());
+
+    // 同一个地址与端口，TCP 与 UDP 是两个不同的端点
+    CHECK(Endpoint::Parse("tcp://1.2.3.4:80") != Endpoint::Parse("udp://1.2.3.4:80"));
+    CHECK(Endpoint::Tcp("1.2.3.4", 80)->kind() == Endpoint::Kind::Tcp);
+}
+
+// IP 类端点（Tcp / Udp）与 UDS 的区分：以前靠"不是 TCP 就是 UDS"，有了 UDP 之后要正面判断。
+void TestIsIp()
+{
+    CHECK(Endpoint::Tcp("1.2.3.4", 1)->IsIp() && Endpoint::Udp("1.2.3.4", 1)->IsIp());
+    CHECK(!Endpoint::Unix("/a")->IsIp() && !Endpoint::UnixAbstract("a")->IsIp());
+    // IsIPv6 只对 IP 类端点有意义：UDS 的路径里有 ':' 也不是 v6
+    CHECK(!Endpoint::Unix("/tmp/a:b")->IsIPv6() && !Endpoint::UnixAbstract("a:b")->IsIPv6());
+    CHECK(Endpoint::Tcp("::1", 1)->IsIPv6() && Endpoint::Udp("::1", 1)->IsIPv6());
+}
+
 void TestPortRange()
 {
     CHECK(Endpoint::Parse("tcp://1.2.3.4:0").has_value()); // 0 = 由系统分配，bind 用
@@ -109,12 +150,18 @@ void TestRejectsOtherSchemes()
     CHECK(!Endpoint::Parse("http://1.2.3.4:80"));
     CHECK(!Endpoint::Parse("1.2.3.4:80"));
     CHECK(!Endpoint::Parse("tcp:/1.2.3.4:80"));
+    CHECK(!Endpoint::Parse("rudp://1.2.3.4:80")); // scheme 是 udp，不是 rudp
 }
 
 // ToString 与 Parse 互逆。
 void TestRoundTrip()
 {
-    for (const char* s : {"tcp://10.0.0.1:1", "tcp://[fe80::1]:65535", "unix:///tmp/x", "unix-abstract://n"})
+    for (const char* s : {"tcp://10.0.0.1:1",
+                          "tcp://[fe80::1]:65535",
+                          "udp://10.0.0.1:1",
+                          "udp://[fe80::1]:65535",
+                          "unix:///tmp/x",
+                          "unix-abstract://n"})
     {
         const auto ep = Endpoint::Parse(s);
         CHECK(ep.has_value());
@@ -132,6 +179,8 @@ int main()
 {
     TestTcpV4();
     TestTcpV6();
+    TestUdp();
+    TestIsIp();
     TestPortRange();
     TestRejectsNonLiterals();
     TestUnix();

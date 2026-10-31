@@ -24,6 +24,7 @@
 #include "endpoint.h"
 #include "event_loop_group.h"
 #include "frame_codec.h"
+#include "net_client.h"
 #include "reconnect_policy.h"
 #include "send_result.h"
 #include "shared_buffer.h"
@@ -47,7 +48,7 @@ struct StreamClientOptions
     ConnectFailedCallback on_connect_failed; // 空 = 不通知（仍会记日志）
 };
 
-class StreamClient
+class StreamClient : public NetClient
 {
 public:
     StreamClient(EventLoopGroup& group,
@@ -56,29 +57,33 @@ public:
                  ReconnectPolicy policy,
                  ConnectionHandler& handler,
                  const FrameCodecFactory& factory);
-    virtual ~StreamClient(); // TcpClient / UdsClient 经基类指针销毁
+    ~StreamClient() override; // TcpClient / UdsClient 经基类指针销毁
 
     StreamClient(const StreamClient&) = delete;
     StreamClient& operator=(const StreamClient&) = delete;
 
     // 任意线程；group 必须已 Start（否则是编程错误，LOG_FATAL）。投递到所属 loop 串行处理，所以先 Stop 再 Start
     // 的顺序有保证， 先 Stop 再 Start 也不会并存两条连接（旧连接的 OnClosed 先于新连接的 OnConnected）。
-    // 只返回参数类错误：选项不合法 EINVAL（connect_timeout ≤ 0、ReconnectPolicy::Valid() 为假）；
+    // 只返回参数类错误：选项不合法 EINVAL（connect_timeout ≤ 0、ReconnectPolicy::Valid() 为假）、
+    // 端点是 UDP（数据报）返回 EPROTONOSUPPORT；
     // 连接建立失败走 on_connect_failed。group 正在 / 已经停机返回 ESHUTDOWN（回调里 Start()
     // 恰好撞上停机时不会让进程中止）。
-    [[nodiscard]] int Start();
+    [[nodiscard]] int Start() override;
 
     // 任意线程。停止重连并关闭当前连接（等价 Close()；要优雅关闭，业务先对句柄调 CloseGracefully），回到 Idle，不等待。
     // 该连接的 OnClosed 仍会且仅会触发一次，在它之后本 client 不再有任何回调。对 Idle 是空操作。
-    void Stop();
+    void Stop() override;
 
     // 经当前连接发送。未连通 → Closed，不缓冲。线程安全。
-    [[nodiscard]] SendResult Send(SharedBuffer payload);
+    [[nodiscard]] SendResult Send(SharedBuffer payload) override;
 
     // 当前连接的句柄，没有连接时 raw() == 0。IO 线程在连接 / 断开时更新。
-    ConnectionHandle handle() const noexcept { return ConnectionHandle(handle_.load(std::memory_order_acquire)); }
+    ConnectionHandle handle() const noexcept override
+    {
+        return ConnectionHandle(handle_.load(std::memory_order_acquire));
+    }
 
-    const Endpoint& endpoint() const noexcept { return endpoint_; }
+    const Endpoint& endpoint() const noexcept override { return endpoint_; }
 
 private:
     struct Impl;

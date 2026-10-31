@@ -239,25 +239,6 @@ void EventLoop::RunTimers()
 
 // ---- 连接持有与回收 ----
 
-Connection* EventLoop::NewConnection(UniqueFd fd,
-                                     PeerInfo peer,
-                                     ConnectionHandler& handler,
-                                     std::unique_ptr<FrameCodec> codec,
-                                     const ConnectionOptions& options)
-{
-    AssertInLoopThread();
-    const std::uint32_t slot = table_->Allocate(options.high_water_mark);
-    const std::uint32_t generation = table_->slot(slot).generation.load(std::memory_order_relaxed);
-    const ConnectionHandle handle = options_.group_id == EventLoopOptions::kNoGroup
-                                        ? ConnectionHandle{}
-                                        : ConnectionHandle::Make(options_.group_id, options_.index, slot, generation);
-    std::unique_ptr<Connection> conn(
-        new Connection(*this, std::move(fd), std::move(peer), handler, std::move(codec), options, table_->slot(slot), slot, handle));
-    Connection* raw = conn.get();
-    table_->Install(slot, std::move(conn));
-    return raw;
-}
-
 void EventLoop::QueueClose(Connection* conn) { closing_.push_back(conn); }
 
 void EventLoop::ProcessClosing()
@@ -270,7 +251,7 @@ void EventLoop::ProcessClosing()
         for (Connection* c : batch)
             c->NotifyClosed();
         for (Connection* c : batch)
-            table_->Reclaim(c->slot_index_); // 销毁连接（fd 随之关闭），槽的 generation + 1
+            table_->Reclaim(c->slot_index()); // 销毁连接（fd 随之关闭），槽的 generation + 1
     }
 }
 

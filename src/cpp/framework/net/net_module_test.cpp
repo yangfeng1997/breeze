@@ -161,7 +161,7 @@ private:
     std::optional<StreamServerOptions> options_; // 有值就走显式选项的 AddServer 重载
     LengthPrefixCodecFactory factory_{1 << 20};
     NetModule* net_ = nullptr;
-    StreamServer* server_ = nullptr;
+    NetServer* server_ = nullptr;
     Endpoint bound_ = *Endpoint::Tcp("127.0.0.1", 1);
     std::atomic<bool> ready_{false};
 };
@@ -176,7 +176,7 @@ public:
                  Biz& biz,
                  const FrameCodecFactory& f,
                  std::string target,
-                 StreamClient*& out,
+                 NetClient*& out,
                  std::optional<Explicit> options = std::nullopt)
         : Module(a)
         , biz_(biz)
@@ -204,7 +204,7 @@ private:
     Biz& biz_;
     const FrameCodecFactory& f_;
     std::string target_;
-    StreamClient*& out_;
+    NetClient*& out_;
     std::optional<Explicit> options_;
 };
 
@@ -369,7 +369,7 @@ void TestClientThroughModule(const std::string& listen)
     Biz client_biz;
     client_biz.echo = false;
     LengthPrefixCodecFactory factory(1 << 20);
-    StreamClient* client = nullptr;
+    NetClient* client = nullptr;
     App client_app("net-client");
     client_app.RegisterModule([](App& a) { return std::make_unique<NetModule>(a, SmallOptions()); });
     client_app.RegisterModule([&](App& a)
@@ -417,7 +417,7 @@ void TestModuleDefaultTcpOptionsReachSockets()
     co.tcp.tcp_user_timeout = 29000ms;
     Biz client_biz;
     LengthPrefixCodecFactory factory(1 << 20);
-    StreamClient* client = nullptr;
+    NetClient* client = nullptr;
     App client_app("net-client");
     client_app.RegisterModule([&](App& a) { return std::make_unique<NetModule>(a, co); });
     client_app.RegisterModule(
@@ -476,7 +476,7 @@ void TestModuleDefaultConnectionOptionsReach(const std::string& listen)
         Biz client_biz;
         client_biz.echo = false;
         LengthPrefixCodecFactory factory(1 << 20);
-        StreamClient* client = nullptr;
+        NetClient* client = nullptr;
         App client_app("net-client");
         client_app.RegisterModule([&](App& a) { return std::make_unique<NetModule>(a, co); });
         client_app.RegisterModule(
@@ -578,7 +578,7 @@ void TestExplicitClientOptionsReachTypedClients(bool tcp)
     };
     Biz biz;
     LengthPrefixCodecFactory factory(1 << 20);
-    StreamClient* client = nullptr;
+    NetClient* client = nullptr;
     App app("net-client");
     app.RegisterModule([](App& a) { return std::make_unique<NetModule>(a, SmallOptions()); });
     app.RegisterModule(
@@ -600,7 +600,7 @@ void TestExplicitClientConnectTimeoutReaches(const std::string& target)
     co.connect_timeout = 0ms;
     Biz biz;
     LengthPrefixCodecFactory factory(1 << 20);
-    StreamClient* client = nullptr;
+    NetClient* client = nullptr;
     App app("net-client");
     app.RegisterModule([](App& a) { return std::make_unique<NetModule>(a, SmallOptions()); });
     app.RegisterModule(
@@ -644,7 +644,7 @@ void TestExplicitClientConnectionAndTcpOptionsReach(const std::string& listen)
     Biz client_biz;
     client_biz.echo = false;
     LengthPrefixCodecFactory factory(1 << 20);
-    StreamClient* client = nullptr;
+    NetClient* client = nullptr;
     App client_app("net-client");
     client_app.RegisterModule([](App& a) { return std::make_unique<NetModule>(a, SmallOptions()); });
     client_app.RegisterModule(
@@ -832,6 +832,13 @@ void TestAssemblyErrors()
         CHECK(!s && s.error().code == Errc::Module && Has(s.error().msg, std::string("'") + bad + "'"));
         const auto c = net->AddClient(bad, biz, factory);
         CHECK(!c && Has(c.error().msg, std::string("'") + bad + "'"));
+    }
+    // udp:// 是合法写法（Endpoint 认），但数据报传输（rudp）还没有实现：给明确的错误，不是崩，也不是悄悄当成 TCP / UDS
+    {
+        const auto s = net->AddServer("udp://127.0.0.1:0", biz, factory);
+        CHECK(!s && s.error().code == Errc::Module && Has(s.error().msg, "udp") && Has(s.error().msg, "rudp"));
+        const auto c = net->AddClient("udp://127.0.0.1:9", biz, factory);
+        CHECK(!c && c.error().code == Errc::Module && Has(c.error().msg, "udp") && Has(c.error().msg, "rudp"));
     }
     // 合法的可以装
     CHECK(net->AddServer("tcp://127.0.0.1:0", biz, factory));

@@ -120,13 +120,15 @@ public:
     TimerId RunAfter(Clock::duration delay, std::move_only_function<void()> fn);
     void Cancel(TimerId id);
 
-    // 在连接表里为新连接占一个槽并建出 Connection（归 loop 持有，回收时销毁），调用方随后调 Connection::Establish()。
-    // 调用方须已 table().TryReserve() 成功；codec 由调用方（在本 loop 线程上）从 FrameCodecFactory 创建。
-    Connection* NewConnection(UniqueFd fd,
-                              PeerInfo peer,
-                              ConnectionHandler& handler,
-                              std::unique_ptr<FrameCodec> codec,
-                              const ConnectionOptions& options);
+    // 连接由各传输自己创建（StreamConnection::Create 等）：在 table() 里 Allocate 一个槽、Install 进去，
+    // 归 loop 持有、回收时销毁。
+    // 这里只提供生成句柄的原语（独立 loop，不属于任何 group 时是无效句柄），EventLoop 不认识任何具体的连接类。
+    ConnectionHandle MakeHandle(std::uint32_t slot, std::uint32_t generation) const noexcept
+    {
+        return options_.group_id == EventLoopOptions::kNoGroup
+                   ? ConnectionHandle{}
+                   : ConnectionHandle::Make(options_.group_id, options_.index, slot, generation);
+    }
     // 连接已标记关闭，放进回收列表：本轮分发之后才回调 OnClosed 并销毁，保证回调栈内对象仍然有效。
     void QueueClose(Connection* conn);
 

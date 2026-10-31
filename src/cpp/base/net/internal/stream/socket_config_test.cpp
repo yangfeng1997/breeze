@@ -17,6 +17,7 @@
 #include <string>
 
 #include "socket.h"
+#include "socket_address.h"
 
 using namespace breeze;
 
@@ -149,6 +150,17 @@ void TestUdsFillsCredentials()
     CHECK(GetIntOpt(p.server.get(), SOL_SOCKET, SO_KEEPALIVE) == 0); // 没被设过
 }
 
+// UDP 端点：数据报没有"连接"，ConfigureSocket 什么都不做（尤其不能落到 UDS 那一支去取 credentials）。
+void TestUdpIsNoOp()
+{
+    UniqueFd fd;
+    CHECK(sock::CreateSocket(*Endpoint::Udp("127.0.0.1", 0), SOCK_DGRAM, fd) == 0);
+    PeerInfo info;
+    ConfigureSocket(fd.get(), Endpoint::Kind::Udp, TcpOptions{}, info);
+    CHECK(!info.credentials.has_value());
+    CHECK(GetIntOpt(fd.get(), SOL_SOCKET, SO_KEEPALIVE) == 0);
+}
+
 } // namespace
 
 int main()
@@ -158,6 +170,7 @@ int main()
     TestTcpKeepAliveOffUserTimeoutAlone();
     TestTcpNothingOptionalSet();
     TestUdsFillsCredentials();
+    TestUdpIsNoOp();
     std::puts("socket_config_test: ok");
     return 0;
 }

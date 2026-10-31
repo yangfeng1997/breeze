@@ -5,11 +5,11 @@
 #include <utility>
 
 #include "acceptor.h"
-#include "connection.h"
 #include "group_access.h"
 #include "logger.h"
 #include "logger_macros.h"
 #include "socket_config.h"
+#include "stream_connection.h"
 
 namespace breeze
 {
@@ -123,7 +123,8 @@ void StreamServer::Impl::Adopt(EventLoop& target, UniqueFd fd, PeerInfo info)
         target.table().Unreserve(); // 正在停机：丢掉，不产生回调
         return;
     }
-    Connection* c = target.NewConnection(std::move(fd), std::move(info), handler, factory.Create(), options.connection);
+    StreamConnection* c =
+        StreamConnection::Create(target, std::move(fd), std::move(info), handler, factory.Create(), options.connection);
     if (c->Establish())
         LoopStats::Bump(target.stats().accepted);
     else
@@ -159,6 +160,8 @@ StreamServer::~StreamServer()
 int StreamServer::Start()
 {
     Impl& m = *impl_;
+    if (m.endpoint.kind() == Endpoint::Kind::Udp)
+        return EPROTONOSUPPORT; // 数据报端点要数据报的服务端（rudp），字节流的不收
     if (!m.group.running())
     {
         if (m.group.stopping())
