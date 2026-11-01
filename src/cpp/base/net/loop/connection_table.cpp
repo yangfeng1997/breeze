@@ -80,6 +80,7 @@ void ConnectionTable::Reclaim(std::uint32_t slot)
     // 先让旧句柄失效，再清零：发送方只在 generation 相符时才会累加 pending_bytes。
     s.generation.fetch_add(1, std::memory_order_release);
     s.state.store(State::Free, std::memory_order_release);
+    s.tx_full.store(false, std::memory_order_relaxed);
     s.pending_bytes.store(0, std::memory_order_relaxed);
 
     free_[(free_head_ + free_count_) % capacity_] = slot;

@@ -42,4 +42,13 @@ message NetConfig {
   // ---- 停机 ----
   // NetModule::Shutdown 里等连接优雅关闭的时间，到点强关。
   uint32 shutdown_deadline_ms = 13 [(config.default) = "5000", (config.range) = {min: 0, max: 600000}];
+
+  // ---- 本机 Agent（Sidecar）：NetModule::AddAgentClient 用 ----
+  // App 连本机 Agent 的 UDS 端点：unix:///路径 或 unix-abstract://名字。
+  string agent_endpoint = 14 [(config.default) = "unix:///run/breeze/agent.sock"];
+  // 是否启用共享内存。握手时协商（docs/共享内存IPC设计.md §6.1）：true = 优先共享内存，Agent 不提供或给不了（内存配额满）时自动
+  // 退化成仅 UDS；false = 只用 UDS（数据也走这条 UDS，没有共享内存）。
+  bool agent_shm_enabled = 15 [(config.default) = "true"];
+  // 共享内存每条环（Tx / Rx 各一条）的容量，MB，必须是 2 的幂（Agent 会拒绝别的值）；0 = 用默认的 16。
+  uint32 agent_shm_ring_mb = 16 [(config.default) = "0", (config.range) = {min: 0, max: 256}];
 }

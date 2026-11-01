@@ -91,9 +91,11 @@ void TestReclaimClearsPending()
     CHECK(t.TryReserve());
     const std::uint32_t s = t.Allocate(0);
     t.slot(s).pending_bytes.store(12345);
+    t.slot(s).tx_full.store(true); // 下游满的提示不能带给槽的下一个连接
     CHECK(t.PendingBytes(s) == 12345);
     t.Reclaim(s);
     CHECK(t.PendingBytes(s) == 0);
+    CHECK(!t.slot(s).tx_full.load());
     CHECK(t.slot(s).state.load() == State::Free);
     CHECK(t.PendingBytes(999) == 0); // 越界不崩
 }

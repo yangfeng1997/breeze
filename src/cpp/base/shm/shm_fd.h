@@ -1,6 +1,6 @@
 // 拥有一个 fd 的 RAII 句柄：只能移动，析构时关闭。
 //
-// 与 base/net/internal/core/unique_fd.h 重复：base/shm 不能依赖 net 的内部头，
+// 与 base/net/socket/unique_fd.h 重复：base/shm 不能依赖 net 的内部头，
 // 等 UniqueFd 上提到 base 之后再合并。
 
 #pragma once

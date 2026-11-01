@@ -18,10 +18,15 @@
 #pragma once
 
 #include <chrono>
+#include <cstdint>
 #include <memory>
+#include <optional>
+#include <string>
 #include <string_view>
 #include <vector>
 
+#include "base/net/agent/agent_client.h"
+#include "base/net/agent/agent_server.h"
 #include "base/net/connection/connection_options.h"
 #include "base/net/connection/net_client_interface.h"
 #include "base/net/connection/net_server_interface.h"
@@ -44,6 +49,16 @@
 namespace breeze
 {
 
+// 本机 Agent（Sidecar）：App 一侧 AddAgentClient 用（配置里的 net.agent_*）。
+struct AgentLinkOptions
+{
+    std::string endpoint = "unix:///run/breeze/agent.sock";
+    // 是否启用共享内存。true：握手时要共享内存，Agent 不提供或给不了时自动退化成仅 UDS；false：只用 UDS。
+    bool shm_enabled = true;
+    // 共享内存每条环的容量（字节，2 的幂）；0 = 默认。
+    std::uint64_t ring_capacity = 0;
+};
+
 struct NetModuleOptions
 {
     EventLoopGroupOptions group;
@@ -51,6 +66,7 @@ struct NetModuleOptions
     TcpOptions tcp;               // 同上，只对 TCP 端点生效
     RUdpOptions rudp; // 同上，只对 udp:// 端点（rudp）生效；net.proto 里还没有 rudp 段，配置驱动的构造用代码里的默认值
     InboundLimits inbound;
+    AgentLinkOptions agent;
     std::size_t wake_budget = 1024;
     std::chrono::milliseconds shutdown_deadline{5000};
 };
@@ -97,6 +113,33 @@ public:
                                   StreamClientOptions options,
                                   ReconnectPolicy policy);
 
+    // ---- 本机 Agent（Sidecar）：设计见 docs/共享内存IPC设计.md ----
+    // App 一侧：连本机 Agent，握手时协商用共享内存（+ UDS 探活）还是仅 UDS（见 agent/agent_client.h），连上之后表现成一条普通连接，
+    // 业务回调照常经 IMainLoopHandler 在主循环线程上执行、经 ConnectionHandle 发送，共享内存与否对业务透明。随模块启动，断线自动重连 / Reattach。
+    // 第一个重载：端点、是否启用共享内存（net.agent_shm_enabled，关了就是仅 UDS）、环容量取 NetModuleOptions::agent（net.agent_*）；
+    // busid 是这个 App 在 Agent 上的通道名；factory 是仅 UDS（含退化）时数据通道的帧格式，要与 Agent 那边一致，要比 Shutdown 活得久。
+    // 第二个重载：全部自己给（options.codec 是帧格式）。端点必须是 UDS。
+    Result<agent::AgentClient*> AddAgentClient(std::string_view busid,
+                                               IMainLoopHandler& handler,
+                                               const IFrameCodecFactory& factory);
+    Result<agent::AgentClient*> AddAgentClient(std::string_view endpoint,
+                                               IMainLoopHandler& handler,
+                                               agent::AgentClientOptions options);
+    // Agent 一侧：监听 UDS，App 经共享内存或仅 UDS 接入，消息由路由器在 IO 线程内转发（**不经主循环**，见 agent/agent_router.h）。
+    // **要求 net.io_threads = 1**（路由器与路由表是单线程访问的），否则返回错误。table 要比模块活得久，只在路由器所在的 loop 线程上访问。
+    // 第一个重载的连接选项取 NetModuleOptions::connection。返回的 AgentServer 里有路由器（router()）与统计。
+    Result<agent::AgentServer*> AddAgentServer(std::string_view endpoint, agent::RouteTable& table);
+    Result<agent::AgentServer*> AddAgentServer(std::string_view endpoint,
+                                               agent::RouteTable& table,
+                                               agent::AgentServerOptions options);
+    // 回调直接在 IO 线程上执行（不回投主循环）的服务端 / 客户端：Agent 之间的转发链路用，handler 是 AgentServer::router()。
+    // 端点是 tcp:// 或 unix://（不收 udp://）。handler 与 factory 要比 Shutdown 活得久。
+    Result<INetServer*> AddIoServer(std::string_view endpoint, IConnectionHandler& handler, const IFrameCodecFactory& factory);
+    Result<INetClient*> AddIoClient(std::string_view endpoint,
+                                   IConnectionHandler& handler,
+                                   const IFrameCodecFactory& factory,
+                                   ReconnectPolicy policy = {});
+
     // rudp（可靠 UDP，KCP 之上）：设计与准入模型见 rudp/rudp_server.h、rudp_client.h。
     // 服务端随模块启动；没给选项时用 NetModuleOptions 的 connection 与 rudp。rudp 选项不合法返回错误。
     Result<RUdpServer*> AddRUdpServer(const RUdpEndpoint& endpoint, IMainLoopHandler& handler);
@@ -127,6 +170,18 @@ private:
 
     Result<> CheckPhase(std::string_view what) const;
     void Rollback();
+    // 装配 TCP / UDS 的服务端 / 客户端（handler 已经按需包装过）。AddServer / AddIoServer 与 AddClient / AddIoClient 共用。
+    INetServer* MakeStreamServer(const std::optional<TcpEndpoint>& tcp,
+                                const std::optional<UdsEndpoint>& uds,
+                                IConnectionHandler& handler,
+                                const IFrameCodecFactory& factory,
+                                StreamServerOptions options);
+    INetClient* MakeStreamClient(const std::optional<TcpEndpoint>& tcp,
+                                const std::optional<UdsEndpoint>& uds,
+                                IConnectionHandler& handler,
+                                const IFrameCodecFactory& factory,
+                                StreamClientOptions options,
+                                ReconnectPolicy policy);
 
     const bool from_config_;
     NetModuleOptions options_;

@@ -42,6 +42,12 @@ SendResult ConnectionHandle::Send(SharedBuffer payload) const
         LoopStats::Add(loop->stats().send_closed_stale);
         return SendResult::Closed;
     }
+    // 下游满的提示：不累加 pending_bytes、不入队，调用方立刻知道没发出去。
+    if (s->tx_full.load(std::memory_order_relaxed))
+    {
+        LoopStats::Add(loop->stats().send_full);
+        return SendResult::Full;
+    }
 
     // 水位：先累加再比较（校验与累加不是原子的，见 ConnectionTable 头注释）。超限就把这次的份额退回去，
     // 本条消息不发，并让连接以 SlowConsumer 关闭。

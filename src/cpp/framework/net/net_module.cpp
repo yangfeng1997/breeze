@@ -27,6 +27,9 @@ NetModuleOptions NetModuleOptionsFrom(const config::NetConfig& c)
     o.inbound.global_budget_bytes = static_cast<std::size_t>(c.inboundGlobalBudgetMb) * 1024 * 1024;
     o.wake_budget = c.wakeBudget;
     o.shutdown_deadline = std::chrono::milliseconds(c.shutdownDeadlineMs);
+    o.agent.endpoint = c.agentEndpoint;
+    o.agent.shm_enabled = c.agentShmEnabled;
+    o.agent.ring_capacity = static_cast<std::uint64_t>(c.agentShmRingMb) << 20;
     return o;
 }
 
@@ -119,7 +122,15 @@ Result<INetServer*> NetModule::AddServer(std::string_view endpoint,
     const auto uds = tcp ? std::optional<UdsEndpoint>{} : UdsEndpoint::From(*ep);
     if (!tcp && !uds) // Endpoint 新增了种类而这里没跟上：明确报错，不要去解引用空的 optional
         return Fail(Errc::Module, std::format("net: 监听端点 '{}' 的传输种类还没有对应的服务端", endpoint));
-    IConnectionHandler& wrapped = executor_.Wrap(handler);
+    return MakeStreamServer(tcp, uds, executor_.Wrap(handler), factory, std::move(options));
+}
+
+INetServer* NetModule::MakeStreamServer(const std::optional<TcpEndpoint>& tcp,
+                                       const std::optional<UdsEndpoint>& uds,
+                                       IConnectionHandler& handler,
+                                       const IFrameCodecFactory& factory,
+                                       StreamServerOptions options)
+{
     if (tcp)
     {
         TcpServerOptions o;
@@ -127,7 +138,7 @@ Result<INetServer*> NetModule::AddServer(std::string_view endpoint,
         o.tcp = options.tcp;
         o.accept_filter = std::move(options.accept_filter);
         o.backlog = options.backlog;
-        servers_.push_back(std::make_unique<TcpServer>(*group_, *tcp, std::move(o), wrapped, factory));
+        servers_.push_back(std::make_unique<TcpServer>(*group_, *tcp, std::move(o), handler, factory));
     }
     else
     {
@@ -136,7 +147,7 @@ Result<INetServer*> NetModule::AddServer(std::string_view endpoint,
         o.connection = options.connection;
         o.accept_filter = std::move(options.accept_filter);
         o.backlog = options.backlog;
-        servers_.push_back(std::make_unique<UdsServer>(*group_, *uds, std::move(o), wrapped, factory));
+        servers_.push_back(std::make_unique<UdsServer>(*group_, *uds, std::move(o), handler, factory));
     }
     return servers_.back().get();
 }
@@ -174,7 +185,16 @@ Result<INetClient*> NetModule::AddClient(std::string_view endpoint,
     const auto uds = tcp ? std::optional<UdsEndpoint>{} : UdsEndpoint::From(*ep);
     if (!tcp && !uds)
         return Fail(Errc::Module, std::format("net: 对端端点 '{}' 的传输种类还没有对应的客户端", endpoint));
-    IConnectionHandler& wrapped = executor_.Wrap(handler);
+    return MakeStreamClient(tcp, uds, executor_.Wrap(handler), factory, std::move(options), policy);
+}
+
+INetClient* NetModule::MakeStreamClient(const std::optional<TcpEndpoint>& tcp,
+                                       const std::optional<UdsEndpoint>& uds,
+                                       IConnectionHandler& handler,
+                                       const IFrameCodecFactory& factory,
+                                       StreamClientOptions options,
+                                       ReconnectPolicy policy)
+{
     if (tcp)
     {
         TcpClientOptions o;
@@ -182,7 +202,7 @@ Result<INetClient*> NetModule::AddClient(std::string_view endpoint,
         o.tcp = options.tcp;
         o.connect_timeout = options.connect_timeout;
         o.on_connect_failed = std::move(options.on_connect_failed);
-        clients_.push_back(std::make_unique<TcpClient>(*group_, *tcp, std::move(o), policy, wrapped, factory));
+        clients_.push_back(std::make_unique<TcpClient>(*group_, *tcp, std::move(o), policy, handler, factory));
     }
     else
     {
@@ -191,9 +211,116 @@ Result<INetClient*> NetModule::AddClient(std::string_view endpoint,
         o.connection = options.connection;
         o.connect_timeout = options.connect_timeout;
         o.on_connect_failed = std::move(options.on_connect_failed);
-        clients_.push_back(std::make_unique<UdsClient>(*group_, *uds, std::move(o), policy, wrapped, factory));
+        clients_.push_back(std::make_unique<UdsClient>(*group_, *uds, std::move(o), policy, handler, factory));
     }
     return clients_.back().get();
+}
+
+// ---- 本机 Agent ----
+
+Result<agent::AgentClient*> NetModule::AddAgentClient(std::string_view busid,
+                                                      IMainLoopHandler& handler,
+                                                      const IFrameCodecFactory& factory)
+{
+    agent::AgentClientOptions o;
+    o.busid = std::string(busid);
+    o.transport = options_.agent.shm_enabled ? shm::wire::Transport::kShmPreferred : shm::wire::Transport::kUdsOnly;
+    o.tx_capacity = options_.agent.ring_capacity;
+    o.rx_capacity = options_.agent.ring_capacity;
+    o.connection = options_.connection;
+    o.codec = &factory;
+    return AddAgentClient(options_.agent.endpoint, handler, std::move(o));
+}
+
+Result<agent::AgentClient*> NetModule::AddAgentClient(std::string_view endpoint,
+                                                      IMainLoopHandler& handler,
+                                                      agent::AgentClientOptions options)
+{
+    if (auto r = CheckPhase("AddAgentClient"); !r)
+        return std::unexpected(r.error());
+    const auto ep = Endpoint::Parse(endpoint);
+    if (!ep || (ep->kind() != Endpoint::Kind::Unix && ep->kind() != Endpoint::Kind::UnixAbstract))
+        return Fail(Errc::Module,
+                    std::format("net: Agent 端点 '{}' 不合法（必须是 unix:///path 或 unix-abstract://name：fd 只能经 UDS 传递）",
+                                endpoint));
+    if (!shm::wire::IsValidBusId(options.busid))
+        return Fail(Errc::Module,
+                    std::format("net: Agent 通道名 '{}' 不合法（[A-Za-z0-9._:@-]，1 到 63 个字符）", options.busid));
+    if (!options.on_connect_failed)
+    {
+        const std::string target(endpoint);
+        options.on_connect_failed = [target](int e, bool will_retry) noexcept
+        { LOG_WARN("net: 连本机 Agent {} 失败: {} 重试={}", target, std::strerror(e), will_retry); };
+    }
+    IConnectionHandler& wrapped = executor_.Wrap(handler);
+    auto client = std::make_unique<agent::AgentClient>(*group_, *ep, std::move(options), wrapped);
+    agent::AgentClient* raw = client.get();
+    clients_.push_back(std::move(client));
+    return raw;
+}
+
+Result<agent::AgentServer*> NetModule::AddAgentServer(std::string_view endpoint, agent::RouteTable& table)
+{
+    agent::AgentServerOptions o;
+    o.connection = options_.connection;
+    return AddAgentServer(endpoint, table, std::move(o));
+}
+
+Result<agent::AgentServer*> NetModule::AddAgentServer(std::string_view endpoint,
+                                                      agent::RouteTable& table,
+                                                      agent::AgentServerOptions options)
+{
+    if (auto r = CheckPhase("AddAgentServer"); !r)
+        return std::unexpected(r.error());
+    if (options_.group.io_threads != 1)
+        return Fail(Errc::Module,
+                    std::format("net: AddAgentServer 要求 net.io_threads = 1（Agent 的路由器与路由表是单线程访问的），当前是 {}",
+                                options_.group.io_threads));
+    const auto ep = Endpoint::Parse(endpoint);
+    if (!ep || (ep->kind() != Endpoint::Kind::Unix && ep->kind() != Endpoint::Kind::UnixAbstract))
+        return Fail(Errc::Module,
+                    std::format("net: Agent 监听端点 '{}' 不合法（必须是 unix:///path 或 unix-abstract://name）", endpoint));
+    auto server = std::make_unique<agent::AgentServer>(*group_, *ep, table, std::move(options));
+    agent::AgentServer* raw = server.get();
+    servers_.push_back(std::move(server));
+    return raw;
+}
+
+Result<INetServer*> NetModule::AddIoServer(std::string_view endpoint, IConnectionHandler& handler, const IFrameCodecFactory& factory)
+{
+    if (auto r = CheckPhase("AddIoServer"); !r)
+        return std::unexpected(r.error());
+    const auto ep = Endpoint::Parse(endpoint);
+    if (!ep)
+        return Fail(Errc::Module, std::format("net: 监听端点 '{}' 不合法（tcp://ip:port | unix:///path | unix-abstract://name）", endpoint));
+    const auto tcp = TcpEndpoint::From(*ep);
+    const auto uds = tcp ? std::optional<UdsEndpoint>{} : UdsEndpoint::From(*ep);
+    if (!tcp && !uds)
+        return Fail(Errc::Module, std::format("net: 监听端点 '{}' 不是 tcp / unix（AddIoServer 不收 udp://）", endpoint));
+    StreamServerOptions so;
+    so.connection = options_.connection;
+    so.tcp = options_.tcp;
+    return MakeStreamServer(tcp, uds, handler, factory, std::move(so));
+}
+
+Result<INetClient*> NetModule::AddIoClient(std::string_view endpoint,
+                                          IConnectionHandler& handler,
+                                          const IFrameCodecFactory& factory,
+                                          ReconnectPolicy policy)
+{
+    if (auto r = CheckPhase("AddIoClient"); !r)
+        return std::unexpected(r.error());
+    const auto ep = Endpoint::Parse(endpoint);
+    if (!ep)
+        return Fail(Errc::Module, std::format("net: 对端端点 '{}' 不合法（tcp://ip:port | unix:///path | unix-abstract://name）", endpoint));
+    const auto tcp = TcpEndpoint::From(*ep);
+    const auto uds = tcp ? std::optional<UdsEndpoint>{} : UdsEndpoint::From(*ep);
+    if (!tcp && !uds)
+        return Fail(Errc::Module, std::format("net: 对端端点 '{}' 不是 tcp / unix（AddIoClient 不收 udp://）", endpoint));
+    StreamClientOptions co;
+    co.connection = options_.connection;
+    co.tcp = options_.tcp;
+    return MakeStreamClient(tcp, uds, handler, factory, std::move(co), policy);
 }
 
 Result<RUdpServer*> NetModule::AddRUdpServer(const RUdpEndpoint& endpoint, IMainLoopHandler& handler)

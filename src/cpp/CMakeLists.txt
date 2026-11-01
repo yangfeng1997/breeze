@@ -285,6 +285,7 @@ if(BREEZE_BUILD_NET)
     ${NET_DIR}/stream/stream_client.cpp
     ${NET_DIR}/stream/internal/stream_socket.cpp
     ${NET_DIR}/stream/internal/stream_socket_config.cpp
+    ${NET_DIR}/stream/internal/fd_passing.cpp
     ${NET_DIR}/stream/internal/acceptor.cpp
     ${NET_DIR}/stream/internal/loop_server.cpp
     ${NET_DIR}/stream/internal/connector.cpp
@@ -317,6 +318,29 @@ if(BREEZE_BUILD_NET)
   target_link_libraries(breeze_net_rudp PUBLIC breeze_net PRIVATE kcp::kcp breeze_container breeze_logger)
   target_compile_options(breeze_net_rudp PRIVATE -Wall -Wextra)
   breeze_apply_log_level(breeze_net_rudp)
+
+  # 共享内存通道的握手与服务端 / 客户端（base/shm 的网络一侧，设计见 docs/共享内存IPC设计.md §6.1）：单独一个库，
+  # 不用共享内存的使用方（只用 TCP / UDS）不背这个依赖。UDS 传 fd 的封装（stream/internal/fd_passing）是通用的，在 breeze_net 里。
+  add_library(breeze_net_shm
+    ${NET_DIR}/shm/shm_protocol.cpp
+    ${NET_DIR}/shm/shm_channel_server.cpp
+    ${NET_DIR}/shm/shm_channel_client.cpp)
+  target_link_libraries(breeze_net_shm PUBLIC breeze_net breeze_shm PRIVATE breeze_logger)
+  target_compile_options(breeze_net_shm PRIVATE -Wall -Wextra)
+  breeze_apply_log_level(breeze_net_shm)
+
+  # Agent 的消息信封、路由表与路由器（设计见 docs/共享内存IPC设计.md §4 / §10）。
+  add_library(breeze_net_agent
+    ${NET_DIR}/agent/envelope.cpp
+    ${NET_DIR}/agent/route_table.cpp
+    ${NET_DIR}/agent/agent_router.cpp
+    ${NET_DIR}/agent/shm_connection.cpp
+    ${NET_DIR}/agent/agent_client.cpp
+    ${NET_DIR}/agent/agent_server.cpp)
+  # breeze_time 只 PRIVATE：时钟读数在 agent_router.cpp 里（与共享内存环盖入队时刻用同一个时钟）。
+  target_link_libraries(breeze_net_agent PUBLIC breeze_net_shm PRIVATE breeze_logger breeze_time)
+  target_compile_options(breeze_net_agent PRIVATE -Wall -Wextra)
+  breeze_apply_log_level(breeze_net_agent)
 endif()
 
 add_library(breeze_app
@@ -357,7 +381,7 @@ breeze_apply_log_level(breeze_kernel)
 # net.proto 生成的头文件经 breeze_config_schemas 传递。网络库只支持 Linux。
 if(BREEZE_BUILD_NET)
   add_library(breeze_net_module ${NET_MODULE_DIR}/main_loop_executor.cpp ${NET_MODULE_DIR}/net_module.cpp)
-  target_link_libraries(breeze_net_module PUBLIC breeze_net breeze_net_rudp breeze_kernel breeze_queue
+  target_link_libraries(breeze_net_module PUBLIC breeze_net breeze_net_rudp breeze_net_agent breeze_kernel breeze_queue
                         breeze_config_schemas)
   target_compile_options(breeze_net_module PRIVATE -Wall -Wextra)
   breeze_apply_log_level(breeze_net_module)
@@ -649,6 +673,16 @@ if(BREEZE_BUILD_NET)
   breeze_net_test(rudp_client_test DIR rudp LIB breeze_net_rudp)
   breeze_net_test(rudp_test DIR testing LIB breeze_net_rudp)
 
+  # 共享内存通道的握手与服务端 / 客户端。fd_passing_test 测通用的 UDS 传 fd（在 breeze_net 里）。
+  breeze_net_test(fd_passing_test DIR stream/internal)
+  breeze_net_test(shm_protocol_test DIR shm LIB breeze_net_shm)
+  breeze_net_test(shm_channel_test DIR testing LIB breeze_net_shm)
+  breeze_net_test(shm_retention_test DIR testing LIB breeze_net_shm)
+  breeze_net_test(envelope_test DIR agent LIB breeze_net_agent)
+  breeze_net_test(shm_transport_test DIR testing LIB breeze_net_shm)
+  breeze_net_test(agent_router_test DIR testing LIB breeze_net_agent)
+  breeze_net_test(agent_client_test DIR testing LIB breeze_net_agent)
+
   # framework/net 的测试复用 base/net 的测试公共件（net_test_util.h 带 event_loop.h 与 stream_socket.h）。
   function(breeze_net_module_test name)
     add_executable(${name} ${NET_MODULE_DIR}/${name}.cpp)
@@ -660,6 +694,7 @@ if(BREEZE_BUILD_NET)
 
   breeze_net_module_test(main_loop_executor_test)
   breeze_net_module_test(net_module_test)
+  breeze_net_module_test(net_module_agent_test)
   # NetModule(app) 的用例读仓库里真实的 config/common.yaml（net 段）
   target_compile_definitions(net_module_test PRIVATE BREEZE_CONFIG_DIR="${CONFIG_SCHEMA_ROOT}/..")
 

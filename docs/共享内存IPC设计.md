@@ -1,6 +1,6 @@
 # 共享内存 IPC 设计（Sidecar 本机通道）
 
-**状态**（2026-10-31）：`base/shm`（memfd 封印、镜像映射、SPSC 字节环、唤醒协议、通道的创建与接手校验）**已实现并有测试**，见 §11 / §12；**握手 / 保留 / Reattach 状态机、UDS 传 fd、控制消息还没实现**。**没有任何性能基准**：下面的性能数字都是目标，不是结果。**tsan 没有在本机跑过**（§12）。
+**状态**（2026-11-01）：**已实现并有测试**：`base/shm`（数据结构）、握手 / UDS 传 fd、**握手时协商传输方式（共享内存 / 仅 UDS / 共享内存优先、给不了就退化）**、保留与恢复（App 重启）、Reattach（Agent 重启）、控制消息（`PrepareRestart` / `Bye`）、`ShmChannelServer` / `ShmChannelClient`（阻塞）、**信封与 Agent 的路由转发（`AgentRouter`）**、**App 一侧的非阻塞客户端 `AgentClient`（共享内存也表现成一条 `IConnection`）**、**`NetModule` 的接入（`AddAgentServer` / `AddAgentClient`）与配置（`net.agent_*`）**，见 §11 / §12。**还没有**：`framework/app` 里的自检线程（§6.4）、控制面（路由表的真实来源、Node 的登记）、Agent 之间链路的自动建立、多 loop 的 Agent、`Probe` / `Abort`（§6.6，暂缓）。**没有任何性能基准**：下面的性能数字都是目标，不是结果。**tsan 没有在本机跑过**（§12）。
 读之前先看 [网络库设计.md](网络库设计.md)：本通道复用它的 UDS、`EventLoop`、`IConnection` 体系，但**不走** `IConnection`（共享内存里没有字节流）。
 
 ## 0. 结论速查
@@ -18,6 +18,10 @@
 9. **Tx 方向至多一次**：Agent 消费 Tx 环按"先标记、处理完 `Pop`、崩溃后跳过被标记的那条"实现，效果等价于先 `Pop` 再转发，丢了靠上层重传（§6.5）。
 10. **App 卡死先由 App 自己管**（自检线程发现主循环不前进就 `abort()`，属 `framework/app`，§6.4）；Agent 侧只检测并记指标，阈值默认 10 秒。**Agent 经 UDS 让 App `abort()` 的方案暂缓，只记录在 §6.6，第一版不做。**
 11. **过期**：信封里放相对剩余毫秒，通道每条记录都盖入队时刻，出队时由解析信封的一层算（§4）；单向 `Send` 至多一次、可丢，继承 `Ctx` 的 deadline 取较小者，默认 TTL 5 秒。
+
+12. **握手时协商传输方式（2026-11-01）**：App 在 Hello 里说要什么（仅 UDS / 共享内存优先 / 共享内存必须），Agent 说了算给不给；"仅 UDS"时握手完的 UDS 直接当数据通道，App 侧可配置（`net.agent_shm_enabled`），不启用共享内存就退化成仅 UDS 通信（§6.1）。
+13. **Agent 的路由转发在 IO 线程内完成**（不经 App 主循环）：解析信封、核对发送方身份、判过期、查路由表、直接写目的地的 Rx 环 / 连接 / 链路（§4、§10）。信封格式是参考几个开源 RPC 框架与两个自有项目后定的（§10）。
+14. **共享内存对业务也表现成 `IConnection`**（`ShmConnection`）：`NetModule::AddAgentClient` 给业务的回调接口、`ConnectionHandle` 跨线程发送、`MainLoopExecutor` 回投主循环都与 TCP / UDS 的连接一样，业务不用关心底下是哪种传输（§11）。
 
 由第 2、8 点推出的设计结果：**memfd 由 Agent 创建，之后两个进程各持有一份 fd，谁活着谁保管**。App 重启，Agent 把 memfd 传回给新 App（§6.2）；Agent 重启，App 把 memfd 传回给新 Agent（§6.5）。只有两边同时死，队列才真正消失。
 
@@ -173,7 +177,7 @@ if (write_idx.load(acquire) != 本地读游标)      // 回头再看一眼：这
 - **eventfd 用 `EFD_NONBLOCK | EFD_CLOEXEC`**；允许虚假唤醒（消费者醒来发现没数据就再走一遍睡眠流程）；计数累积没关系，醒来一次性读清。
 - **睡前自旋是调用方的可选策略，默认关**：`base/shm` 里**没有自旋**，只提供 `PrepareToSleep` / `WokeUp` 与 eventfd。App 主循环（业务单线程）**不自旋**：每次 tick 或 eventfd 可读时在预算内搬空环，进 `epoll_wait` 之前调 `PrepareToSleep`，返回 false 就继续处理，醒来调 `WokeUp`。自旋只有专用的轮询线程上才可能值得（比如 Agent 的 IO 线程在高负载下），时长要由基准决定；**之前写的"20–50µs"是猜的，作废**。不自旋的代价：每次从空闲变忙，生产者多一次 eventfd 写、消费者多一次 epoll 唤醒（我没测过，量级是一次系统调用加一次调度）。
 - **睡眠标志这套协议为什么仍然要有**：它让生产者只在消费者真要睡的时候才敲 eventfd，忙的时候 `Commit` 一次系统调用都没有；不要它也行，代价是每次 `Commit` 都 `write` 一次 eventfd，好处是没有 Dekker 与栅栏这一类难测的竞态。
-- **Agent 一侧**：每个通道的 eventfd 挂进 Agent 的 `EventLoop`（`EventLoop::Add(Pollable*, fd, events)` 能挂任意 fd）。**App 一侧**：Rx 的 eventfd 挂进 App 主循环的 `epoll`。
+- **Agent 一侧**：每个通道的 eventfd 挂进 Agent 的 `EventLoop`（`EventLoop::Add(IPollable*, fd, events)` 能挂任意 fd）。**App 一侧**：Rx 的 eventfd 挂进 App 主循环的 `epoll`。
 - **每条环各有自己的一份标志与 eventfd**：一个进程在一条环上是消费者，在另一条环上是生产者。
 
 ## 6. 握手、挂载、崩溃与保留
@@ -187,6 +191,25 @@ App   ── Hello{ 协议版本, busid, 挂载类型, Tx 容量, Rx 容量, pid
 Agent ── Accept{ resumed, app_epoch, agent_epoch, 两条环的容量与偏移 } + SCM_RIGHTS[memfd, tx_efd, rx_efd] ──▶ App
 Agent ── Reject{ 原因 } ──▶ App
 ```
+
+**实现（线格式 v2，`base/net/shm/shm_protocol.h`）**：Accept 与 Reject 合成一条定长的 `Reply`（80 字节）：`result == 0` 即 Accept；Attach 新建 / 恢复时随这条消息用
+`SCM_RIGHTS` 附上 `[memfd, tx_efd, rx_efd]`，Reattach 的 Accept 不带 fd（App 手里本来就有）；否则 `result` 是 errno（Reject），不带 fd。Hello 是 112 字节，
+握手之后 App → Agent 还有 16 字节的定长 `Control`（§6.6）。两端同机，结构按本机字节序与布局直接收发，头里有魔数（字节序列 `BSHM`）与版本，改了任何字段就升版本（现在是 2）。
+`busid` 是定长 64 字节的字符串，字符集 `[A-Za-z0-9._:@-]`、1 到 63 个字符。
+Hello 里有 `transport`（`UdsOnly` / `ShmPreferred` / `ShmRequired`）与 `flags`（目前只有 `discard_retained`），Reply 里有 Agent 实际选定的 `transport`（`Uds` / `Shm`）与 `resumed`；
+**阻塞的 `ShmChannelClient::Connect` 只发 `ShmRequired` 并要求回复是 `Shm`**；协商（含 `UdsOnly` 与退化）由非阻塞的 `AgentClient` 做（见下面"传输方式的协商"）。
+
+**传输方式的协商（已实现）**：Hello 里的 `transport` 是 App 的意愿，Reply 里的 `transport` 是 Agent 实际给的。
+
+| App 要 | Agent 给 | 说明 |
+|---|---|---|
+| `UdsOnly` | `Uds` | 不创建共享内存；握手之后这条 UDS 交给 `StreamConnection` 当数据通道（帧由 `IFrameCodecFactory` 切，两端要一致）；Agent 没提供数据通道（没给 `ShmUdsDataPath`）则 `Reject(ENOTSUP)` |
+| `ShmPreferred`（默认） | `Shm`；给不了时 `Uds` | **只有"可用性"类的失败才退化**：共享内存总量配额满（`ENOSPC`）、`memfd` / eventfd 创建或登记失败（`ENOMEM` / `EMFILE` / `ENFILE` / `ENOSYS` / `EPERM`）、Agent 配了 `allow_shm = false`；App 自己的问题（容量不合法 `EINVAL`、准入被拒 `EACCES`、名字被占 `EBUSY`）照常拒绝，**不拿退化掩盖**；通道数配额满也照常拒绝（仅 UDS 也占名额） |
+| `ShmRequired` | `Shm` | 给不了就 `Reject`（`ENOSPC` / `ENOTSUP` ……） |
+
+- **通道名、配额、准入在两种传输之间统一**：仅 UDS 的通道和共享内存的通道共用一个 busid 命名空间与 `max_channels`，都要过 `OnAdmit`；保留中的共享内存通道不能被仅 UDS 的同名 Hello 顶替，要换传输方式得带 `discard_retained` 明说（只还给同一个 uid）。
+- **仅 UDS 的对端的生命周期**：UDS 断了就是连接关闭（没有队列可保留，也没有 Reattach）；业务回调里 `IConnection::GetContext<UdsPeerContext>()` 取到它的 busid / `SO_PEERCRED`；服务端停机会关掉它们；**`~ShmChannelServer` 返回之后不会再有这些连接的回调**（要等它们回收完，见 §12 的坑）。
+- **App 侧**：`AgentClientOptions::transport`；`NetModule` 的配置 `net.agent_shm_enabled`（false = `UdsOnly`，true = `ShmPreferred`）。连上之后 `AgentClient::link()` 告诉你实际走的是哪一种。`Reattach` 只能是共享内存（`CheckHello` 拒绝 `UdsOnly` 的 Reattach）。
 
 `挂载类型`有两种：**`Attach`**（App 来要通道：新建，或恢复 Agent 持有的那一个，§6.2）和 **`Reattach`**（Agent 重启之后，App 把手里的 memfd 传回去，§6.5；这一种的 fd 方向相反，由 App 随 Hello 一起传给 Agent）。
 
@@ -202,6 +225,21 @@ Agent ── Reject{ 原因 } ──▶ App
 
 - **身份**：Agent 用 `SO_PEERCRED` 取对端 uid / pid，不只信 Hello 里自称的 busid；是否放行（uid 白名单）是 Agent 的策略。
 - **memfd 在 Agent 发出之前加封印**：`F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL`。否则对端 `ftruncate` 缩小它，另一边一访问就收到 `SIGBUS` 崩溃。
+- **服务端的处理顺序**（拒绝的代价依次递增，都在创建共享内存之前或之中）：Hello 的固定部分（魔数 / 版本 / 类型 / 标志 / busid，`EPROTO` / `ENOTSUP` / `EINVAL`）→
+  busid 唯一（`EBUSY`）→ 通道数配额（`ENOSPC`）→ 准入回调（身份 / 策略，errno 原样回给对端）→ 创建通道（容量不合法 `EINVAL`）→ 共享内存总量配额（`ENOSPC`）→
+  登记 Tx 的 eventfd → 发 Accept。
+- **握手是不可信的入口**：服务端用 `recvmsg` 读 Hello（Reattach 的 Hello 要带 fd，读之前不知道类型），只给 4 个 fd 槽位、只读还差的字节数，收齐才处理：
+  Attach 带了 fd 是 `Reject(EPROTO)`；带的 fd 比槽位多（控制缓冲被截断）整条当协议错误、不回复直接断开，已收到的随 `UniqueFd` 关闭；
+  待握手的连接数有上限（`max_pending_handshakes`，超过直接断开），握手有超时（`handshake_timeout`，默认 5 秒）；握手之后 UDS 上只许有定长的 `Control`（§6.6），别的字节一律是协议错误并关闭（第一个不对的字节就识别，不等攒够 16 字节）。
+  客户端一侧同样不信 Agent：读 Reply 用 `recvmsg`、只给 4 个 fd 槽位（期望 3 个，多了是协议错误，已收到的全部关闭），校验头、`result`、fd 的种类（封印齐全的 memfd、
+  非阻塞的 eventfd），再用 Reply 里的布局与共享内存头里算出来的互相核对，对不上就拒绝。
+- **通道刚建好要先跑一次消费循环**：它收尾的 `PrepareToSleep` 才会把 `consumer_sleeping` 置 1，App 的第一次 `Commit` 才知道要敲 eventfd；否则标志一直是 0，Agent 永远等不到第一声。
+  这件事由 `ShmChannelServer` 做，回调里不用管（唤醒协议整个收进了服务端，见 `shm_channel_server.h`）。
+- **`EBUSY` 与快速重启**：App 快速重启时，Agent 的事件循环可能还没处理旧连接的 EOF。两道防线：服务端见到同名 Hello 时**先探一下旧连接**（`ProbeAlive`：UDS 的 EOF 在对方退出时就已经排在内核里），断了就当场转入保留再恢复；
+  客户端在 `busy_retry` 窗口内（默认 1 秒）按 5ms 起翻倍、至多 100ms 的间隔重试 `EBUSY`，最后一次尝试恰在窗口结束处。
+  **服务端的探测什么时候才用得上**：IO 线程按就绪的先后处理事件，普通的快速重启（旧进程先退出、新进程才连）旧连接的 EOF 总是先于新 Hello 被处理，探测用不上——`TestRapidRestartNeverSeesBusy`（`busy_retry = 0`，连续 200 次）只证明这一点，
+  **去掉探测它照样过**（变异验证里存活，我最初写成"证明只靠探测就够"是错的）。探测只在"新进程先连上、旧进程随后才退出"（滚动更新时新旧重叠）时才起作用：新 Hello 先就绪、旧连接的 EOF 后就绪。
+  `TestHelloBeforeOldEofStillResumes` 把 IO 线程卡在一个回调里，卡住期间先发新 Hello、再关旧连接，造出这种次序；没有探测就是 `EBUSY`。
 - **Reject 的原因**（对应 errno，沿用 rudp 的风格）：`EBUSY` 同一 busid 已有活着的 App、`ENOSPC` 超过通道数或共享内存总量的配额、`EPROTO` 版本或布局不符、`EACCES` 身份不被允许、`EINVAL` 容量不合法或 Reattach 的 fd 校验不过。
 
 ### 6.2 通道的状态
@@ -219,6 +257,21 @@ Agent ── Reject{ 原因 } ──▶ App
   - 启动保留计时器，**默认 30 秒**，可配置，App 退出前可用 `PrepareRestart(reserve)` 显式设置（热更新场景给长一点）。
 - **resumed**：保留期内同一 busid 再来 `Attach`（身份校验同上），Agent **把同一个 memfd 再传一遍**，`app_epoch` 加一，`resumed = true`；App 接着用共享内存里的游标，看到的 Rx 环里就是重启期间积压的消息。
 - **销毁**：保留期结束没人来，Agent 关掉 memfd；环里没读走的消息作废，计入指标，**这时业务看不到丢失，除非发送方设置了回执**（回执属于路由层，不在本文范围）。
+
+**实现（`ShmChannelServer`，`shm_channel_server.h` 文件头有完整说明）**：
+
+- **通道对象跨保留不换**：一条通道对应一个 `ShmServerSession`，id 从建立到销毁不变；重新来握手的连接（一个还在握手的会话）查到它，把 UDS 交过去（`ResumeOld`），握手会话随即销毁。
+  **业务回调里的映射要以 `ShmServerChannel::id()` 为键，不要只用 busid**：`discard_retained` 重建时，同名的新通道会先于旧通道的 `OnClosed` 出现（事件序列 `Opened Detached Opened Closed(Discarded)`）。
+- **回调**：`OnOpened`（`reattached()` 为真表示 Agent 重启后恢复的）→ `OnDetached(retain)` → `OnResumed` / `OnClosed(RetentionExpired)`。`OnReadable` 在 Detached 期间照常被调用（遗言），`rx()` 仍可写；`detached()` 告诉业务此刻 App 不在。
+- **保留多久**：`retain_default`（默认 30 秒，0 = 不保留）；App 退出前 `PrepareRestart(ms)` 只管**下一次**断开，超过 `retain_max`（默认 10 分钟）按上限算；`Bye` = 不保留。
+  **不保留（`Bye` / `retain_default` 为 0）时先排空遗言再销毁**（`OnClosed(PeerBye / PeerClosed)`），排空有上限 `drain_timeout`（默认 5 秒）兜底，不能让一个还在写的对端把通道一直拖着。
+- **只把"UDS 读到 EOF / ECONNRESET"当 App 没了**：`ECONNRESET` 是 App 没读完 Accept 就被 kill 时内核的报法，同样进保留；其余 IO 错误、协议错误、`Close()` 一律直接销毁，不替不老实的对端留队列。
+- **恢复的规矩**：保留着的队列只还给**同一个 uid**（`SO_PEERCRED`，在准入回调之前就拒绝，`EACCES`）；沿用原容量，Hello 里的容量 / 载荷上限填 0 或与现有值一致，否则 `Reject(EINVAL)`（被拒绝不毁掉保留着的队列）；
+  想换大小就带 `discard_retained`：**新通道建好、过了配额之后才丢旧的**（容量不合法时旧队列还在），新通道名在旧的开始关闭时就放出来，丢弃的旧通道占的配额在判断时抵扣。
+  `app_epoch` 在回复**之前**加一（客户端一收到回复就拿头里的值对账，`Superseded()`）；Agent 的 epoch 不变。
+  同名通道的 App 还活着（探测后仍然在线）就 `EBUSY`，不抢。
+- **统计**：`detached_channels` / `detached_total` / `resumed` / `reattached` / `retention_expired` / `discarded` / `byes` / `inflight_skipped` / `rx_bytes_discarded`。
+  这些计数在回复**之后**才更新，事件回调（`OnDetached` 等）又晚于计数：测试里要 `WaitUntil`，不能读到计数就去读事件。
 
 ### 6.3 保留语义的几个细节
 
@@ -311,6 +364,16 @@ Agent ── Reject{ 原因 } ──▶ App
 5. `SO_PEERCRED` 的身份被允许；
 6. 通过后 `agent_epoch` 加一写入头部，回 `Accept{resumed = true}`。
 
+**实现（`ShmChannelClient::Reattach` 与 `ShmChannelServer` 的 Reattach 路径）**：
+
+- 客户端：`AgentGone()` 为真之后调 `Reattach(options)`（阻塞，同 `Connect`；`busy_retry` 窗口内重试 `EBUSY`），本对象的映射与 `tx()` / `rx()` 原样接着用；
+  回复必须是 `resumed == 1`、不带 fd、`transport == Shm`、布局与手里的内存一致、`app_epoch` 与本进程一致（否则 `ESTALE`：被别的进程接管，本进程该退出）、`agent_epoch` 不倒退；失败时本对象保持原样，可以再试。
+- 服务端：App 交来的三个 fd 走 `ShmChannel::Attach` 的全套校验（封印、大小、头、布局、容量上限、两条环的游标——对端此刻活着，校验对此是安全的），再核对通道数与总量配额、准入回调；
+  通过后 `RecoverFromCrash`（跳过"处理到一半"的那一条，`inflight_skipped` 计数）、清 `consumer_sleeping`、`agent_epoch` 加一、回 `Accept{resumed = 1}`（不带 fd）、先跑一轮消费循环。
+- **Reattach 命中还留着的通道**：Agent 其实没重启，只是 App 这边的 UDS 断了（`shutdown` 一下就能造出来）。通道名在 Agent 里还留着时，服务端用 `fstat` 的 inode 核对 App 交来的是不是**同一块内存**：是就原样恢复
+  （原来的 App，`app_epoch` 不变，不再发 fd，`agent_epoch` 不变）；不是就 `EBUSY`。App 已经被别的进程用 `Attach` 接手时，原进程的 Reattach 要么 `EBUSY`（新进程还活着），要么在新进程走后得到 `ESTALE`（`Superseded()` 为真）。
+- **清 `consumer_sleeping` 其实是冗余的**：接手后的第一轮消费循环无条件扫一遍，收尾的 `PrepareToSleep` 会重新置位（变异验证里去掉它测试照样过）。留着是为了把"标志与实际状态不符"的窗口缩到零。
+
 **恢复后的状态**：
 
 - **游标原样沿用**，它们本来就在共享内存里。
@@ -345,15 +408,15 @@ Agent ── Reject{ 原因 } ──▶ App
 
 **状态（2026-10-31 决定）**：**先由 App 自己管卡死**（§6.4 的自检线程），**Agent 不发 `Abort`**。本节除 `PrepareRestart` / `Bye` 外都是设计储备，第一版不实现；等 App 自救线程跑起来、真有"自救也救不了"的案例再回头评估。
 
-握手完成之后，UDS 连接不只是存活探针，还可以作为一条**定长消息的控制流**：
+握手完成之后，UDS 连接不只是存活探针，还可以作为一条**定长消息的控制流**（实现里是 16 字节的 `Control{头, op, arg}`，`CheckControl` 校验：头不符 `EPROTO`，op 不认识 / 参数与 op 不匹配 `EINVAL`；`PrepareRestart` 的参数不能是 0，`Bye` 不带参数）：
 
 | 方向 | 消息 | 用途 | 第一版 |
 |---|---|---|---|
 | Agent → App | `Probe` | 问 App 的控制线程"主循环还在前进吗" | 暂缓 |
 | App → Agent | `ProbeAck{帧计数, 距上一帧的毫秒数}` | 回答 `Probe`，由控制线程回，不经过主循环 | 暂缓 |
 | Agent → App | `Abort{原因}` | 让 App 自己 `abort()`（§6.4 第二阶段） | 暂缓 |
-| App → Agent | `PrepareRestart{保留秒数}` | App 退出前设置保留时长（§6.2） | 做 |
-| App → Agent | `Bye` | App 主动正常退出，不必等保留期 | 做 |
+| App → Agent | `PrepareRestart{保留毫秒数}` | App 退出前设置保留时长（§6.2） | **已实现**（`ShmChannelClient::SendPrepareRestart`，单位毫秒，只管下一次断开） |
+| App → Agent | `Bye` | App 主动正常退出，不必等保留期 | **已实现**（`SendBye`；Agent 排空 Tx 就销毁，`OnClosed(PeerBye)`） |
 
 **若将来做 `Probe` / `Abort`，App 一侧要由库起一个控制线程**（第一版不起：UDS 由 `ShmChannelClient` 挂在 `EventLoop` 的 IO 线程上读，`PrepareRestart` / `Bye` 在那里发就够了）：
 
@@ -406,7 +469,7 @@ Agent ── Reject{ 原因 } ──▶ App
 - **对"保留 30 秒"不够用的场景要心里有数**：以 200 B 载荷（占 256 B）、10k msg/s 计，16 MiB **只能攒约 6.5 秒**，攒满 30 秒需要约 73 MiB；流量降到 1k msg/s 才能撑约 65 秒。所以 **保留时长受环容量限制，不是想设多长就多长**；热更新窗口长、流量大的服务要调大 Rx 环容量，或者接受重启期间的丢弃。
 - **内存账**：Node Agent 混部 30 个 App，30 × 2 × 16 MiB = **960 MiB**（页被触碰之后才占物理内存，环用久了会全部触碰）。K8s 里这部分要算进容器的内存限制；据我所知 memfd 的页记在首次触碰它的进程所属的 cgroup 上，Agent 与 App 分属不同 cgroup 时要核算清楚，**这点上线前要在目标环境里实测确认**。
 - **容量由 App 在握手时指定**（规则见 §6.1：2 的幂、`[1 MiB, 256 MiB]`、不合法就拒绝）；默认两条环都是 16 MiB，允许两条环大小不同（Rx 环通常要更大，因为有保留需求与扇入）。
-- **背压语义**：环不阻塞。Tx 环满了，App 侧 `TryReserve` 返回 `Full`，由 App 的上层决定；Rx 环满了见 §6.3。两侧都要有"占用率高水位"指标（§9）。
+- **背压语义**：环不阻塞。Tx 环满了，App 侧 `TryReserve` 返回 `Full`，业务看到的是 `SendResult::Full`（§11），由 App 的上层决定；Rx 环满了见 §6.3。两侧都要有"占用率高水位"指标（§9）。
 
 ## 9. 可观测
 
@@ -460,9 +523,51 @@ Agent ── Reject{ 原因 } ──▶ App
 | 多线程 Agent | 通道按 App 绑定到固定的 loop，路由表用快照指针无锁读 | 它是多个 NetWorker 线程 |
 | 可选大页 | `MFD_HUGETLB` 减少 TLB 缺失，要预留大页，作为后续优化 | — |
 
-**对信封头的要求**（信封头不在本仓库里，这是给它的设计提的约束）：Agent 的**路由决策只应读载荷的前 48 字节**，这样连同 16 字节记录头，一次转发只触碰记录的第一个缓存行（§4）。
-文章里的 64 字节信封头把 `deadline_unix_ms` 和 `gray_tag` 放在 48–63 字节，需要调整：把路由决策用到的字段排进前 48 字节，比如 `[魔数 版本 标志 payload_len | msg_id gray_tag | src dst | service_type zone route_type ttl err | route_key | deadline]` 正好 48 字节，`seq_id`、`trace_id` 这类只在回包和追踪时才用的字段放到后 16 字节。
-按 §4 "过期怎么算"，**`deadline` 必须在前 48 字节里**，类型是 u32 相对剩余毫秒（不是墙钟 `unix_ms`）：Agent 出队时要读它判断过期。字段宽度改了之后，要重新核对前 48 字节的总和。
+**信封（已实现，`base/net/agent/envelope.h`，库 `breeze_net_agent`）**：仓库里原来没有信封，这是按下面的调研结论定的，**字段布局要和仓库外的信封维护者对一遍**（§13）。64 字节，小端，前 48 字节是路由区：
+
+| 偏移 | 字段 | 说明 |
+|---|---|---|
+| 0 | `magic` u32 | 字节序列 `BENV` |
+| 4 / 5 / 6 | `version` u8 / `type` u8 / `flags` u16 | `type`：1 Request、2 Response、3 Oneway（单向显式，不靠 `seq == 0`）；`flags` 目前只有"追踪"位，不认识的位一律丢 |
+| 8 | `body_len` u32 | 头之后的载荷字节数，**必须恰好等于 总长 - 64** |
+| 12 | `msg_id` u32 | 业务消息号 |
+| 16 / 20 | `src` / `dst` u32 | NodeId（库里当不透明的 u32）；Direct 与 Response 的 `dst` 必填 |
+| 24 / 26 / 27 / 28 | `service_type` u16 / `route_type` u8 / `hops` u8 / `gray_tag` u8 | `route_type`：1 Direct、2 Any、3 Hash、4 Broadcast；`hops` 每转发一跳加一，到 8 丢弃（防环） |
+| 29 | 保留 3 字节 | 必须为 0 |
+| 32 | `route_key` u64 | Hash 路由用的**数值**（实体 id 或发送方算好的哈希），不是字符串 |
+| 40 | `remaining_ms` u32 | 发送那一刻的相对剩余毫秒，0 无效（§4）。**在路由区里**，Agent 出队时要读、转发时要改 |
+| 44 | `err_code` u32 | 只有 Response 用 |
+| 48 | `seq` u64 | 相关性：单调递增、永不复用、命名空间是发送方；**Agent 不改写它** |
+| 56 | `trace_id` u64 | 只在回包与追踪时用 |
+
+校验（`ParseEnvelope`，先把 64 字节拷到本地再校验）：总长不足 64、魔数、版本、类型、`route_type`、Direct 缺 `dst`、Response 不是 Direct、不认识的 `flags`、保留位、`body_len` 对不上，**任何一项不过就丢弃并按原因计数**，不退化成别的路径。
+`remaining_ms` / `hops` / `src` 的合法性不在这里判：过期由 `CheckExpire` 判，`hops` 由 `PatchForForward` 判，`src` 由路由器核对发送方的身份。
+`CheckExpire`：剩余 = `remaining_ms × 10^6 - (now - 入队时刻)`，**对剩余向下取整到毫秒，不足 1 毫秒也算过期**（写进拷贝的 `remaining_ms` 不能是 0，宁可早丢）；`remaining_ms` 或入队时刻为 0 是 `kInvalid`，单独计数；
+不是从环里来的消息（UDS / TCP 的帧）没有入队时刻，调用方传"收到的时刻"，排队时间记 0。
+
+**调研依据**（2026-11-01，子代理在 `D:\GameserverNew`、`D:\silver-server`、brpc、grpc-go、thrift、TarsCpp 里按关键词定位的，引用的行号没有逐条核对）：
+- **几乎所有项目的坑都是"路由字段在变长区"**：brpc 的服务名 / 方法名 / `timeout_ms` 在 protobuf meta 里，Tars 在 tars 编码里（`iTimeout` 还在载荷之后），gRPC 在 HPACK 头里（超时是十进制文本加单位），自有的 GameserverNew 把 `RoutingKey` 和方法名放在定长区之后，
+  所以转发节点读不全，也没法原地改写超时（改写会让变长整数 / 文本的宽度变化，要连带改长度）。本信封路由区全是定长数字。
+- **相对剩余毫秒是共识**（gRPC、brpc、Tars、GameserverNew 都是），但**没有一个在转发一跳时扣排队时间**（gRPC 只在发送时用 `time.Until(deadline)` 重算；Tars 只在服务端按队列等待超时丢；GameserverNew 的 Agent 不改 `DeadlineMs`；silver-server 干脆不带）。
+  我们有记录头里的入队时刻，所以能做到。
+- **魔数 + 版本 + 头长度**（Thrift 的 THeader、brpc 的 `PRPC`、silver 的 natsagent `NATSAGT`）；GameserverNew 没有，解码失败就退回旧路径转发，是反例。
+- **单向用显式类型**（Thrift `ONEWAY`、Tars `cPacketType`），不靠 `seq == 0`（GameserverNew、silver-server 都靠约定，silver 回包时看到 0 才丢）。
+- **Agent 改写 seq 要维护映射表**（GameserverNew 的 `remoteSeq`，疑似不清理）：本设计不改 seq，回包按 `(src, seq)` 索引。
+- **路由键用数值**：GameserverNew 的 Direct 用字符串带 nodeID 还要 `ParseUint`，一致性哈希 key 也是字符串。
+- **发送方身份**：GameserverNew 没有核对 `SrcNodeID` 与握手时的 node 一致；本设计由路由器核对（本机 App 的 `src` 必须等于握手时登记的 NodeId，否则可以冒充别人）。
+- **校验要有下界**：silver-server 旧共享内存队列没有 `length < sizeof(header)` 的检查，相减下溢，一条坏消息堵死队列；GameserverNew 的 UDS 上限 1MB 与 peer 的 16MB 不一致。
+
+**Agent 的路由器（已实现，`base/net/agent/agent_router.h`）**：同一个 `AgentRouter` 既是 `ShmChannelServer` 的 `ShmChannelHandler`（共享内存通道），又是 `ShmUdsDataPath` 与 Agent 之间链路的 `IConnectionHandler`。
+每条消息的流程：`ParseEnvelope`（先拷头再校验）→ **本机 App 的 `src` 必须等于握手时登记的 NodeId**（否则丢并计 `bad_src`；来自别的 Agent 的链路是受信的，不核对）→ `CheckExpire`（出队时用记录头的入队时刻扣排队时间；
+UDS / 链路的帧没有入队时刻，排队时间记 0）→ `PatchForForward`（拷贝里改 `remaining_ms`、`hops` 加一，到 8 丢弃防环）→ 路由表 `Resolve` → 投递：
+- **本机共享内存的 App**：直接 `TryReserve` 它的 Rx 环、改写过的头与载荷各拷一次、`Commit`，不经中转队列；App 在保留中（Detached）照样写，满了丢并计 `rx_full_detached`；
+- **本机仅 UDS 的 App**：`IConnection::Send`；**别的 Agent**：`ConnectionHandle::Send`（路由表的 `RemoteOf(node)` 给出链路句柄；同一个 Node 既在本机又登记成远端时，本机优先）。
+- **失败的处理**：Oneway / Response 无路可走、过期、环满：丢并计数，不通知发送方（单向可丢，已定）；**Request 送不到时回一条错误 Response**（`kRouteErrNoRoute = 1` / `kRouteErrUnavailable = 2`，带回 `seq` / `msg_id` / `trace_id`，`dst` 是请求的 `src`），让调用方快速失败而不是等满 deadline；过期的 Request **不回**（请求方早已判超时）。
+- **释放策略**：共享内存通道上"先 `MarkInflight`、转发完再 `Pop`"，Agent 崩溃后新 Agent 靠标记跳过处理到一半的那一条（`TestInflightMarkedWhileForwarding` 在路由表的 `Resolve` 里卡住路由器，从 App 一侧看控制块，证明标记确实立着）。
+- **路由表**（`RouteTable`，真实来源是控制面，仓库里还没有）：接口加一个内存实现 `StaticRouteTable`：Direct 发给 `dst`；Any 轮询；Hash 对"按 NodeId 排序的实例列表"取模（**不是一致性哈希**，实例增减时大部分键会换去别的实例）；Broadcast 发给全部实例（不含发送方）。
+  通道名到 NodeId 的映射由 `AgentRouterOptions::node_of` 给（默认：通道名就是十进制的 NodeId）；不认识的 `Reject(EACCES)`，两个通道名映射到同一个 Node `Reject(EBUSY)`。
+- **单线程**：路由器、路由表、对端表都只在一个 loop 线程上访问，所以 Agent 进程的 `EventLoopGroup` 必须 `io_threads = 1`（`AgentServer::Start` 在 group 有多个 loop 时返回 `EINVAL`；`NetModule::AddAgentServer` 在 `net.io_threads != 1` 时报错）。
+  Agent 之间的链路用 `AgentServer::router()` 当 `IConnectionHandler`（`NetModule::AddIoServer` / `AddIoClient`，回调直接在 IO 线程上跑，不回投主循环），再把"远端 Node 经哪条链路"登记进路由表。
 
 **关于"零拷贝转发"的一个更正**：我之前提过 `SharedBuffer` 需要能包装外部内存才能零拷贝。细想后不需要：从环里直接 `send(span)`，写不完的部分拷进连接缓冲，环里的槽位立刻释放，就**不需要延后释放，也就不会让最慢的目的连接拖住整条环**。`SharedBuffer` 的外部内存只在"同一条消息要异步多次发送且来不及立刻写完"时才有用，不是第一阶段的前提。
 接收方向（TCP → App 的 Rx 环）目前仍是一次拷贝（读到本线程缓冲，再拷进环）；"`recv` 直接读进环"是后续优化，要先知道帧长，复杂度较高。
@@ -474,19 +579,36 @@ Agent ── Reject{ 原因 } ──▶ App
 **实现状态（2026-10-31）**：`src/cpp/base/shm/` 已有——`shm_defs`（线格式、布局计算）、`shm_memfd`（memfd 创建与封印、eventfd）、
 `shm_mirror_map`（镜像映射）、`shm_ring`（`RingProducer` / `RingConsumer`：批量发布与释放、`inflight` 标记与崩溃接手、睡眠协议）、
 `shm_channel`（`ShmChannel::Create` / `Attach`，含对端 fd 的全套校验）；CMake 目标 `breeze_shm`，只在 Linux 构建。
-**还没有**：UDS 传 fd、握手、通道状态机与保留计时器、Reattach、控制消息、`framework/app` 的接入。
+`src/cpp/base/net/` 里新增：`stream/internal/fd_passing`（UDS 上 `SCM_RIGHTS` 传 fd 的通用封装，在 `breeze_net` 里）、
+`shm/shm_protocol`（握手线格式）、`shm/shm_channel_server`（`ShmChannelServer`：Agent 一侧，握手 + 准入 + 配额 + 探活 + 替调用方跑 Tx 环的唤醒协议）、
+`shm/shm_channel_client`（`ShmChannelClient`：App 一侧，阻塞的 `Connect` + `liveness_fd()` / `AgentGone()`）；CMake 目标 `breeze_net_shm`（单独一个库，照 rudp 的先例）。
+**范围**：`Attach`（新建 / 保留期内恢复 / `discard_retained` 重建）、`Reattach`、保留计时器与 `Detached`、控制消息 `PrepareRestart` / `Bye`、`Superseded()` 都已实现（§6.2 / §6.5 / §6.6）；
+`ShmChannelServer` 的全部通道、握手与回调都在 accept 所在的那一个 loop 上（容量上限是一个 IO 线程）。
+
+**新增（`src/cpp/base/net/agent/`，库 `breeze_net_agent`，依赖 `breeze_net_shm`）**：
+- `envelope`：信封（§10）、`ParseEnvelope` / `CheckExpire` / `PatchForForward`；`route_table`：`RouteTable` 与 `StaticRouteTable`；`agent_router`：`AgentRouter`（§10）；
+- `agent_server`：`AgentServer`（`INetServer`）= `AgentRouter` + `ShmChannelServer` + 仅 UDS 的数据通道，`NetModule` 经它持有；
+- `shm_connection`（内部）：`ShmConnection : IConnection`——共享内存通道做成进连接表的 `IConnection`：Tx 环的生产者与 Rx 环的消费者都在所属 IO 线程上，业务线程发送经 `ConnectionHandle` 投递到那个线程
+  （发送方预扣的 `pending_bytes` 写完环就还回去）；PauseRead / ResumeRead 对应暂停 / 恢复读 Rx 环（消息留在环里不丢）；Agent 不在时 Send 照常写 Tx 环，满了丢这一条并计 `tx_full_drops`、**返回 `SendResult::Full`**（IO 线程上直接 `Send` 当场如此；业务线程经 `ConnectionHandle` 发时写环是异步的，靠槽上的 `tx_full` 提示：环满之后 `kFullHintWindow`（2 ms）之内的发送当场得到 `Full`、不入队，计 `NetStats::send_full`，到点由 IO 线程上的一次性定时器清掉，清掉之后的第一条才真的去试）。**`Full` 保证没发出；`Ok` 不保证发出了**——提示置位之前已投递的那几条仍可能被丢，只进 `tx_full_drops`；
+- `agent_client`：`AgentClient`（`INetClient`）——App 一侧的**非阻塞**客户端：握手 → 按协商结果建 `ShmConnection` 或 `StreamConnection`；共享内存模式下 UDS 断开（Agent 掉线）**连接不关**，只置 `agent_down()`，后台按退避 `Reattach`；
+  Reattach 被判定不可能成功（校验不过、被别的进程接管）才关闭这条连接再走全新的 Attach；**共享内存里的环被对端写坏（读写环时校验不过）、或接手 Agent 保留着的内存时校验不过，下一次 Attach 自动带 `discard_retained`**
+  （Agent 保留着的是同一块坏内存，再"恢复"它只会再坏一次；不这样做会因为 `EINVAL` 不可重试而卡在 Idle——这是写 `TestCorruptTxRingClosesConnection` 时发现的）；仅 UDS 模式 UDS 断了就是关闭，按退避重新握手；`PrepareRestart(ms)` 之后的 `Stop()` / 析构当作重启，不发 `Bye`；析构同步停掉自己并等连接回收完。
+- `framework/net`：`NetModule::AddAgentClient`（端点 / 是否启用共享内存 / 环容量取配置 `net.agent_*`，业务回调回投主循环）、`AddAgentServer`、`AddIoServer` / `AddIoClient`（回调直接在 IO 线程）。配置：`net.proto` 的 `agent_endpoint`、`agent_shm_enabled`、`agent_shm_ring_mb`。
+
+**还没有**：`framework/app` 的接入（自检线程 §6.4、`Probe` / `Abort` §6.6）、控制面（路由表的真实来源、Node 的登记、Agent 之间链路的自动建立）、多 loop 的 Agent、按 uid 的配额。
 include 在 main 分支上目前是与同目录其它库一致的扁平写法；合并 `refactor/net-layout-and-includes` 之后要按那边的规则改成从 `src/cpp` 起算。
 `UniqueFd` 在 `base/net/internal` 里，`base/shm` 不能依赖它，所以有一个重复的 `shm::Fd`，等 `UniqueFd` 上提到 `base` 之后合并。
 
 - **`base/shm/`（新）**：纯数据结构，**不依赖 `EventLoop`**——memfd 封装（含封印）、镜像映射、单向 SPSC 环、通道头与控制块、唤醒协议里的睡眠标志与 eventfd 的收发。eventfd 的 fd 暴露出来，谁的事件循环都能挂。
-- **UDS 传 fd**：在 UDS 一侧新增 `sendmsg` / `recvmsg` + `SCM_RIGHTS` 的小封装。`IConnection` 带不了 fd，所以握手用一个专用的接受器，不走 `IConnection`。
-- **`ShmChannelServer` / `ShmChannelClient`（新，放在 `base/net` 里还是单独的库待定）**：握手、通道状态机、保留计时器、控制消息（§6.6）、接入 `EventLoop`。因为依赖 `EventLoop` 与 UDS，更靠近 `base/net`。第一版不起额外线程（§6.6 的控制线程只有做 `Probe` / `Abort` 时才需要）。
+- **UDS 传 fd**（已实现）：`sendmsg` / `recvmsg` + `SCM_RIGHTS` 的小封装。`IConnection` 带不了 fd，所以握手用 `Acceptor` 接出裸 fd，自己管会话，不走 `IConnection`。
+- **`ShmChannelServer` / `ShmChannelClient`（已实现，放在 `base/net/shm/`，库 `breeze_net_shm`）**：握手、传输协商、通道状态机、保留计时器、控制消息（§6.6）、接入 `EventLoop`。因为依赖 `EventLoop` 与 UDS，更靠近 `base/net`。不起额外线程（§6.6 的控制线程只有做 `Probe` / `Abort` 时才需要）。
 - **分层**：遵守 `tools/check_includes.py` 的规则（`base/` 不能依赖 `framework/`）；include 从 `src/cpp` 起算。
-- **与 `framework/app` 的关系**：App 侧 Rx 的 eventfd 要挂进主循环；可以做成一个 `Module`，也可以直接让通道对象在 `Tick` / `Wake` 里被驱动。第一版先做通道本身，不绑模块。
+- **与 `framework/app` / `framework/net` 的关系**：**已经接进 `NetModule`**（`AddAgentClient` / `AddAgentServer`）：App 侧 Rx 的 eventfd 挂在 `NetModule` 的 IO 线程上，消息经 `MainLoopExecutor` 回投主循环，业务看到的是一条普通的 `IConnection`（§11）；
+  没有走"让主循环线程直接当 Tx 环的生产者 / Rx 环的消费者"的路——那样 App → Agent 能少一次线程切换，但要把共享内存的唤醒挂进主循环、业务线程之外的发送也得汇到主循环，改动面大，等有基准证明值得再做。`framework/app` 的自检线程（§6.4）仍然没有。
 
 ## 12. 测试与验证计划
 
-**已实现并通过的（2026-10-31，debug / asan+ubsan / release 三种配置，ctest 的 `shm_*` 四个目标）**：
+**已实现并通过的（2026-11-01，debug / asan+ubsan / release 三种配置；`shm_*`、`fd_passing_test`、`envelope_test`、`agent_*`、`net_module_agent_test` 共十三个目标）**：
 
 | 测试 | 覆盖 |
 |---|---|
@@ -494,8 +616,38 @@ include 在 main 分支上目前是与同目录其它库一致的扁平写法；
 | `shm_ring_test` | 空 / 满 / 恰好满、批量发布与释放、跨镜像边界（100 圈）、游标绕过 2^64（含接手与跳过）、唤醒协议各分支、两个双线程压力、锤子测试、**litmus 测试**（见下） |
 | `shm_untrusted_test` | 篡改记录头 / 游标 / 通道头 / fd 的 30 多种用例、崩溃接手的各分支、对端运行时接手的回归、3 万次随机翻字节的模糊测试 |
 | `shm_multiprocess_test` | 跨进程收发（用 `Attach` 重新映射）、两个方向的乒乓（含每条都睡）、`kill -9` 消费者 400+ 次（至多一次、跳过）、`kill -9` 生产者 200+ 次（批内原子）、接手、SIGBUS 对照 |
+| `fd_passing_test` | 传递与 `CLOEXEC`、对端塞太多 fd / 不期望带 fd 时不泄漏、EOF / `EAGAIN` / 参数错误、信号打断下的补发、补发时对端关闭返回 `EPIPE` 而不是被 `SIGPIPE` 杀死 |
+| `shm_protocol_test` | busid 规则、Hello 各字段的校验（含 Reattach 的限制）、`Control` 的校验、Reply 头的校验、结构尺寸 |
+| `shm_channel_test`（服务端按 `retain_default = 0` 跑：UDS 断开就排空并销毁） | 握手 + 回显（含默认容量）、跨睡眠的唤醒（共享内存里的计数证明 eventfd 起了作用）、预算用完要让出且不丢不卡、多客户端并发、同名 `EBUSY` 与关闭后复用、各种配额 / 准入 / 容量拒绝、协议滥用（错版本 / 错魔数 / 全零 / 附带一堆 fd / 握手后写数据 / 半条或拆成两段的 Hello）、握手超时与待握手上限、服务端停止、损坏的环、**假 Agent**（客户端面对错误回复、fd 数量与种类不对、布局对不上、分多段到、不回复 / 半条回复）、**跨进程的真正 `SCM_RIGHTS` 与 `kill -9`**（回显、被杀后同名顶替） |
 
-**变异验证**：把库里 98 处关键判断逐个改坏，**96 个被测试杀死**，存活 2 个：
+| `shm_retention_test` | **App 重启**：遗言在保留期里被排空、Agent 在保留期里往 Rx 写、新进程恢复后先读到积压（顺序不乱不少）、`app_epoch` 加一、事件序列 `Opened Detached Resumed`；保留到期（不早于保留时长、`rx_bytes_discarded` 精确）；恢复后旧计时器作废；预算只有 3 时 300 条遗言一条不丢；**控制消息**（`PrepareRestart` 延长 / 超上限按上限 / 只管下一次，`Bye` 不保留，不合法的控制消息、第一个字节就不对、分段到、半条就走）；**恢复的规矩**（活着的同名通道 `EBUSY` 与重试窗口、容量对不上、别的用户 `EACCES`、`discard_retained` 的事件顺序与失败时旧队列不毁、连续 200 次快速重启不见 `EBUSY`）；停机销毁保留中的通道；业务主动 `Close` 保留中的通道；**Agent 重启**（Agent 不在期间 App 照写、旧 Agent 死在处理一条记录的期间则跳过那一条、睡眠标志停在 1 也能恢复、Reattach 命中还留着的通道、`Superseded` / `ESTALE`）；**Reattach 的恶意输入**（不是 memfd、没封印、eventfd 位置放了管道、魔数被改、游标越界、容量超限、fd 数量 0 / 1 / 2 / 4、通道名被占、配额、准入拒绝，之后规矩的 Reattach 仍然成功且在这块内存上收发正常）；**假 Agent 对 Reattach 回错的东西**；**跨进程**：`kill -9` App 后新进程恢复读到 100 条回显、`kill -9` Agent 五次后 Reattach（在 24000 条里至多丢"被杀那一刻处理到一半的那一条"，不重复、不乱序） |
+
+| `shm_transport_test` | **传输协商**：`UdsOnly` / `ShmPreferred` / `ShmRequired` 对 Agent 的各种配置（提供 / 不提供共享内存、有 / 没有仅 UDS 的数据通道、总量配额满、通道数配额满、容量不合法、准入被拒）各得到什么（只有"可用性"类失败才退化）；仅 UDS 的数据通道（200 条收发、大帧、空帧、超长帧头关连接、对端关闭、身份 `UdsPeerContext`）；通道名与配额在两种传输之间统一（含保留中的共享内存通道要换仅 UDS 必须带 `discard_retained`、别的用户 `EACCES`）；仅 UDS 的 Hello 带 fd；Hello 与第一帧数据同一次 `write` 到达；停机关掉仅 UDS 的连接；**服务端先于连接销毁、处理器随即释放**（`~ShmChannelServer` 之后不再有回调） |
+| `envelope_test` | 布局与每个字段的偏移、`ParseEnvelope` 的每一种拒绝（含边界：63 / 64 字节、`body_len` 差一、极值）、先拷头、`CheckExpire` 的边界（刚好用完、差 1 纳秒、不足 1 毫秒的零头、时钟回拨、`u32` 极值不溢出）、`PatchForForward`、20 万次随机翻字节的模糊测试 |
+| `agent_router_test` | 转发矩阵（共享内存 / 仅 UDS 两两互转，头里 `src` / `dst` / `seq` / `msg_id` / `trace_id` 都不改，`hops` 加一，`remaining_ms` 扣了排队时间）、拨快时钟模拟排队（过期 / 无效 / 差不多用完、过期的 Request 不回包）、坏信封与冒充 `src`、无路由与错误回包（含服务存在但实例列表为空）、目的地满 / 单条超限 / 保留中 / 已断开、`hops`、Any / Hash / Broadcast、`node_of` 映射、**转发期间 `inflight` 标记立着**、本机优先于链路、discard 重建后仍登记在名下、两个发送方各 2 万条的顺序与数量、**两个 Agent 之间经 TCP 链路转发**（含回包、跨链路的错误回包、链路上的过期） |
+| `agent_client_test` | 两种传输下的收发与 `Stop`（`Bye`）；协商结果（退化、`ENOTSUP` / `ENOSPC` / `EACCES` / `EINVAL` 各自可不可重试）；**Agent 重启时共享内存连接不关**（后台 `Reattach`，期间写 Tx 的由新 Agent 处理，两轮）、仅 UDS 的自动重连；**App 热更重启**（`PrepareRestart` 后析构不发 `Bye`、保留期里 Agent 写的积压一连上就交给业务）；暂停 / 恢复读（含在回调里暂停）；Agent 还没起来的退避重试、名字被占的重试、`Stop` 取消重试；**Reattach 被判不可能成功时关闭连接重新 Attach**；`Tx` 环满的丢弃与计数；**`Full` 的返回**（IO 线程直发当场 `Full`、经句柄 / `AgentClient` 在提示期间当场 `Full` 且不入队不占 `pending_bytes`、Agent 恢复消费并过了提示窗口后又能发，`TestTxFullReturnsFullAndRecovers`）；发送计账不泄漏 `pending_bytes`；`discard_retained`；9 种恶意 Agent 回复；并发发送（4 线程 × 3000）；**客户端先于连接销毁、处理器随即释放** |
+| `net_module_agent_test` | 真实的 `App` + `NetModule`：一个 Agent（`AddAgentServer`）加两个 App（`AddAgentClient`），一个走共享内存、一个因配置关掉共享内存只用 UDS，互发请求与回包（20 条，保序）；业务回调都在各自 App 的主循环线程上；配置 `net.agent_*` 到选项的映射；端点 / 通道名 / `io_threads` 不对时 `App::Run` 带着原因返回 |
+
+**握手相关代码的变异验证**：把 `fd_passing` / `shm_protocol` / `shm_channel_server` / `shm_channel_client` 里 107 处关键判断逐个改坏，release 下 **98 个被杀死**；
+存活 9 个里，`BeginClose` 在回调栈里销毁自己（use-after-free）与 `eventfd` 不摘除这两个在 **asan 下被抓到**（所以这套测试必须也在 asan 下跑），
+fd 槽位越界写同样只有 asan 能抓；其余存活的是冗余防线（摘 fd / 忽略已关闭会话的事件 / 取消定时器 / busid 映射按 id 校验，任何一个单独去掉都无害）和造不出来的错误路径
+（对有效 fd 的 `getsockopt(SO_PEERCRED)` 与 `epoll_ctl` 失败）。
+
+**保留 / 恢复 / Reattach 的变异验证**（`/tmp` 副本里逐个改坏，release）：83 个，**首轮杀死 68 个**；存活的 15 个逐个分析后补了用例（探测旧连接、Reattach 的 uid、`inflight` 标记本身不合法、`ECONNRESET` 当 IO 错误、discard 后名字登记、discard 的配额抵扣、分两段累计的 fd、排空超时、`Superseded`、Reattach 之后换连接……），**补完杀死 83 个中的 81 个**，剩下两个：
+`SV38`（Reattach 清 `consumer_sleeping`，冗余：接手后的第一轮消费循环无条件扫一遍）与 `SV46`（析构里的栅栏，竞态，不稳定地存活，asan 满载下抓到过它防的那个 UAF）。**这轮变异验证挖出的真问题**：测试夹具里处理器比 group 先销毁（见下面的坑）。
+
+**协商 / 信封 / 路由器的变异验证**：80 个，首轮杀死 73 个，补用例后又杀 4 个（`Any` 的实例列表为空、转发期间 `inflight` 标记、本机优先于链路、仅 UDS 通道名重名）；剩下 3 个：`EN20` 与 `AR17` 是**等价变异**（`age >= budget` 与后面的 `left == 0` 判同一件事；路由器经 UDS 与 Agent 间链路发送，这两种连接不会返回 `Full`，所以 `!= Closed` 与 `== Ok` 在这里一样——`SendResult` 有了 `Full` 之后，将来链路换成共享内存就不再等价，到时要补用例），
+`TR22`（`~ShmChannelServer` 等仅 UDS 的连接回收完）**asan 下也存活**：析构里的第二个 `CallSync` 栅栏在实践中已经间接等到了回收（回收在同一轮事件循环的末尾，栅栏任务要等下一轮才能跑），显式等待只是把"不会再有回调"从靠时序变成保证；用例把 `OnClosed` 里睡 30ms 撑开窗口也测不出差别，属于冗余防线。
+
+**`SendResult::Full` 的变异验证**：13 个，杀死 11 个；存活 2 个都是测不出来而不是没写：`FU04`（提示已置位时仍重复起定时器）只多出若干个到点就无事可做的定时器，最坏是后一轮的提示被前一轮遗留的定时器提前清掉、窗口变短，提示本来就是尽力的；`FU06`（定时器不核对槽的 `generation`）要在 2 ms 内让同一个槽被新连接复用才会清错别人的提示，槽是 FIFO 复用、测试里的 group 又没有可注入的时钟，造不出这个窗口，核对只是廉价的防线（与 `ScheduleDrain` 里的同款写法一致）。
+
+**`AgentClient` / `ShmConnection` / `NetModule` 接入的变异验证**：68 个，首轮（64 个）杀死 47 个；存活的逐个分析补了用例（暂停时的交付、关闭时的槽状态、Tx 环游标被写坏、Reattach 回复的各项校验、握手超时、`AgentServer` 要求单 loop、成功后退避重置、
+写坏后丢弃重建……），**最终杀死 63 个**，剩下 5 个：`AC24` / `AC25`（`Stop` 不显式取消握手 / 定时器：过期检查——epoch 比较与状态判断——已经覆盖）、`AC26`（去掉握手回调里的 epoch 比较：状态判断仍然挡得住）、
+`AC34`（客户端析构显式等连接回收：与 `TR22` 同理，析构里的栅栏在实践中已经间接等到了）、`AC41`（`Stop` 立刻清当前连接：去掉的最坏后果是旧连接晚到的 `OnClosed` 取消一次进行中的握手、多等一次重试，最终结果相同，测不出差别，但补丁是对的）。
+**这轮变异验证挖出的真问题**：①环被对端写坏后 Agent 保留着同一块坏内存，原来的实现会因为接手校验失败（`EINVAL`，不可重试）卡在 Idle——现在检测到写坏、或接手保留着的内存时校验不过，下一次 Attach 自动带 `discard_retained`；
+②`Stop()` 之后紧接着 `Start()` 时，旧连接要等回收才 `OnClosed`，`StopOnLoop` 要立刻清掉当前连接的指针。
+
+**`base/shm` 的变异验证**：把库里 98 处关键判断逐个改坏，**96 个被测试杀死**，存活 2 个：
 `write_idx` 的发布从 `release` 改 `relaxed`（**x86 的内存模型下看不出来，只能靠 ARM 真机或 TSAN**）、
 `S_ISREG` 检查（与封印检查等价的纯防御）。验证过程中发现并修了一个真 bug（§7）、删掉了几处走不到的检查。
 **litmus 测试**专门逼 Dekker 的两道栅栏：两个线程用自旋屏障在每一轮里同时执行 `PrepareToSleep` 与 `Commit`，
@@ -506,8 +658,37 @@ include 在 main 分支上目前是与同目录其它库一致的扁平写法；
 **没有验证的**：
 - **tsan 没有在本机跑过**（见 [网络库设计.md](网络库设计.md) §11.2）；真机上要补，重点看 `Commit` / `PrepareToSleep` 的两道栅栏、`write_idx` / `read_idx` 的 release / acquire 配对。
 - **弱内存序的平台（ARM）没有跑过**：x86 的 TSO 会掩盖 release / acquire 写错的问题（上面存活的变异就是例子）。
-- 握手、保留、Reattach、控制消息、看门狗（本表之外下面列的那些）**还没有实现，所以也没有测试**。
+- 看门狗（Agent 侧检测 `Stalled`、App 自检线程）、`Probe` / `Abort`（本表之外下面列的那些）**还没有实现，所以也没有测试**。
+- **Agent 之间的链路只在同进程里测过**（两个 `EventLoopGroup`、本机回环的 TCP）；真实的跨机、链路断开重连后路由表的更新都没验证。
+- **`AgentRouter` 与 `kill -9` 的组合**：路由器上"先标记、转发完再 Pop"只用"在 `Resolve` 里卡住、从 App 一侧看标记"证明了标记立着，没有像 `shm_retention_test` 那样对真实的路由器进程做 `kill -9` 注入。
+- 真实部署环境没有验证：Agent 与 App 在不同容器 / Pod 里共享 UDS（K8s 里怎么挂卷、`SO_PEERCRED` 的 pid 在 pid 命名空间里是否可用）、memfd 的页在 cgroup 里怎么计费。
+- `ShmChannelServer` 一个服务端只用一个 loop：容量上限没有测过，也没有按通道数压过。
 - 所有性能数字都没有测过；乒乓用例打印的往返时间只是顺带，不是结论。
+
+**验证协商 / 路由 / 客户端时踩过的坑**：
+- **处理器要比 group 活得久**：连接归 group 的 loop 持有，`~EventLoopGroup` 时还会关连接、回调处理器。测试夹具里把处理器声明在 group 之后，析构时处理器先没了，栈上对象析构后内存仍有效，**asan 看不见，debug 下偶发段错误（约 15%）**。
+  库的契约也跟着收紧：`~ShmChannelServer` / `~AgentClient` 返回之后不会再有它的任何回调（等仅 UDS / 共享内存的连接回收完）。
+- **`ConnectionHandle::Send` 有自己的背压**：跨线程发送方先在槽上预扣 `pending_bytes`，超过水位就按慢消费者拒绝；测试线程一口气投递 1.6 MB 会被拒（`Closed`），要按 IO 线程已处理的数量分批发。`ShmConnection` 写完环要把预扣还回去（`SendFromTask`），否则累计发送量过水位就被误关。
+- **`NetModule::Shutdown` 必须在调 `App::Run` 的线程上调**（队列的消费者角色绑在那个线程上，断言会抓到），测试里让 `Run` 线程在 `Run` 返回之后自己调。
+- **回包是新消息**：`hops` 从 0 起（我一开始断言成 2）。
+- **等价变异不是用例漏洞**：`EN20`、`AR17` 这类改了写法但行为一样的变异，分析清楚就记下来，不硬凑用例。
+
+**验证保留 / Reattach 时踩过的坑**：
+- **析构时残留的任务在 `Impl` 销毁之后才执行（上一版就有，满载下 asan 抓到）**：事件分发阶段 `PostTeardown` 投递的任务可能排在 `~ShmChannelServer` 的同步任务之后，同步任务返回、`Impl` 销毁，这条任务才跑（堆释放后使用）。
+  修法：析构里再 `CallSync` 一个空任务当栅栏（队列先进先出，它返回时前面的任务都已执行）。**release 下不会崩，只有 asan 加满载才暴露**。
+- **先发回复、后改状态的顺序**：`Resume` 最初先发 `Reply`、再加 `app_epoch`，客户端一收到回复就检查 `Superseded()`，偶发误判被接管（32 核满载下才复现）。epoch 必须在回复之前加；之后发送失败也不回退（计数单调，跳过一个值无害）。
+- **kill 的落点有系统性偏差**：测"Agent 被杀"时，触发 kill 的是"App 收到一条回显"，而回显恰恰是 Agent 提交的那一刻，所以 kill 永远落在"提交之后、Pop 之前"，"标记之后、提交之前"（那时会丢这一条）一次都采不到
+  （改动前 25 次 kill 丢 0 条）。办法：Agent 处理器在两个窗口里各忙等 30µs 把它们撑大，kill 之前再按轮次错开几十微秒；现在 5 次 kill 全部落在窗口里，丢 2 到 4 条。
+- **测试里读事件要等事件**：计数先于回调更新（`detached_total` 加一在 `OnDetached` 之前），测试看到计数就去读事件会读空；应当 `WaitUntil` 事件序列本身。
+- **想让别的用户连一下**：Linux 的凭据是线程级的，在新线程里直接发 `SYS_setresuid`（不是 glibc 的 `setresuid`，它会广播给所有线程）就只改这个线程；`SO_PEERCRED` 取的是 `connect` 那一刻的。要 root，否则跳过。UDS 所在目录与 socket 文件要放开权限。
+- **时间线类用例的窗口要宽**：保留 2 秒、1 秒窗口的用例在 32 核满载下才暴露出时间线算错（我自己算错了第二次保留的到期时刻，没改动的代码上就失败）。
+
+**验证握手这一层时踩过的坑**：
+- **"回到基线"当断言会空等**：用"fd 数回到基线"证明服务端关了连接，客户端一关、服务端还没来得及 `accept` 时计数也是基线，断言第一次检查就通过了——变异验证里它存活才暴露。
+  这类断言必须先确认"已经偏离过基线"（等到服务端真的接受了连接）。
+- **统计要先于对外可见的效果更新**：`Reject` 原先先发回复、后给 `rejected` 计数，客户端一收到回复就读统计会读到旧值；空闲机器上窗口小，32 核满载时才复现。已改成先计数再发。
+- **窗口要卡紧**：测"把数据当断开"时，假 Agent 会在 5 秒后自己关连接，`WaitUntil` 给 10 秒就会被后来的 EOF 碰巧救过；窗口必须小于对端自己放弃的时间。
+- **只有 sanitizer 才抓得到的东西要在 sanitizer 下验证变异**：release 下去掉越界检查、在回调栈里销毁对象，测试照样通过。
 
 **写这类测试时踩过的坑**：不要在测试里绑核。线程会继承创建者的亲和性，同一个进程里前一个用例把主线程绑死，
 后一个用例新建的锁步自旋线程就落在同一个核上，每次屏障交接都要等调度器抢占，慢到几乎不动（实测 2 万轮 20 秒都跑不完，分核时 0.6µs/轮）。
@@ -530,12 +711,28 @@ include 在 main 分支上目前是与同目录其它库一致的扁平写法；
 ## 13. 未决项与风险
 
 - **记录对齐**：已定 64 字节（§4），**要用基准验证**：做 16 对 64 的 A/B，看低占用时的往返延迟收益是否大于空间浪费。
+- **`ShmChannelServer` 的单 loop 上限**：全部通道的握手与 Tx 环消费都在一个 IO 线程上；通道多、流量大时要分到多个 loop（通道在握手后可以迁到别的 loop，但 eventfd 与 UDS 都要跟着迁）。
+- **`EBUSY` 的重试**：已做（服务端先探旧连接，客户端 `busy_retry` 窗口内退避重试，§6.1）；窗口长度（默认 1 秒）是拍的，没有依据。
+- **阻塞的 `ShmChannelClient::Connect` / `Reattach`** 只适合启动时或后台线程里调用；业务用的是非阻塞的 `AgentClient`（握手、探活、Reattach 都挂在 `EventLoop` 上，后台按退避重试）。
+- **`AgentClient` 的 `Stop()` 与 `PrepareRestart()` 的语义要业务自己分清**：`Stop()` 发 `Bye`（Agent 立刻销毁队列，不保留），`PrepareRestart(ms)` 之后的 `Stop()` / 析构当作重启（保留 `ms`）；进程被 kill 则走默认的保留时长。
+  热更流程要在退出前调 `PrepareRestart`，否则保留的是默认的 30 秒。
+- **保留着的通道占着配额**：保留期里的通道算在 `max_channels` 与 `max_total_bytes` 里，且保留期默认 30 秒、`PrepareRestart` 最长 10 分钟；一个不断换 busid 来握手又消失的对端（身份合法的前提下）能把配额占满到保留到期。
+  目前只有总量上限，没有按 uid 的上限；是否要加，要看部署里谁能连上这个 UDS。
+- **Agent 的路由器是单线程的**：`io_threads = 1`，一个 Agent 的全部通道、握手、仅 UDS 的连接、Agent 之间的链路都在一个 IO 线程上。容量上限没有测过；要扩就得把对端表与路由表换成线程安全的、通道按 App 绑到固定的 loop（§10 目标里写过），并解决跨 loop 的转发。
+- **控制面还没有**：路由表（`RouteTable`）的真实来源是服务发现；NodeId 与通道名的映射现在靠 `AgentRouterOptions::node_of`（默认通道名就是十进制 NodeId）；"远端 Node 经哪条 Agent 链路"现在要调用方自己登记（`StaticRouteTable::SetRemote`），链路也要自己建（`NetModule::AddIoServer` / `AddIoClient`）；
+  Agent 之间链路断了、重连了，路由表里的句柄要有人更新。`Hash` 路由是取模，不是一致性哈希；Any 是轮询，不看负载与灰度标记（`gray_tag` 只透传）。
+- **信封字段要和仓库外的维护者对一遍**（§10）：目前是我按调研结果定的；`NodeId` 当不透明的 `u32`；`hops` 上限 8；`remaining_ms` 的 `u32` 上限约 49.7 天。UDS / 链路上的帧没有入队时刻，排队时间记 0（所以只在共享内存环里的排队才会被扣掉，内核 socket 缓冲里的不扣）。
+- **"环满"的可见性是尽力的**：`SendResult` 加了 `Full`（没发出、连接还开着），但业务线程跨线程发送的写环发生在 IO 线程上，调用方当场只能靠槽上的 `tx_full` 提示知道。提示置位之前已经投递的几条，以及提示每 2 ms 过期后放过去试的那一条，仍可能返回 `Ok` 却因环满被丢（只进 `tx_full_drops`）；所以 `Ok` 仍是"网络层已接收"，要必达走 RPC 的 deadline 与重试。
+  `kFullHintWindow` 是常量（2 ms），没有测量依据：太长会把 Agent 刚腾出的空间白白让掉，太短等于没提示。**超过单条上限（`tx_too_large`）仍返回 `Ok` 只计数**，是调用方的编程错误而不是流量问题，没有为它加一档；要加的话和 `Full` 一样，值加在 `SendResult` 上、实现在 `ShmConnection::Write`。
+- **`ShmConnection` 没有空闲检测与写队列水位**：写环是同步的，不排队；Agent 一侧发给慢 App 的消息环满就丢（`rx_full`），不会像 TCP 那样把慢消费者关掉。
+- **仅 UDS 的数据通道的帧格式**要 Agent 与 App 两端一致（`IFrameCodecFactory`），握手里不协商；配错了表现为连上就协议错误。
 - **是否需要自旋**：App 主循环默认不自旋；专用轮询线程（Agent 的 IO 线程）值不值得自旋、自旋多长，要靠基准决定。
 - **保留时长的默认值**：暂定 30 秒（Tbuspp2 的 `mq_space_hb_expire` 默认也是 30 秒，笔记里写的）；受 §8 的容量限制。
 - **过期（§4，方案 B 已定）**：每批 `Commit` 读一次时钟的开销要单独量（目标是摊到整批后可忽略）；取批内首条 `TryReserve` 的时刻作为整批的入队时刻，是否过于保守要看实测；握手校验单调时钟差的阈值（1 秒）；`remaining_ms` 是 u32，上限约 49.7 天，超过的由 RPC 层拒绝；信封的字段布局由仓库外定，要和它的维护者对一遍。
 - **看门狗**：N = 10 秒、满环 2 秒、第二阶段 M = 30 秒、App 自救的 T = 30 秒都是初值，要按你们实际的帧长和重启窗口再调；**已定：卡死先由 App 自救线程管，Agent 只记指标加日志**（§6.4）；通知控制面、`Probe` / `Abort`（§6.6，暂缓）、`pidfd` 升级都是后续；是否加心跳待定。
 - **（暂缓项）`Probe` / `Abort` 与控制线程**：App 里多一个库线程，与"业务单线程"的约定怎么对齐（它只碰原子变量）；`abort()` 前打栈的超时值；`pidfd` 跨命名空间发信号在目标环境里到底行不行。App 自救线程跑起来之后再评估是否还需要。
-- **Reattach 的细节**：新 Agent 的接纳窗口多长；Reattach 与新 `Attach` 在同一 busid 上竞争时谁先；身份校验除了 uid 还要不要加别的。
+- **Reattach 的细节**：新 Agent 没有"接纳窗口"的概念（它不知道应该有多少通道回来，也就没有"到齐"这回事，只受配额约束）；Reattach 与新 `Attach` 在同一 busid 上竞争时先到先得（后到的 `EBUSY`；交来的是同一块内存则视为恢复）；
+  身份校验目前只有 uid（保留着的队列只还给同一个 uid），要不要加别的（比如可执行文件、cgroup）没定。
 - **是否允许两条环不同大小**：已允许，默认相同；Rx 是否该默认更大，要看真实流量。
 - **K8s 部署**：UDS 路径怎么在 App 容器与 Agent 容器之间共享（emptyDir 还是 hostPath）；共享内存的内存限制与 cgroup 记账（§8）。
 - **TSAN 本机跑不了**：并发协议只能在真机上验证，在那之前不要当作已验证。

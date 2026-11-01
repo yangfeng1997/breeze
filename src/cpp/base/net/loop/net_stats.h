@@ -47,6 +47,9 @@ struct NetStats
     std::uint64_t send_closed_oversize = 0;      // payload 超过 codec 上限
     std::uint64_t send_closed_io_error = 0;      // 直写时 sendmsg 出错
 
+    // 跨线程 Send 因下游满（Slot::tx_full 提示）直接返回 Full 的次数；这些消息没入队、没进 ShmConnStats::tx_full_drops。
+    std::uint64_t send_full = 0;
+
     // 各 loop 里单轮（分发事件 + 任务 + 定时器 + 回收，不含 epoll_wait 睡眠）的最长耗时，取最大值。
     std::chrono::nanoseconds max_loop_lag{0};
 };

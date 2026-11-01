@@ -47,3 +47,6 @@ net:
   inbound_global_budget_mb: 256
   wake_budget: 1024
   shutdown_deadline_ms: 5000
+  agent_endpoint: unix:///run/breeze/agent.sock
+  agent_shm_enabled: true
+  agent_shm_ring_mb: 0

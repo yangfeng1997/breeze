@@ -53,6 +53,7 @@ struct alignas(64) LoopStats
     Counter send_closed_slow_consumer{0};
     Counter send_closed_oversize{0};
     Counter send_closed_io_error{0};
+    Counter send_full{0};
 
     static void Add(Counter& c) noexcept { c.fetch_add(1, std::memory_order_relaxed); }
 
@@ -80,6 +81,7 @@ struct alignas(64) LoopStats
         out.send_closed_slow_consumer += rd(send_closed_slow_consumer);
         out.send_closed_oversize += rd(send_closed_oversize);
         out.send_closed_io_error += rd(send_closed_io_error);
+        out.send_full += rd(send_full);
         const std::chrono::nanoseconds lag(static_cast<std::int64_t>(rd(max_lag_ns)));
         if (lag > out.max_loop_lag)
             out.max_loop_lag = lag;

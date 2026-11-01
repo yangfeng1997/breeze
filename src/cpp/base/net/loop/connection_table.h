@@ -37,6 +37,9 @@ public:
     {
         std::atomic<std::uint32_t> generation{1}; // 从 1 起：句柄 raw == 0 恒为无效；回收时 +1
         std::atomic<State> state{State::Free};
+        // 下游满的提示（ShmConnection 写环遇满时置位、一小段时间后由它的定时器清零）：置位期间跨线程 Send 直接返回
+        // SendResult::Full、不入队。只是提示——清零之后的第一条才真的去试；回收时清零。
+        std::atomic<bool> tx_full{false};
         std::atomic<std::uint64_t> pending_bytes{0}; // 排队与在途的 payload 字节；回收时清零
         std::atomic<std::uint64_t> high_water{0};    // 建立时写入；发送方据此判断慢消费者
     };
