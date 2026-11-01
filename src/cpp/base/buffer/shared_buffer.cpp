@@ -1,4 +1,4 @@
-#include "shared_buffer.h"
+#include "base/buffer/shared_buffer.h"
 
 #include <atomic>
 #include <cassert>
@@ -7,8 +7,8 @@
 #include <new>
 #include <utility>
 
-#include "logger.h"
-#include "logger_macros.h"
+#include "base/logger/logger.h"
+#include "base/logger/logger_macros.h"
 
 namespace breeze
 {

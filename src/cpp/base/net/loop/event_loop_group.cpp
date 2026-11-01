@@ -1,15 +1,15 @@
-#include "event_loop_group.h"
+#include "base/net/loop/event_loop_group.h"
 
 #include <cerrno>
 #include <thread>
 
-#include "connection_handle.h"
-#include "event_loop.h"
-#include "group_access.h"
-#include "group_registry.h"
-#include "logger.h"
-#include "logger_macros.h"
-#include "thread.h"
+#include "base/logger/logger.h"
+#include "base/logger/logger_macros.h"
+#include "base/net/connection/connection_handle.h"
+#include "base/net/loop/event_loop.h"
+#include "base/net/loop/group_access.h"
+#include "base/net/loop/group_registry.h"
+#include "base/thread/thread.h"
 
 namespace breeze
 {

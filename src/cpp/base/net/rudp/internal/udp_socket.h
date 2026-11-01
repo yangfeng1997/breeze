@@ -16,16 +16,16 @@
 #include <optional>
 #include <span>
 
-#include "endpoint.h"
-#include "internal/core/event_loop.h"
-#include "internal/core/pollable.h"
-#include "internal/core/unique_fd.h"
-#include "rudp_options.h"
+#include "base/net/endpoint/endpoint.h"
+#include "base/net/loop/event_loop.h"
+#include "base/net/loop/pollable_interface.h"
+#include "base/net/rudp/rudp_options.h"
+#include "base/net/socket/unique_fd.h"
 
 namespace breeze
 {
 
-class DatagramHandler
+class IDatagramHandler
 {
 public:
     // 收到一个数据报。data 只在回调内有效。回调里不能销毁 socket。
@@ -34,23 +34,23 @@ public:
     virtual void OnSocketError(int /*sys_errno*/) {}
 
 protected:
-    ~DatagramHandler() = default;
+    ~IDatagramHandler() = default;
 };
 
-class UdpSocket final : public Pollable
+class UdpSocket final : public IPollable
 {
 public:
     // 服务端：bind 到 local。成功时 out 有值，失败返回 errno（out 不变）。
     [[nodiscard]] static int OpenServer(EventLoop& loop,
                                         const Endpoint& local,
                                         const RUdpOptions& options,
-                                        DatagramHandler& handler,
+                                        IDatagramHandler& handler,
                                         std::unique_ptr<UdpSocket>& out);
     // 客户端：connect 到 peer（UDP 的 connect 只设默认对端，立即返回）。
     [[nodiscard]] static int OpenClient(EventLoop& loop,
                                         const Endpoint& peer,
                                         const RUdpOptions& options,
-                                        DatagramHandler& handler,
+                                        IDatagramHandler& handler,
                                         std::unique_ptr<UdpSocket>& out);
 
     ~UdpSocket() override = default;
@@ -74,7 +74,7 @@ public:
     void Close();
 
 private:
-    UdpSocket(EventLoop& loop, UniqueFd fd, Endpoint local, DatagramHandler& handler)
+    UdpSocket(EventLoop& loop, UniqueFd fd, Endpoint local, IDatagramHandler& handler)
         : loop_(loop)
         , fd_(std::move(fd))
         , handler_(handler)
@@ -86,7 +86,7 @@ private:
                     const Endpoint& ep,
                     bool server,
                     const RUdpOptions& options,
-                    DatagramHandler& handler,
+                    IDatagramHandler& handler,
                     std::unique_ptr<UdpSocket>& out);
 
     void OnEvents(std::uint32_t events) override;
@@ -95,7 +95,7 @@ private:
 
     EventLoop& loop_;
     UniqueFd fd_;
-    DatagramHandler& handler_;
+    IDatagramHandler& handler_;
     Endpoint local_;
     bool registered_ = false;
 };

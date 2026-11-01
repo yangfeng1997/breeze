@@ -11,8 +11,8 @@
 #include <thread>
 #include <vector>
 
-#include "mpsc_queue.h"
-#include "spsc_queue.h"
+#include "base/queue/mpsc_queue.h"
+#include "base/queue/spsc_queue.h"
 
 using namespace breeze;
 

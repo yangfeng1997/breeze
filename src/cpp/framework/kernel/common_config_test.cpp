@@ -1,7 +1,7 @@
 // config/schema/common.yaml 的回归测试：schema 被改动、改坏时在这里暴露。
 // 无测试框架依赖：失败即 abort。
 
-#include "config/common_config.h"
+#include "gen/config/common_config.h"
 
 #include <cstdio>
 #include <cstdlib>

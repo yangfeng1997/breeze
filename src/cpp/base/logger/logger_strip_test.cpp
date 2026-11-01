@@ -13,8 +13,8 @@
 #include <sstream>
 #include <string>
 
-#include "logger.h"
-#include "logger_macros.h"
+#include "base/logger/logger.h"
+#include "base/logger/logger_macros.h"
 
 using namespace breeze;
 namespace fs = std::filesystem;

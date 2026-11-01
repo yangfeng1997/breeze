@@ -3,7 +3,7 @@
 // 以及两份独立的随机对照：RFC 原文语法翻成的正则（加附录 B 的切分正则）、inet_pton。
 // 无测试框架依赖：失败即 abort。
 
-#include "uri.h"
+#include "base/uri/uri.h"
 
 #include <cstdio>
 #include <cstdlib>

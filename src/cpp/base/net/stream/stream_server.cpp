@@ -1,22 +1,22 @@
-#include "stream_server.h"
+#include "base/net/stream/stream_server.h"
 
 #include <cerrno>
 #include <chrono>
 #include <utility>
 
-#include "acceptor.h"
-#include "group_access.h"
-#include "logger.h"
-#include "logger_macros.h"
-#include "socket_config.h"
-#include "stream_connection.h"
+#include "base/logger/logger.h"
+#include "base/logger/logger_macros.h"
+#include "base/net/loop/group_access.h"
+#include "base/net/stream/internal/acceptor.h"
+#include "base/net/stream/internal/stream_connection.h"
+#include "base/net/stream/internal/stream_socket_config.h"
 
 namespace breeze
 {
 
 struct StreamServer::Impl
 {
-    Impl(EventLoopGroup& g, Endpoint ep, StreamServerOptions o, ConnectionHandler& h, const FrameCodecFactory& f)
+    Impl(EventLoopGroup& g, Endpoint ep, StreamServerOptions o, IConnectionHandler& h, const IFrameCodecFactory& f)
         : group(g)
         , endpoint(std::move(ep))
         , options(std::move(o))
@@ -28,8 +28,8 @@ struct StreamServer::Impl
     EventLoopGroup& group;
     Endpoint endpoint;
     StreamServerOptions options;
-    ConnectionHandler& handler;
-    const FrameCodecFactory& factory;
+    IConnectionHandler& handler;
+    const IFrameCodecFactory& factory;
 
     EventLoop* loop = nullptr; // Acceptor 所在的 loop，Start 时选定
     std::unique_ptr<Acceptor> acceptor;
@@ -115,7 +115,7 @@ void StreamServer::Impl::OnAccept(UniqueFd fd, std::optional<Endpoint> peer)
                 { Adopt(target, std::move(fd), std::move(info)); });
 }
 
-// 在目标 loop 的线程上建连接。codec 也在这里创建：FrameCodecFactory::Create 本来就要求线程安全。
+// 在目标 loop 的线程上建连接。codec 也在这里创建：IFrameCodecFactory::Create 本来就要求线程安全。
 void StreamServer::Impl::Adopt(EventLoop& target, UniqueFd fd, PeerInfo info)
 {
     if (!target.accepting())
@@ -134,8 +134,8 @@ void StreamServer::Impl::Adopt(EventLoop& target, UniqueFd fd, PeerInfo info)
 StreamServer::StreamServer(EventLoopGroup& group,
                            const Endpoint& endpoint,
                            StreamServerOptions options,
-                           ConnectionHandler& handler,
-                           const FrameCodecFactory& factory)
+                           IConnectionHandler& handler,
+                           const IFrameCodecFactory& factory)
     : endpoint_(endpoint)
     , impl_(std::make_unique<Impl>(group, endpoint, std::move(options), handler, factory))
 {

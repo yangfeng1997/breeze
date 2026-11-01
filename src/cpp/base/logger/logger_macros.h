@@ -22,7 +22,7 @@
 #include <format>
 #include <source_location>
 
-#include "logger.h"
+#include "base/logger/logger.h"
 
 // 编译期级别常量。注意与下面的 BREEZE_LOG_<LEVEL>(...) 宏区分：带 LEVEL_ 的是数字。
 #define BREEZE_LOG_LEVEL_TRACE 0

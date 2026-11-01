@@ -1,4 +1,4 @@
-#include "tcp_client.h"
+#include "base/net/tcp/tcp_client.h"
 
 #include <utility>
 
@@ -24,8 +24,8 @@ TcpClient::TcpClient(EventLoopGroup& group,
                      const TcpEndpoint& peer,
                      TcpClientOptions options,
                      ReconnectPolicy policy,
-                     ConnectionHandler& handler,
-                     const FrameCodecFactory& factory)
+                     IConnectionHandler& handler,
+                     const IFrameCodecFactory& factory)
     : StreamClient(group, peer.endpoint(), ToStreamOptions(std::move(options)), policy, handler, factory)
 {
 }

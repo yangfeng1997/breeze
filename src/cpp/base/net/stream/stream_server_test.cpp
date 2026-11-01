@@ -2,7 +2,7 @@
 // 选项透传、统计，以及 TCP 与 UDS 两个 server 共用一个 group。
 // 无测试框架依赖：失败即 abort。每个用例结束时检查没有 fd / 线程泄漏。
 
-#include "stream_server.h"
+#include "base/net/stream/stream_server.h"
 
 #include <fcntl.h>
 #include <poll.h>
@@ -21,10 +21,10 @@
 #include <thread>
 #include <vector>
 
-#include "event_loop_group.h"
-#include "group_access.h"
-#include "length_prefix_codec.h"
-#include "net_test_util.h"
+#include "base/net/codec/length_prefix_codec.h"
+#include "base/net/loop/event_loop_group.h"
+#include "base/net/loop/group_access.h"
+#include "base/net/testing/net_test_util.h"
 
 using namespace breeze;
 using namespace breeze::testing;
@@ -337,8 +337,8 @@ void TestOptionsReachConnections()
 
 // ---- 统计 ----
 
-// 接口：StreamServer 是 NetServer；NetModule 与业务经 NetServer 统一持有各种服务端。
-static_assert(std::is_base_of_v<NetServer, StreamServer>);
+// 接口：StreamServer 是 INetServer；NetModule 与业务经 INetServer 统一持有各种服务端。
+static_assert(std::is_base_of_v<INetServer, StreamServer>);
 
 // UDP 是数据报端点，字节流的服务端不收它：Start 返回 EPROTONOSUPPORT，不会悄悄建一个 TCP 监听
 // （地址写法与 TCP 相同，不拦住的话 "udp://1.2.3.4:80" 会变成 1.2.3.4:80 的 TCP 监听）。

@@ -18,12 +18,12 @@
 #include <thread>
 #include <vector>
 
-#include "event_loop_group.h"
-#include "group_access.h"
-#include "length_prefix_codec.h"
-#include "net_test_util.h"
-#include "stream_client.h"
-#include "stream_server.h"
+#include "base/net/codec/length_prefix_codec.h"
+#include "base/net/loop/event_loop_group.h"
+#include "base/net/loop/group_access.h"
+#include "base/net/stream/stream_client.h"
+#include "base/net/stream/stream_server.h"
+#include "base/net/testing/net_test_util.h"
 
 using namespace breeze;
 using namespace breeze::testing;

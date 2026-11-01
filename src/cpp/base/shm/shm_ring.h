@@ -24,7 +24,7 @@
 #include <cstdint>
 #include <span>
 
-#include "shm_defs.h"
+#include "base/shm/shm_defs.h"
 
 namespace breeze::shm
 {

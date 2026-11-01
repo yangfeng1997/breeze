@@ -19,10 +19,10 @@
 #include <cstdint>
 #include <expected>
 
-#include "shm_defs.h"
-#include "shm_fd.h"
-#include "shm_mirror_map.h"
-#include "shm_ring.h"
+#include "base/shm/shm_defs.h"
+#include "base/shm/shm_fd.h"
+#include "base/shm/shm_mirror_map.h"
+#include "base/shm/shm_ring.h"
 
 namespace breeze::shm
 {

@@ -1,10 +1,10 @@
-#include "thread_pool.h"
+#include "base/thread/thread_pool.h"
 
 #include <bit>
 #include <cerrno>
 
-#include "logger.h"
-#include "logger_macros.h"
+#include "base/logger/logger.h"
+#include "base/logger/logger_macros.h"
 
 namespace breeze
 {

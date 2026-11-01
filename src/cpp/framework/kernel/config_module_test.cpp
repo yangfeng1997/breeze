@@ -1,6 +1,6 @@
 // 无测试框架依赖：失败即 abort。临时文件写在 /tmp 下。
 
-#include "config_module.h"
+#include "framework/kernel/config_module.h"
 
 #include <unistd.h>
 
@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-#include "app.h"
+#include "framework/app/app.h"
 
 using namespace breeze;
 namespace fs = std::filesystem;

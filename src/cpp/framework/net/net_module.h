@@ -1,8 +1,8 @@
-// 网络模块：装配 EventLoopGroup、各传输的服务端 / 客户端（经 NetServer / NetClient 接口持有）与 MainLoopExecutor，
+// 网络模块：装配 EventLoopGroup、各传输的服务端 / 客户端（经 INetServer / INetClient 接口持有）与 MainLoopExecutor，
 // 把连接事件回投 App 主循环。
 // 设计见 docs/网络库设计.md §5。这里只做装配，不含 IO 逻辑。
 //
-// 用法：业务模块 DependsOn("net")，在自己的 Init 里 AddServer / AddClient（传 MainLoopHandler 与 FrameCodecFactory）；
+// 用法：业务模块 DependsOn("net")，在 Init 里 AddServer / AddClient（传 IMainLoopHandler 与 IFrameCodecFactory）；
 // NetModule::Start 起 group，再依次起 server 与 client。IO 线程把事件入队后 App::Notify()，主循环调 Wake()，Wake =
 // Drain(budget)。
 //
@@ -22,24 +22,24 @@
 #include <string_view>
 #include <vector>
 
-#include "config/net_config.h"
-#include "connection_options.h"
-#include "event_loop_group.h"
-#include "main_loop_executor.h"
-#include "main_loop_handler.h"
-#include "module.h"
-#include "net_client.h"
-#include "net_server.h"
-#include "rudp_client.h"
-#include "rudp_options.h"
-#include "rudp_server.h"
-#include "stream_client.h"
-#include "stream_server.h"
-#include "tcp_client.h"
-#include "tcp_options.h"
-#include "tcp_server.h"
-#include "uds_client.h"
-#include "uds_server.h"
+#include "base/net/connection/connection_options.h"
+#include "base/net/connection/net_client_interface.h"
+#include "base/net/connection/net_server_interface.h"
+#include "base/net/loop/event_loop_group.h"
+#include "base/net/rudp/rudp_client.h"
+#include "base/net/rudp/rudp_options.h"
+#include "base/net/rudp/rudp_server.h"
+#include "base/net/stream/stream_client.h"
+#include "base/net/stream/stream_server.h"
+#include "base/net/tcp/tcp_client.h"
+#include "base/net/tcp/tcp_options.h"
+#include "base/net/tcp/tcp_server.h"
+#include "base/net/uds/uds_client.h"
+#include "base/net/uds/uds_server.h"
+#include "framework/app/module.h"
+#include "framework/net/main_loop_executor.h"
+#include "framework/net/main_loop_handler_interface.h"
+#include "gen/config/net_config.h"
 
 namespace breeze
 {
@@ -76,33 +76,37 @@ public:
     // 装配：Init 之后、Start 之前（通常在依赖 net 的模块的 Init 里）。endpoint 是 tcp://ip:port | unix:///path |
     // unix-abstract://name | udp://ip:port（配置里直接写字符串）；不合法返回错误并带上原字符串。
     // 返回的指针在模块存活期内有效。
-    // 之后经 NetClient::Send / ConnectionHandle 发送；handler 与 factory 要比 Shutdown 活得久。
+    // 之后经 INetClient::Send / ConnectionHandle 发送；handler 与 factory 要比 Shutdown 活得久。
     // udp:// 的 AddServer 装配的是 rudp 服务端（用模块的 connection 与 rudp 默认选项；显式选项里只有 connection 与
     // accept_filter 对它有意义），factory 对它被忽略：rudp 的消息自带边界，没有 codec。要签发票据就要拿到 RUdpServer，
-    // 用 AddRUdpServer（或对返回的 NetServer* 做 dynamic_cast）。
+    // 用 AddRUdpServer（或对返回的 INetServer* 做 dynamic_cast）。
     // AddClient 不收 udp://：rudp 客户端要凭票据握手，用 AddRUdpClient。
-    Result<NetServer*> AddServer(std::string_view endpoint, MainLoopHandler& handler, const FrameCodecFactory& factory);
-    Result<NetServer*> AddServer(std::string_view endpoint,
-                                 MainLoopHandler& handler,
-                                 const FrameCodecFactory& factory,
-                                 StreamServerOptions options);
-    Result<NetClient*> AddClient(std::string_view endpoint, MainLoopHandler& handler, const FrameCodecFactory& factory);
-    Result<NetClient*> AddClient(std::string_view endpoint,
-                                 MainLoopHandler& handler,
-                                 const FrameCodecFactory& factory,
-                                 StreamClientOptions options,
-                                 ReconnectPolicy policy);
+    Result<INetServer*> AddServer(std::string_view endpoint,
+                                  IMainLoopHandler& handler,
+                                  const IFrameCodecFactory& factory);
+    Result<INetServer*> AddServer(std::string_view endpoint,
+                                  IMainLoopHandler& handler,
+                                  const IFrameCodecFactory& factory,
+                                  StreamServerOptions options);
+    Result<INetClient*> AddClient(std::string_view endpoint,
+                                  IMainLoopHandler& handler,
+                                  const IFrameCodecFactory& factory);
+    Result<INetClient*> AddClient(std::string_view endpoint,
+                                  IMainLoopHandler& handler,
+                                  const IFrameCodecFactory& factory,
+                                  StreamClientOptions options,
+                                  ReconnectPolicy policy);
 
     // rudp（可靠 UDP，KCP 之上）：设计与准入模型见 rudp/rudp_server.h、rudp_client.h。
     // 服务端随模块启动；没给选项时用 NetModuleOptions 的 connection 与 rudp。rudp 选项不合法返回错误。
-    Result<RUdpServer*> AddRUdpServer(const RUdpEndpoint& endpoint, MainLoopHandler& handler);
+    Result<RUdpServer*> AddRUdpServer(const RUdpEndpoint& endpoint, IMainLoopHandler& handler);
     Result<RUdpServer*> AddRUdpServer(const RUdpEndpoint& endpoint,
-                                      MainLoopHandler& handler,
+                                      IMainLoopHandler& handler,
                                       RUdpServerOptions options);
     // 客户端**不随模块启动**：票据要等控制面发下来，业务拿到后（构造时给，或 SetTicket）自己调 Start()，
     // 每次断线都要新票据（不自动重连）。随 group 一起停。没给选项时用 NetModuleOptions 的 connection 与 rudp。
-    Result<RUdpClient*> AddRUdpClient(const RUdpEndpoint& server, MainLoopHandler& handler);
-    Result<RUdpClient*> AddRUdpClient(const RUdpEndpoint& server, MainLoopHandler& handler, RUdpClientOptions options);
+    Result<RUdpClient*> AddRUdpClient(const RUdpEndpoint& server, IMainLoopHandler& handler);
+    Result<RUdpClient*> AddRUdpClient(const RUdpEndpoint& server, IMainLoopHandler& handler, RUdpClientOptions options);
 
     // main 在 App::Run 返回之后调：group 优雅关闭（到 shutdown_deadline 强关），再把事件 Drain 到空。
     // 在主循环线程（调 Run 的线程）上调用。对没 Start 成功的、以及重复调用都是空操作。
@@ -132,8 +136,8 @@ private:
     // 仍运行时会同步停掉自己。
     MainLoopExecutor executor_;
     std::unique_ptr<EventLoopGroup> group_;
-    std::vector<std::unique_ptr<NetServer>> servers_;
-    std::vector<std::unique_ptr<NetClient>> clients_;
+    std::vector<std::unique_ptr<INetServer>> servers_;
+    std::vector<std::unique_ptr<INetClient>> clients_;
     std::vector<std::unique_ptr<RUdpClient>> rudp_clients_; // 不随模块启动，见 AddRUdpClient
 };
 

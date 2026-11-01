@@ -1,9 +1,9 @@
-#include "wait_group.h"
+#include "base/thread/wait_group.h"
 
 #include <cstdlib>
 
-#include "logger.h"
-#include "logger_macros.h"
+#include "base/logger/logger.h"
+#include "base/logger/logger_macros.h"
 
 namespace breeze
 {

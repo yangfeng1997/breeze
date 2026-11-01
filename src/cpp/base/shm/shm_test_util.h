@@ -12,7 +12,7 @@
 #include <cstring>
 #include <span>
 
-#include "shm_channel.h"
+#include "base/shm/shm_channel.h"
 
 #define CHECK(cond)                                                                                                    \
     do                                                                                                                 \

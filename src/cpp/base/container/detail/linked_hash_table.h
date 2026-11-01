@@ -25,7 +25,7 @@
 #include <type_traits>
 #include <utility>
 
-#include "hash_common.h"
+#include "base/container/detail/hash_common.h"
 
 namespace breeze::container_internal
 {

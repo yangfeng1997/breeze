@@ -9,7 +9,7 @@
 #include <chrono>
 #include <cstdint>
 
-#include "connection_handler.h"
+#include "base/net/connection/connection_handler_interface.h"
 
 namespace breeze
 {

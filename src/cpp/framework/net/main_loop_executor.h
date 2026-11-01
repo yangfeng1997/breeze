@@ -1,7 +1,7 @@
 // 把 IO 线程上的连接事件回投到 App 主循环，保持"主循环单线程、业务无锁"。设计见 docs/网络库设计.md §5。
 //
-//   IO 线程 N ──ConnectionHandler──▶ 事件入该线程专属的 SpscQueue ──App::Notify──▶ 主循环 Drain
-//   后回调业务（MainLoopHandler）
+//   IO 线程 N ──IConnectionHandler──▶ 事件入该线程专属的 SpscQueue ──App::Notify──▶ 主循环 Drain
+//   后回调业务（IMainLoopHandler）
 //
 // - 事件队列每个 IO 线程一条（按连接句柄里的 group / loop 定位）；Connected → Message* → Closed 走同一条，不分两道，
 //   所以 Closed 不会超车。Enqueue 无界、不阻塞。
@@ -10,7 +10,7 @@
 //   （最多 64KB），所以实际在途量最多超出上限一次 read。
 // - 主循环线程 = 调 Drain 的线程，必须固定（队列是 SPSC，Debug 会断言）。
 //
-// 生命周期：Wrap 出来的 ConnectionHandler 归本对象所有；本对象必须比 EventLoopGroup::Shutdown 活得久（Shutdown
+// 生命周期：Wrap 出来的 IConnectionHandler 归本对象所有；本对象必须比 EventLoopGroup::Shutdown 活得久（Shutdown
 // 之后不再有 IO 线程 往队列里写）。析构时未消费的事件直接丢弃，不回调业务。
 
 #pragma once
@@ -24,11 +24,11 @@
 #include <span>
 #include <vector>
 
-#include "app.h"
-#include "connection_handle.h"
-#include "connection_handler.h"
-#include "main_loop_handler.h"
-#include "spsc_queue.h"
+#include "base/net/connection/connection_handle.h"
+#include "base/net/connection/connection_handler_interface.h"
+#include "base/queue/spsc_queue.h"
+#include "framework/app/app.h"
+#include "framework/net/main_loop_handler_interface.h"
 
 namespace breeze
 {
@@ -63,7 +63,7 @@ public:
     const InboundLimits& limits() const noexcept { return limits_; }
 
     // 交给 StreamServer / StreamClient 构造。同一个 handler 重复 Wrap 会得到不同的适配器，行为相同。
-    ConnectionHandler& Wrap(MainLoopHandler& handler);
+    IConnectionHandler& Wrap(IMainLoopHandler& handler);
 
     // 在主循环线程上分发至多 limit 个事件；返回 true = 可能仍有积压（分发了 limit 个），false = 已空。
     // 各队列轮转着取，一条队列的积压不会饿死别的。
@@ -82,12 +82,12 @@ private:
     static constexpr std::size_t kBatch = 64;
 
     // ---- IO 线程 ----
-    void OnConnected(Connection& c, MainLoopHandler& h);
-    void OnMessage(Connection& c, std::span<const std::byte> payload, MainLoopHandler& h);
-    void OnClosed(Connection& c, CloseReason reason, int sys_errno, MainLoopHandler& h);
+    void OnConnected(IConnection& c, IMainLoopHandler& h);
+    void OnMessage(IConnection& c, std::span<const std::byte> payload, IMainLoopHandler& h);
+    void OnClosed(IConnection& c, CloseReason reason, int sys_errno, IMainLoopHandler& h);
     void Push(ConnectionHandle h, Event&& ev);
     Queue& QueueFor(ConnectionHandle h);
-    void MaybePause(Connection& c, const std::shared_ptr<ConnState>& st);
+    void MaybePause(IConnection& c, const std::shared_ptr<ConnState>& st);
 
     // ---- 主循环线程 ----
     void Dispatch(Event& ev);

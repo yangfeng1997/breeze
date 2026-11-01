@@ -2,7 +2,7 @@
 // 超时、服务端晚起）、心跳、Close 之后不重连、换票据重来、Stop / Start 的各种时序、空闲、析构与停机。
 // 无测试框架依赖：失败即 abort；每个用例都带超时，卡死也会 abort。
 
-#include "rudp_client.h"
+#include "base/net/rudp/rudp_client.h"
 
 #include <atomic>
 #include <cstdio>
@@ -11,9 +11,9 @@
 #include <optional>
 #include <thread>
 
-#include "event_loop_group.h"
-#include "net_test_util.h"
-#include "rudp_test_util.h"
+#include "base/net/loop/event_loop_group.h"
+#include "base/net/testing/net_test_util.h"
+#include "base/net/testing/rudp_test_util.h"
 
 using namespace breeze;
 using namespace breeze::testing;

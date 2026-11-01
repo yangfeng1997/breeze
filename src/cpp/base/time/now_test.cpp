@@ -1,7 +1,7 @@
 // Now：帧缓存、实时、GM 偏移与冻结、单调时钟、业务时区、并发读写。
 // 全局状态，用例之间要自己还原（Reset）。第一个用例必须是"没调过 Update 的时候"。无测试框架依赖：失败即 abort。
 
-#include "now.h"
+#include "base/time/now.h"
 
 #include <atomic>
 #include <chrono>
@@ -11,7 +11,7 @@
 #include <thread>
 #include <vector>
 
-#include "time_util.h"
+#include "base/time/time_util.h"
 
 using namespace breeze;
 using namespace std::chrono_literals;

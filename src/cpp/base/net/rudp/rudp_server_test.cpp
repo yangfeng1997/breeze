@@ -3,7 +3,7 @@
 // 畸形包、心跳、Close、空闲、Stop、析构、统计。
 // 无测试框架依赖：失败即 abort；每个用例都带超时，卡死也会 abort。
 
-#include "rudp_server.h"
+#include "base/net/rudp/rudp_server.h"
 
 #include <atomic>
 #include <cstdio>
@@ -13,10 +13,10 @@
 #include <set>
 #include <thread>
 
-#include "event_loop_group.h"
-#include "group_access.h"
-#include "net_test_util.h"
-#include "rudp_test_util.h"
+#include "base/net/loop/event_loop_group.h"
+#include "base/net/loop/group_access.h"
+#include "base/net/testing/net_test_util.h"
+#include "base/net/testing/rudp_test_util.h"
 
 using namespace breeze;
 using namespace breeze::testing;
@@ -665,7 +665,7 @@ void TestManySessions()
 void TestInFlightSessionsAreOnlyUpdatedWhenDue()
 {
     Fixture f;
-    f.rec.on_connected = [](Connection& c) { CHECK(c.Send(std::as_bytes(std::span("hi", 2))) == SendResult::Ok); };
+    f.rec.on_connected = [](IConnection& c) { CHECK(c.Send(std::as_bytes(std::span("hi", 2))) == SendResult::Ok); };
     constexpr int kN = 40;
     std::vector<std::unique_ptr<RawUdp>> raws;
     for (int i = 0; i < kN; ++i)
@@ -699,7 +699,7 @@ void TestInFlightSessionsAreOnlyUpdatedWhenDue()
 void TestSendWhileInFlightIsFlushedPromptly()
 {
     Fixture f;
-    f.rec.on_connected = [](Connection& c) { CHECK(c.Send(std::as_bytes(std::span("first", 5))) == SendResult::Ok); };
+    f.rec.on_connected = [](IConnection& c) { CHECK(c.Send(std::as_bytes(std::span("first", 5))) == SendResult::Ok); };
     RawUdp raw;
     const RUdpTicket t = f.Ticket();
     SendHello(raw, f.ep(), t);
@@ -802,7 +802,7 @@ void TestAcceptPrecedesDataSentFromOnConnected()
     RUdpServerOptions o;
     o.rudp.flush_on_send = true;
     Fixture f(std::move(o));
-    f.rec.on_connected = [](Connection& c) { CHECK(c.Send(std::as_bytes(std::span("hello", 5))) == SendResult::Ok); };
+    f.rec.on_connected = [](IConnection& c) { CHECK(c.Send(std::as_bytes(std::span("hello", 5))) == SendResult::Ok); };
     RawUdp raw;
     const RUdpTicket t = f.Ticket();
     SendHello(raw, f.ep(), t);
@@ -856,7 +856,7 @@ void TestSessionsSurviveSwapRemove()
 void TestTickIntervalDrivesLatency()
 {
     Fixture f;
-    f.rec.on_message = [](Connection& c, std::string_view sv) { Echo(c, sv); };
+    f.rec.on_message = [](IConnection& c, std::string_view sv) { Echo(c, sv); };
     RawUdp raw;
     const RUdpTicket t = f.Ticket();
     KcpPeer peer(raw, f.ep(), t.conv);
@@ -901,7 +901,7 @@ void TestIdleSessionsDoNotSpinTheLoop()
 void TestSessionGoesQuietAfterActivity()
 {
     Fixture f;
-    f.rec.on_message = [](Connection& c, std::string_view sv) { Echo(c, sv); };
+    f.rec.on_message = [](IConnection& c, std::string_view sv) { Echo(c, sv); };
     RawUdp raw;
     const RUdpTicket t = f.Ticket();
     KcpPeer peer(raw, f.ep(), t.conv);
@@ -941,8 +941,8 @@ void TestDataIsAckedPromptly()
 void TestSessionsClosedWhileTickingLeaveTheRestWorking()
 {
     Fixture f;
-    f.rec.on_connected = [](Connection& c) { CHECK(c.Send(std::as_bytes(std::span("hi", 2))) == SendResult::Ok); };
-    f.rec.on_message = [](Connection& c, std::string_view sv) { Echo(c, sv); };
+    f.rec.on_connected = [](IConnection& c) { CHECK(c.Send(std::as_bytes(std::span("hi", 2))) == SendResult::Ok); };
+    f.rec.on_message = [](IConnection& c, std::string_view sv) { Echo(c, sv); };
     constexpr int kN = 6;
     std::vector<std::unique_ptr<RawUdp>> raws;
     std::vector<std::unique_ptr<KcpPeer>> peers;
@@ -979,7 +979,7 @@ void TestDataPathAndOversizeFromPeer()
     RUdpServerOptions o;
     o.rudp.max_message_size = 1000;
     Fixture f(std::move(o));
-    f.rec.on_message = [](Connection& c, std::string_view sv) { Echo(c, sv); };
+    f.rec.on_message = [](IConnection& c, std::string_view sv) { Echo(c, sv); };
     RawUdp raw;
     const RUdpTicket t = f.Ticket();
     KcpPeer peer(raw, f.ep(), t.conv);

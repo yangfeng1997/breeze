@@ -1,20 +1,21 @@
-#include "stream_client.h"
+#include "base/net/stream/stream_client.h"
 
 #include <cerrno>
 #include <chrono>
 #include <thread>
 
-#include "connector.h"
-#include "group_access.h"
-#include "logger.h"
-#include "logger_macros.h"
+#include "base/logger/logger.h"
+#include "base/logger/logger_macros.h"
+#include "base/net/loop/group_access.h"
+#include "base/net/stream/internal/connector.h"
 
 namespace breeze
 {
 
 struct StreamClient::Impl
 {
-    Impl(EventLoopGroup& g, StreamClientOptions o, ReconnectPolicy p, ConnectionHandler& h, const FrameCodecFactory& f)
+    Impl(
+        EventLoopGroup& g, StreamClientOptions o, ReconnectPolicy p, IConnectionHandler& h, const IFrameCodecFactory& f)
         : group(g)
         , options(std::move(o))
         , policy(p)
@@ -26,8 +27,8 @@ struct StreamClient::Impl
     EventLoopGroup& group;
     StreamClientOptions options; // 第一次 Start 时整个移进 Connector
     ReconnectPolicy policy;
-    ConnectionHandler& handler;
-    const FrameCodecFactory& factory;
+    IConnectionHandler& handler;
+    const IFrameCodecFactory& factory;
 
     EventLoop* loop = nullptr; // 第一次 Start 时选定，此后固定
     std::unique_ptr<Connector> connector;
@@ -38,8 +39,8 @@ StreamClient::StreamClient(EventLoopGroup& group,
                            const Endpoint& endpoint,
                            StreamClientOptions options,
                            ReconnectPolicy policy,
-                           ConnectionHandler& handler,
-                           const FrameCodecFactory& factory)
+                           IConnectionHandler& handler,
+                           const IFrameCodecFactory& factory)
     : endpoint_(endpoint)
     , impl_(std::make_unique<Impl>(group, std::move(options), policy, handler, factory))
 {

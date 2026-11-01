@@ -4,7 +4,7 @@
 //   raw    裸 epoll echo：性能上限，没有任何抽象
 //   raw-iov  诊断用：同 raw，但系统调用形状与 breeze 相同（readv 2 个 iovec + sendmsg 2 个 iovec）
 //   muduo  muduo 的 TcpServer echo（只支持 TCP）
-//   breeze 本库的 ConnectionHandler 直接回调（LoopServer + LengthPrefixCodec），echo 用视图版 Send，不拷贝（与 muduo
+//   breeze 本库的 IConnectionHandler 直接回调（LoopServer + LengthPrefixCodec），echo 用视图版 Send，不拷贝（与 muduo
 //   同一方案） breeze-copy  同 breeze，但 echo 先拷成 SharedBuffer 再发（旧写法，留作参照） breeze-fixed  诊断用：同
 //   breeze，但回复预先建好的固定 payload（不分配、不拷贝），用来把框架开销与 echo 里的拷贝分开
 //   breeze-mainloop  本库 + framework/net（§9 第 4 组）：真实的 App::Run 主循环 + NetModule（1 个 IO 线程），IO
@@ -68,20 +68,20 @@
 #include <thread>
 #include <vector>
 
-#include "app.h"
-#include "connection.h"
-#include "event_loop_group.h"
-#include "event_loop_thread.h"
-#include "group_access.h"
-#include "kcp_session.h"
-#include "length_prefix_codec.h"
-#include "loop_server.h"
-#include "net_module.h"
-#include "rudp_protocol.h"
-#include "rudp_server.h"
-#include "socket.h"
-#include "socket_address.h"
-#include "tcp_socket.h"
+#include "base/net/codec/length_prefix_codec.h"
+#include "base/net/connection/connection_interface.h"
+#include "base/net/loop/event_loop_group.h"
+#include "base/net/loop/event_loop_thread.h"
+#include "base/net/loop/group_access.h"
+#include "base/net/rudp/internal/kcp_session.h"
+#include "base/net/rudp/rudp_protocol.h"
+#include "base/net/rudp/rudp_server.h"
+#include "base/net/socket/socket_address.h"
+#include "base/net/stream/internal/loop_server.h"
+#include "base/net/stream/internal/stream_socket.h"
+#include "base/net/tcp/tcp_socket.h"
+#include "framework/app/app.h"
+#include "framework/net/net_module.h"
 
 #ifdef BREEZE_BENCH_MUDUO
 #include <muduo/base/Logging.h>
@@ -209,7 +209,7 @@ public:
 //   iov    读用 readv（2 个 iovec）、写用 sendmsg（把回包从第 4 字节处切成 2 个 iovec，等同"帧头 + payload"）——与
 //   breeze 同形状的系统调用 rdhup  epoll 注册带 EPOLLRDHUP（breeze 有） cold   每连接一个 2KB 读缓冲，readv
 //   读进它、回包从它发出（breeze 的每连接 Buffer）；否则所有连接共用一块 64KB ptr    epoll 的 data
-//   存指向每连接对象的指针，而不是 fd（breeze 存 Pollable*）
+//   存指向每连接对象的指针，而不是 fd（breeze 存 IPollable*）
 struct RawOptions
 {
     bool iov = false;
@@ -372,17 +372,17 @@ private:
 
 // 本库：LoopServer + LengthPrefixCodec，回调里用视图版 Send 把 payload 直接从读缓冲写回——不分配、不拷贝，
 // 与 muduo 的 echo（send(Buffer*) 直接交换数据）是同一方案。
-class BenchHandler final : public ConnectionHandler
+class BenchHandler final : public IConnectionHandler
 {
 public:
-    void OnMessage(Connection& c, std::span<const std::byte> payload) noexcept override { (void)c.Send(payload); }
+    void OnMessage(IConnection& c, std::span<const std::byte> payload) noexcept override { (void)c.Send(payload); }
 };
 
 // 旧写法留作参照（breeze-copy）：先拷成 SharedBuffer 再发，每条消息多一次分配与拷贝。
-class CopyEchoHandler final : public ConnectionHandler
+class CopyEchoHandler final : public IConnectionHandler
 {
 public:
-    void OnMessage(Connection& c, std::span<const std::byte> payload) noexcept override
+    void OnMessage(IConnection& c, std::span<const std::byte> payload) noexcept override
     {
         (void)c.Send(SharedBuffer::CopyFrom(payload));
     }
@@ -391,7 +391,7 @@ public:
 // 诊断变体：回复一块预先建好的固定 payload（压测客户端每次发的内容都相同），不分配、不拷贝。
 // 与 breeze 的差就是 echo 里"把收到的 payload 拷成 SharedBuffer"的成本；与 raw
 // 的差才是框架本身（分帧、事件分发、帧头）。
-class FixedReplyHandler final : public ConnectionHandler
+class FixedReplyHandler final : public IConnectionHandler
 {
 public:
     explicit FixedReplyHandler(std::size_t size)
@@ -400,7 +400,7 @@ public:
         for (std::size_t i = 0; i < size; ++i)
             reply_.MutableBytes()[i] = static_cast<std::byte>('a' + i % 26);
     }
-    void OnMessage(Connection& c, std::span<const std::byte>) noexcept override { (void)c.Send(reply_); }
+    void OnMessage(IConnection& c, std::span<const std::byte>) noexcept override { (void)c.Send(reply_); }
 
 private:
     SharedBuffer reply_;
@@ -409,7 +409,7 @@ private:
 class BreezeServer final : public EchoServer
 {
 public:
-    explicit BreezeServer(std::unique_ptr<ConnectionHandler> handler)
+    explicit BreezeServer(std::unique_ptr<IConnectionHandler> handler)
         : handler_(std::move(handler))
     {
     }
@@ -429,7 +429,7 @@ public:
     std::uint64_t Iterations() override { return lt_.loop.Iterations(); }
 
 private:
-    std::unique_ptr<ConnectionHandler> handler_;
+    std::unique_ptr<IConnectionHandler> handler_;
     EventLoopThread lt_{EventLoopOptions{EventLoopOptions::kNoGroup, 0, g_table_slots}}; // 连接表要装得下全部连接
     std::unique_ptr<LengthPrefixCodecFactory> factory_;
     std::unique_ptr<LoopServer> srv_;
@@ -440,7 +440,7 @@ private:
 // 线程拷出来、主循环线程直接发回，不再拷）。比 breeze 多出的就是 MainLoopExecutor 的代价。
 class MainLoopServer final : public EchoServer
 {
-    class EchoBiz final : public MainLoopHandler
+    class EchoBiz final : public IMainLoopHandler
     {
     public:
         void OnMessage(ConnectionHandle h, SharedBuffer msg) override { (void)h.Send(std::move(msg)); }
@@ -501,7 +501,7 @@ class MainLoopServer final : public EchoServer
         LengthPrefixCodecFactory factory_{1024 * 1024};
         std::promise<Endpoint>& ready_;
         RUdpServer*& rudp_out_;
-        NetServer* server_ = nullptr;
+        INetServer* server_ = nullptr;
     };
 
 public:
@@ -724,10 +724,10 @@ private:
 };
 
 // 本库 rudp：1 个 IO 线程的 EventLoopGroup + RUdpServer，回调里用视图版 Send 回显（与 breeze 的 TCP 同一个写法）。
-class RUdpEchoHandler final : public ConnectionHandler
+class RUdpEchoHandler final : public IConnectionHandler
 {
 public:
-    void OnMessage(Connection& c, std::span<const std::byte> payload) noexcept override { (void)c.Send(payload); }
+    void OnMessage(IConnection& c, std::span<const std::byte> payload) noexcept override { (void)c.Send(payload); }
 };
 
 class RUdpBenchServer final : public EchoServer

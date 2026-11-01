@@ -1,11 +1,11 @@
-#include "message_stats.h"
+#include "base/metrics/message_stats.h"
 
 #include <algorithm>
 #include <format>
 #include <tuple>
 #include <utility>
 
-#include "logger_macros.h"
+#include "base/logger/logger_macros.h"
 
 namespace breeze
 {

@@ -1,8 +1,8 @@
-#include "config_module.h"
+#include "framework/kernel/config_module.h"
 
 #include <format>
 
-#include "logger_macros.h"
+#include "base/logger/logger_macros.h"
 
 namespace breeze
 {

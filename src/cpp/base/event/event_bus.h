@@ -35,7 +35,7 @@
 #include <utility>
 #include <vector>
 
-#include "assert_macros.h"
+#include "base/assert/assert_macros.h"
 
 namespace breeze
 {

@@ -1,7 +1,7 @@
 // NonCopyable：派生类不可拷贝也不可移动、可默认构造、不增加大小；基类不能单独实例化；可移动的类型不要继承它。
 // 全是编译期断言（失败就编译不过），运行时什么也不做。
 
-#include "noncopyable.h"
+#include "base/noncopyable/noncopyable.h"
 
 #include <cstdio>
 #include <type_traits>

@@ -14,10 +14,10 @@
 #include <string_view>
 #include <vector>
 
-#include "args_parser.h"
-#include "config.h"
-#include "config/common_config.h"
-#include "module.h"
+#include "base/args/args_parser.h"
+#include "base/config/config.h"
+#include "framework/app/module.h"
+#include "gen/config/common_config.h"
 
 namespace breeze
 {

@@ -1,7 +1,7 @@
 // App 的装配：构造/析构、RegisterModule、Build 与 depsSort。
 // 生命周期见 lifecycle.cpp，主循环见 loop.cpp。
 
-#include "app.h"
+#include "framework/app/app.h"
 
 #include <algorithm>
 #include <format>
@@ -9,7 +9,7 @@
 #include <ranges>
 #include <stdexcept>
 
-#include "logger_macros.h"
+#include "base/logger/logger_macros.h"
 
 namespace breeze
 {

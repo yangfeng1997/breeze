@@ -11,12 +11,12 @@
 #include <thread>
 #include <vector>
 
-#include "event_loop_group.h"
-#include "group_access.h"
-#include "length_prefix_codec.h"
-#include "loop_server.h"
-#include "net_test_util.h"
-#include "stream_server.h"
+#include "base/net/codec/length_prefix_codec.h"
+#include "base/net/loop/event_loop_group.h"
+#include "base/net/loop/group_access.h"
+#include "base/net/stream/internal/loop_server.h"
+#include "base/net/stream/stream_server.h"
+#include "base/net/testing/net_test_util.h"
 
 using namespace breeze;
 using namespace breeze::testing;
@@ -58,7 +58,7 @@ void TestPauseHoldsBackDeliveryUntilResume()
 {
     const LeakCheck leak;
     Fixture f;
-    f.rec.on_message = [](Connection& c, std::string_view s)
+    f.rec.on_message = [](IConnection& c, std::string_view s)
     {
         if (s == "pause-me")
             c.PauseRead();
@@ -93,7 +93,7 @@ void TestPauseResumeKeepsOrder()
     Fixture f;
     constexpr int kN = 3000;
     std::atomic<int> seen{0};
-    f.rec.on_message = [&](Connection& c, std::string_view)
+    f.rec.on_message = [&](IConnection& c, std::string_view)
     {
         if (seen.fetch_add(1) % 100 == 99)
             c.PauseRead();
@@ -125,7 +125,7 @@ void TestPausedConnectionStillClosesOnReset()
 {
     const LeakCheck leak;
     Fixture f;
-    f.rec.on_message = [](Connection& c, std::string_view) { c.PauseRead(); };
+    f.rec.on_message = [](IConnection& c, std::string_view) { c.PauseRead(); };
     TestClient c(f.server.endpoint());
     c.SendFrame("x");
     CHECK(WaitUntil([&] { return f.Paused() == 1; }));
@@ -142,7 +142,7 @@ void TestPausedConnectionNoticesFinOnResume()
 {
     const LeakCheck leak;
     Fixture f;
-    f.rec.on_message = [](Connection& c, std::string_view) { c.PauseRead(); };
+    f.rec.on_message = [](IConnection& c, std::string_view) { c.PauseRead(); };
     TestClient c(f.server.endpoint());
     const ConnectionHandle h = f.rec.WaitConnected(0);
     c.SendFrame("x");
@@ -180,7 +180,7 @@ void TestGracefulFlushesThenWaitsForPeer()
     const LeakCheck leak;
     Fixture f;
     constexpr std::size_t kBig = 3 * 1024 * 1024; // 远超内核缓冲：一部分必然在写队列里
-    f.rec.on_message = [&](Connection& c, std::string_view)
+    f.rec.on_message = [&](IConnection& c, std::string_view)
     {
         SharedBuffer b = SharedBuffer::Create(kBig);
         std::memset(b.MutableBytes().data(), 'g', kBig);
@@ -211,7 +211,7 @@ void TestGracefulForceClosesOnTimeout()
 {
     const LeakCheck leak;
     Fixture f;
-    f.rec.on_message = [](Connection& c, std::string_view)
+    f.rec.on_message = [](IConnection& c, std::string_view)
     {
         CHECK(c.Send(Buf("bye")) == SendResult::Ok);
         c.CloseGracefully(300ms);
@@ -252,7 +252,7 @@ void TestGracefulStillDeliversPeerMessages()
 {
     const LeakCheck leak;
     Fixture f;
-    f.rec.on_message = [](Connection& c, std::string_view s)
+    f.rec.on_message = [](IConnection& c, std::string_view s)
     {
         if (s == "go")
             c.CloseGracefully(5s);
@@ -292,7 +292,7 @@ void TestGracefulResumesReadingToDeliverPeerMessages()
 {
     const LeakCheck leak;
     Fixture f;
-    f.rec.on_message = [](Connection& c, std::string_view s)
+    f.rec.on_message = [](IConnection& c, std::string_view s)
     {
         if (s == "pause")
             c.PauseRead();
@@ -407,9 +407,9 @@ void TestPausedConnectionIsNotIdleKilled()
     const LeakCheck leak;
     FakeLoop fl;
     EventRecorder rec;
-    Connection* conn = nullptr;
-    rec.on_connected = [&](Connection& c) { conn = &c; };
-    rec.on_message = [](Connection& c, std::string_view) { c.PauseRead(); };
+    IConnection* conn = nullptr;
+    rec.on_connected = [&](IConnection& c) { conn = &c; };
+    rec.on_message = [](IConnection& c, std::string_view) { c.PauseRead(); };
     LengthPrefixCodecFactory factory;
     ConnectionOptions co;
     co.idle_timeout = 2000ms;
@@ -488,9 +488,9 @@ void TestContextLivesUntilAfterOnClosed()
     Fixture f;
     std::atomic<bool> destroyed{false};
     std::atomic<int> seen_in_closed{-1};
-    f.rec.on_connected = [&](Connection& c) { c.SetContext(std::make_unique<Ctx>(destroyed)); };
-    f.rec.on_message = [](Connection& c, std::string_view) { c.GetContext<Ctx>()->n++; };
-    f.rec.on_closed = [&](Connection& c, CloseReason)
+    f.rec.on_connected = [&](IConnection& c) { c.SetContext(std::make_unique<Ctx>(destroyed)); };
+    f.rec.on_message = [](IConnection& c, std::string_view) { c.GetContext<Ctx>()->n++; };
+    f.rec.on_closed = [&](IConnection& c, CloseReason)
     {
         CHECK(!destroyed.load()); // OnClosed 时上下文还在
         seen_in_closed = c.GetContext<Ctx>()->n;

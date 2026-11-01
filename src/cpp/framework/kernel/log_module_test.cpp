@@ -1,6 +1,6 @@
 // 无测试框架依赖：失败即 abort。日志写在 /tmp 下。
 
-#include "log_module.h"
+#include "framework/kernel/log_module.h"
 
 #include <unistd.h>
 
@@ -13,8 +13,8 @@
 #include <sstream>
 #include <string>
 
-#include "app.h"
-#include "logger_macros.h"
+#include "base/logger/logger_macros.h"
+#include "framework/app/app.h"
 
 using namespace breeze;
 namespace fs = std::filesystem;

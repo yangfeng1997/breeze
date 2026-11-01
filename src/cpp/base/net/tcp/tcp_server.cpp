@@ -1,4 +1,4 @@
-#include "tcp_server.h"
+#include "base/net/tcp/tcp_server.h"
 
 #include <utility>
 
@@ -23,8 +23,8 @@ StreamServerOptions ToStreamOptions(TcpServerOptions&& o)
 TcpServer::TcpServer(EventLoopGroup& group,
                      const TcpEndpoint& endpoint,
                      TcpServerOptions options,
-                     ConnectionHandler& handler,
-                     const FrameCodecFactory& factory)
+                     IConnectionHandler& handler,
+                     const IFrameCodecFactory& factory)
     : StreamServer(group, endpoint.endpoint(), ToStreamOptions(std::move(options)), handler, factory)
 {
 }

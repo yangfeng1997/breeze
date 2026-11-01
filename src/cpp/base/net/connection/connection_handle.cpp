@@ -1,13 +1,13 @@
-#include "connection_handle.h"
+#include "base/net/connection/connection_handle.h"
 
 #include <algorithm>
 #include <cstdio>
 #include <limits>
 
-#include "connection_handler.h"
-#include "event_loop.h"
-#include "group_access.h"
-#include "group_registry.h"
+#include "base/net/connection/connection_handler_interface.h"
+#include "base/net/loop/event_loop.h"
+#include "base/net/loop/group_access.h"
+#include "base/net/loop/group_registry.h"
 
 namespace breeze
 {

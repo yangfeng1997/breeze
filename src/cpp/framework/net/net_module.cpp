@@ -1,12 +1,12 @@
-#include "net_module.h"
+#include "framework/net/net_module.h"
 
 #include <cerrno>
 #include <cstring>
 #include <format>
 #include <optional>
 
-#include "config_module.h"
-#include "logger_macros.h"
+#include "base/logger/logger_macros.h"
+#include "framework/kernel/config_module.h"
 
 namespace breeze
 {
@@ -80,9 +80,9 @@ Result<> NetModule::CheckPhase(std::string_view what) const
     return {};
 }
 
-Result<NetServer*> NetModule::AddServer(std::string_view endpoint,
-                                        MainLoopHandler& handler,
-                                        const FrameCodecFactory& factory)
+Result<INetServer*> NetModule::AddServer(std::string_view endpoint,
+                                         IMainLoopHandler& handler,
+                                         const IFrameCodecFactory& factory)
 {
     StreamServerOptions so;
     so.connection = options_.connection;
@@ -90,10 +90,10 @@ Result<NetServer*> NetModule::AddServer(std::string_view endpoint,
     return AddServer(endpoint, handler, factory, std::move(so));
 }
 
-Result<NetServer*> NetModule::AddServer(std::string_view endpoint,
-                                        MainLoopHandler& handler,
-                                        const FrameCodecFactory& factory,
-                                        StreamServerOptions options)
+Result<INetServer*> NetModule::AddServer(std::string_view endpoint,
+                                         IMainLoopHandler& handler,
+                                         const IFrameCodecFactory& factory,
+                                         StreamServerOptions options)
 {
     if (auto r = CheckPhase("AddServer"); !r)
         return std::unexpected(r.error());
@@ -113,13 +113,13 @@ Result<NetServer*> NetModule::AddServer(std::string_view endpoint,
         auto s = AddRUdpServer(*udp, handler, std::move(o));
         if (!s)
             return std::unexpected(s.error());
-        return static_cast<NetServer*>(*s); // factory 与 options.tcp / backlog 对 rudp 没有意义，丢掉
+        return static_cast<INetServer*>(*s); // factory 与 options.tcp / backlog 对 rudp 没有意义，丢掉
     }
     const auto tcp = TcpEndpoint::From(*ep);
     const auto uds = tcp ? std::optional<UdsEndpoint>{} : UdsEndpoint::From(*ep);
     if (!tcp && !uds) // Endpoint 新增了种类而这里没跟上：明确报错，不要去解引用空的 optional
         return Fail(Errc::Module, std::format("net: 监听端点 '{}' 的传输种类还没有对应的服务端", endpoint));
-    ConnectionHandler& wrapped = executor_.Wrap(handler);
+    IConnectionHandler& wrapped = executor_.Wrap(handler);
     if (tcp)
     {
         TcpServerOptions o;
@@ -141,9 +141,9 @@ Result<NetServer*> NetModule::AddServer(std::string_view endpoint,
     return servers_.back().get();
 }
 
-Result<NetClient*> NetModule::AddClient(std::string_view endpoint,
-                                        MainLoopHandler& handler,
-                                        const FrameCodecFactory& factory)
+Result<INetClient*> NetModule::AddClient(std::string_view endpoint,
+                                         IMainLoopHandler& handler,
+                                         const IFrameCodecFactory& factory)
 {
     StreamClientOptions co;
     co.connection = options_.connection;
@@ -151,11 +151,11 @@ Result<NetClient*> NetModule::AddClient(std::string_view endpoint,
     return AddClient(endpoint, handler, factory, std::move(co), ReconnectPolicy{});
 }
 
-Result<NetClient*> NetModule::AddClient(std::string_view endpoint,
-                                        MainLoopHandler& handler,
-                                        const FrameCodecFactory& factory,
-                                        StreamClientOptions options,
-                                        ReconnectPolicy policy)
+Result<INetClient*> NetModule::AddClient(std::string_view endpoint,
+                                         IMainLoopHandler& handler,
+                                         const IFrameCodecFactory& factory,
+                                         StreamClientOptions options,
+                                         ReconnectPolicy policy)
 {
     if (auto r = CheckPhase("AddClient"); !r)
         return std::unexpected(r.error());
@@ -174,7 +174,7 @@ Result<NetClient*> NetModule::AddClient(std::string_view endpoint,
     const auto uds = tcp ? std::optional<UdsEndpoint>{} : UdsEndpoint::From(*ep);
     if (!tcp && !uds)
         return Fail(Errc::Module, std::format("net: 对端端点 '{}' 的传输种类还没有对应的客户端", endpoint));
-    ConnectionHandler& wrapped = executor_.Wrap(handler);
+    IConnectionHandler& wrapped = executor_.Wrap(handler);
     if (tcp)
     {
         TcpClientOptions o;
@@ -196,7 +196,7 @@ Result<NetClient*> NetModule::AddClient(std::string_view endpoint,
     return clients_.back().get();
 }
 
-Result<RUdpServer*> NetModule::AddRUdpServer(const RUdpEndpoint& endpoint, MainLoopHandler& handler)
+Result<RUdpServer*> NetModule::AddRUdpServer(const RUdpEndpoint& endpoint, IMainLoopHandler& handler)
 {
     RUdpServerOptions o;
     o.connection = options_.connection;
@@ -205,7 +205,7 @@ Result<RUdpServer*> NetModule::AddRUdpServer(const RUdpEndpoint& endpoint, MainL
 }
 
 Result<RUdpServer*> NetModule::AddRUdpServer(const RUdpEndpoint& endpoint,
-                                             MainLoopHandler& handler,
+                                             IMainLoopHandler& handler,
                                              RUdpServerOptions options)
 {
     if (auto r = CheckPhase("AddRUdpServer"); !r)
@@ -213,14 +213,14 @@ Result<RUdpServer*> NetModule::AddRUdpServer(const RUdpEndpoint& endpoint,
     if (!options.rudp.Valid())
         return Fail(Errc::Module,
                     std::format("net: rudp 服务端 {} 的传输参数不合法（见 RUdpOptions::Valid）", endpoint.ToString()));
-    ConnectionHandler& wrapped = executor_.Wrap(handler);
+    IConnectionHandler& wrapped = executor_.Wrap(handler);
     auto server = std::make_unique<RUdpServer>(*group_, endpoint, std::move(options), wrapped);
     RUdpServer* raw = server.get();
     servers_.push_back(std::move(server));
     return raw;
 }
 
-Result<RUdpClient*> NetModule::AddRUdpClient(const RUdpEndpoint& server, MainLoopHandler& handler)
+Result<RUdpClient*> NetModule::AddRUdpClient(const RUdpEndpoint& server, IMainLoopHandler& handler)
 {
     RUdpClientOptions o;
     o.connection = options_.connection;
@@ -229,7 +229,7 @@ Result<RUdpClient*> NetModule::AddRUdpClient(const RUdpEndpoint& server, MainLoo
 }
 
 Result<RUdpClient*> NetModule::AddRUdpClient(const RUdpEndpoint& server,
-                                             MainLoopHandler& handler,
+                                             IMainLoopHandler& handler,
                                              RUdpClientOptions options)
 {
     if (auto r = CheckPhase("AddRUdpClient"); !r)
@@ -237,7 +237,7 @@ Result<RUdpClient*> NetModule::AddRUdpClient(const RUdpEndpoint& server,
     if (!options.rudp.Valid())
         return Fail(Errc::Module,
                     std::format("net: rudp 客户端 {} 的传输参数不合法（见 RUdpOptions::Valid）", server.ToString()));
-    ConnectionHandler& wrapped = executor_.Wrap(handler);
+    IConnectionHandler& wrapped = executor_.Wrap(handler);
     auto client = std::make_unique<RUdpClient>(*group_, server, std::move(options), wrapped);
     RUdpClient* raw = client.get();
     rudp_clients_.push_back(std::move(client));

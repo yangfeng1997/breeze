@@ -1,4 +1,4 @@
-#include "shm_channel.h"
+#include "base/shm/shm_channel.h"
 
 #include <unistd.h>
 
@@ -7,7 +7,7 @@
 #include <new>
 #include <utility>
 
-#include "shm_memfd.h"
+#include "base/shm/shm_memfd.h"
 
 namespace breeze::shm
 {

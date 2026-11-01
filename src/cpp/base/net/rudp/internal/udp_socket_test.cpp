@@ -2,7 +2,7 @@
 // ICMP 错误上报、Close 与端口释放、套接字缓冲、字节统计。
 // loop 由测试线程自己 RunOnce 驱动，单线程、结果可复现。无测试框架依赖：失败即 abort。
 
-#include "udp_socket.h"
+#include "base/net/rudp/internal/udp_socket.h"
 
 #include <sys/socket.h>
 
@@ -11,9 +11,9 @@
 #include <cstdlib>
 #include <mutex>
 
-#include "internal/core/event_loop.h"
-#include "rudp_test_util.h"
-#include "socket_address.h"
+#include "base/net/loop/event_loop.h"
+#include "base/net/socket/socket_address.h"
+#include "base/net/testing/rudp_test_util.h"
 
 using namespace breeze;
 using namespace breeze::testing;
@@ -21,7 +21,7 @@ using namespace breeze::testing;
 namespace
 {
 
-class Recorder final : public DatagramHandler
+class Recorder final : public IDatagramHandler
 {
 public:
     struct Got

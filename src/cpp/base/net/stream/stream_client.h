@@ -18,17 +18,17 @@
 #include <functional>
 #include <memory>
 
-#include "connection_handle.h"
-#include "connection_handler.h"
-#include "connection_options.h"
-#include "endpoint.h"
-#include "event_loop_group.h"
-#include "frame_codec.h"
-#include "net_client.h"
-#include "reconnect_policy.h"
-#include "send_result.h"
-#include "shared_buffer.h"
-#include "tcp_options.h"
+#include "base/buffer/shared_buffer.h"
+#include "base/net/codec/frame_codec_interface.h"
+#include "base/net/connection/connection_handle.h"
+#include "base/net/connection/connection_handler_interface.h"
+#include "base/net/connection/connection_options.h"
+#include "base/net/connection/net_client_interface.h"
+#include "base/net/connection/send_result.h"
+#include "base/net/endpoint/endpoint.h"
+#include "base/net/loop/event_loop_group.h"
+#include "base/net/stream/reconnect_policy.h"
+#include "base/net/tcp/tcp_options.h"
 
 namespace breeze
 {
@@ -42,15 +42,15 @@ struct StreamClientOptions
     ConnectFailedCallback on_connect_failed; // 空 = 不通知（仍会记日志）
 };
 
-class StreamClient : public NetClient
+class StreamClient : public INetClient
 {
 public:
     StreamClient(EventLoopGroup& group,
                  const Endpoint& endpoint,
                  StreamClientOptions options,
                  ReconnectPolicy policy,
-                 ConnectionHandler& handler,
-                 const FrameCodecFactory& factory);
+                 IConnectionHandler& handler,
+                 const IFrameCodecFactory& factory);
     ~StreamClient() override; // TcpClient / UdsClient 经基类指针销毁
 
     StreamClient(const StreamClient&) = delete;

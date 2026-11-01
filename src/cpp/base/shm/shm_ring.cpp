@@ -1,4 +1,4 @@
-#include "shm_ring.h"
+#include "base/shm/shm_ring.h"
 
 #include <unistd.h>
 
@@ -6,7 +6,7 @@
 #include <cerrno>
 #include <cstring>
 
-#include "now.h"
+#include "base/time/now.h"
 
 namespace breeze::shm
 {

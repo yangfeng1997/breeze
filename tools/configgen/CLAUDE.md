@@ -37,7 +37,7 @@ python3 tools/configgen/configgen.py --schema-dir config/schema --check     # �
 
 | 路径 | 内容 |
 |---|---|
-| `src/cpp/gen/config/` | C++ 头文件，`#include "config/<proto 文件名>_config.h"` |
+| `src/cpp/gen/config/` | C++ 头文件，`#include "gen/config/<proto 文件名>_config.h"`（从 `src/cpp` 起算） |
 | `src/go/gen/config/` | Go 源文件，import 路径 `project/gen/config` |
 | `build/jsonschema/` | JSON Schema，给编辑器的 yaml 补全 |
 

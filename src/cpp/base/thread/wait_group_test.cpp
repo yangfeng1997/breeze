@@ -1,14 +1,14 @@
 // WaitGroup：基本等待、动态 Add、复用、带超时的等待、多个等待者、等完立刻销毁，以及 Done 多于 Add 即 FATAL。
 
-#include "wait_group.h"
+#include "base/thread/wait_group.h"
 
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <vector>
 
-#include "thread.h"
-#include "thread_test_util.h"
+#include "base/thread/thread.h"
+#include "base/thread/thread_test_util.h"
 
 using namespace breeze;
 using namespace breeze::testing;

@@ -1,4 +1,4 @@
-// rudp 会话：Connection 接口的实现，KCP 之上的一条可靠有序的消息通道。设计见 docs/网络库设计.md §4.14。
+// rudp 会话：IConnection 接口的实现，KCP 之上的一条可靠有序的消息通道。设计见 docs/网络库设计.md §4.14。
 //
 // 没有自己的 fd：服务端所有会话共用一个 UDP socket，由服务端按来源地址把数据报分给会话；客户端的 socket 归客户端。
 // 所以 OnEvents 不会被调用。会话不自己起定时器：拥有者（服务端 / 客户端）每个 interval 调一次 Tick。
@@ -9,7 +9,7 @@
 // Tick 没到点就直接返回（仍在表里）；有待发的确认 / 排队的数据 / 新来的 Input、Send 才下一拍就推进。
 // 往返时间长（几十毫秒以上）时，每条消息的在途时间里会话都在活跃表里，这一步才省得下东西。
 //
-// 与 StreamConnection 的语义差异（都写在 Connection 接口的注释之外，因为是 rudp 特有的）：
+// 与 StreamConnection 的语义差异（都写在 IConnection 接口的注释之外，因为是 rudp 特有的）：
 // - 消息自带边界，没有 codec；单条消息上限是 RUdpOptions::max_message_size，
 //   超限的 Send 与 TCP 的 codec 超限一样关连接。
 // - PauseRead：停止向 handler 交付，消息留在 KCP 的接收队列里，队列占满接收窗口后对端自然被拖慢（真背压，不丢）。
@@ -34,21 +34,21 @@
 #include <deque>
 #include <memory>
 
-#include "connection.h"
-#include "connection_options.h"
-#include "internal/core/connection_table.h"
-#include "kcp_session.h"
-#include "peer_info.h"
-#include "rudp_options.h"
-#include "rudp_protocol.h"
-#include "udp_socket.h"
+#include "base/net/connection/connection_interface.h"
+#include "base/net/connection/connection_options.h"
+#include "base/net/endpoint/peer_info.h"
+#include "base/net/loop/connection_table.h"
+#include "base/net/rudp/internal/kcp_session.h"
+#include "base/net/rudp/internal/udp_socket.h"
+#include "base/net/rudp/rudp_options.h"
+#include "base/net/rudp/rudp_protocol.h"
 
 namespace breeze
 {
 
 class EventLoop;
 
-class RUdpConnection final : public Connection
+class RUdpConnection final : public IConnection
 {
 public:
     // 会话的拥有者（服务端 / 客户端）。
@@ -75,7 +75,7 @@ public:
                                   socklen_t peer_len,
                                   std::uint32_t conv,
                                   PeerInfo peer,
-                                  ConnectionHandler& handler,
+                                  IConnectionHandler& handler,
                                   Owner& owner,
                                   const ConnectionOptions& conn_options,
                                   const RUdpOptions& rudp_options);
@@ -135,7 +135,7 @@ private:
                    std::uint32_t conv,
                    std::unique_ptr<KcpSession> kcp,
                    PeerInfo peer,
-                   ConnectionHandler& handler,
+                   IConnectionHandler& handler,
                    Owner& owner,
                    const ConnectionOptions& conn_options,
                    const RUdpOptions& rudp_options,
@@ -166,7 +166,7 @@ private:
 
     EventLoop& loop_;
     UdpSocket& socket_;
-    ConnectionHandler& handler_;
+    IConnectionHandler& handler_;
     Owner& owner_;
     std::unique_ptr<KcpSession> kcp_;
     ConnectionTable::Slot& slot_;

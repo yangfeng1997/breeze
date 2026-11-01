@@ -2,7 +2,7 @@
 // 两个会话用内存里的"线"连起来，时钟由测试推进（Update / Input 都传 now），不睡觉、不开 socket，结果可复现。
 // 无测试框架依赖：失败即 abort。
 
-#include "kcp_session.h"
+#include "base/net/rudp/internal/kcp_session.h"
 
 #include <algorithm>
 #include <cstdio>

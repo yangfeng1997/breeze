@@ -13,8 +13,8 @@
 
 #pragma once
 
-#include "config.h"
-#include "logger.h"
+#include "base/config/config.h"
+#include "base/logger/logger.h"
 
 namespace breeze
 {

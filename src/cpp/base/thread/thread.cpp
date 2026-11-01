@@ -1,13 +1,13 @@
-#include "thread.h"
+#include "base/thread/thread.h"
 
 #include <sched.h>
 
 #include <cerrno>
 #include <memory>
 
-#include "current_thread.h"
-#include "logger.h"
-#include "logger_macros.h"
+#include "base/logger/logger.h"
+#include "base/logger/logger_macros.h"
+#include "base/thread/current_thread.h"
 
 namespace breeze
 {

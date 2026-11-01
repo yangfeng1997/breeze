@@ -5,12 +5,12 @@
 #include <cstddef>
 #include <memory>
 
-#include "frame_codec.h"
+#include "base/net/codec/frame_codec_interface.h"
 
 namespace breeze
 {
 
-class LengthPrefixCodec final : public FrameCodec
+class LengthPrefixCodec final : public IFrameCodec
 {
 public:
     static constexpr std::size_t kHeaderSize = 4;
@@ -27,7 +27,7 @@ private:
     std::size_t max_frame_;
 };
 
-class LengthPrefixCodecFactory final : public FrameCodecFactory
+class LengthPrefixCodecFactory final : public IFrameCodecFactory
 {
 public:
     explicit LengthPrefixCodecFactory(std::size_t max_frame = LengthPrefixCodec::kDefaultMaxFrame)
@@ -35,7 +35,7 @@ public:
     {
     }
 
-    std::unique_ptr<FrameCodec> Create() const override { return std::make_unique<LengthPrefixCodec>(max_frame_); }
+    std::unique_ptr<IFrameCodec> Create() const override { return std::make_unique<LengthPrefixCodec>(max_frame_); }
 
 private:
     std::size_t max_frame_;

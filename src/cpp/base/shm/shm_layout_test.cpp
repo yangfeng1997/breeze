@@ -9,11 +9,11 @@
 #include <cstdio>
 #include <cstring>
 
-#include "shm_defs.h"
-#include "shm_fd.h"
-#include "shm_memfd.h"
-#include "shm_mirror_map.h"
-#include "shm_test_util.h"
+#include "base/shm/shm_defs.h"
+#include "base/shm/shm_fd.h"
+#include "base/shm/shm_memfd.h"
+#include "base/shm/shm_mirror_map.h"
+#include "base/shm/shm_test_util.h"
 
 using namespace breeze::shm;
 using breeze::shm::testing::Arm;

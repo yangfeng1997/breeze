@@ -6,8 +6,8 @@
 #include <string>
 #include <vector>
 
-#include "buffer.h"
-#include "length_prefix_codec.h"
+#include "base/buffer/buffer.h"
+#include "base/net/codec/length_prefix_codec.h"
 
 using namespace breeze;
 
@@ -41,7 +41,7 @@ Bytes Frame(LengthPrefixCodec& codec, const std::string& payload)
 }
 
 // 把缓冲里能解的帧都解出来；返回最后一次 Decode 的结果（NeedMore 或 Error）。
-DecodeResult Drain(FrameCodec& codec, Buffer& buf, std::vector<std::string>& frames)
+DecodeResult Drain(IFrameCodec& codec, Buffer& buf, std::vector<std::string>& frames)
 {
     for (;;)
     {

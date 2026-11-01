@@ -6,9 +6,9 @@
 
 #include <chrono>
 
-#include "stream_client.h"
-#include "tcp_endpoint.h"
-#include "tcp_options.h"
+#include "base/net/stream/stream_client.h"
+#include "base/net/tcp/tcp_endpoint.h"
+#include "base/net/tcp/tcp_options.h"
 
 namespace breeze
 {
@@ -29,8 +29,8 @@ public:
               const TcpEndpoint& peer,
               TcpClientOptions options,
               ReconnectPolicy policy,
-              ConnectionHandler& handler,
-              const FrameCodecFactory& factory);
+              IConnectionHandler& handler,
+              const IFrameCodecFactory& factory);
 
     // 对端地址（构造时给的）。
     TcpEndpoint peer() const;

@@ -15,8 +15,8 @@
 #include <memory>
 #include <string_view>
 
-#include "logger.h"
-#include "module.h"
+#include "base/logger/logger.h"
+#include "framework/app/module.h"
 
 namespace breeze
 {

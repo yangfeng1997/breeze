@@ -1,7 +1,7 @@
 // Singleton / ThreadLocalSingleton：全进程只构造一次（并发首次访问）、线程局部各一份、退出时析构。
 // 无测试框架依赖：失败即 abort。
 
-#include "singleton.h"
+#include "base/singleton/singleton.h"
 
 #include <sys/wait.h>
 #include <unistd.h>

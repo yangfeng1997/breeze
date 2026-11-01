@@ -4,7 +4,7 @@
 // 无测试框架依赖：失败即 abort。
 
 #define BREEZE_ASSERT_FATAL 0
-#include "event_bus.h"
+#include "base/event/event_bus.h"
 
 #include <fcntl.h>
 #include <unistd.h>

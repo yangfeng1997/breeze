@@ -1,5 +1,7 @@
 // EventLoopGroup：选项校验、注册表用满、线程创建失败后的回滚（无线程 / fd 泄漏）、PickLoop、Shutdown 语义。
 
+#include "base/net/loop/event_loop_group.h"
+
 #include <sys/resource.h>
 #include <unistd.h>
 
@@ -14,10 +16,9 @@
 #include <thread>
 #include <vector>
 
-#include "event_loop_group.h"
-#include "group_access.h"
-#include "group_registry.h"
-#include "net_test_util.h"
+#include "base/net/loop/group_access.h"
+#include "base/net/loop/group_registry.h"
+#include "base/net/testing/net_test_util.h"
 
 using namespace breeze;
 using namespace breeze::testing;

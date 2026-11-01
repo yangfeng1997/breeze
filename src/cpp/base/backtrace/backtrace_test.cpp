@@ -1,7 +1,7 @@
 // Backtrace：行格式、skip 与 max_depth、demangle、模块偏移。
 // 符号名要求本可执行文件带 -rdynamic（CMake 里 ENABLE_EXPORTS），且被探测的函数是外部链接。
 
-#include "backtrace.h"
+#include "base/backtrace/backtrace.h"
 
 #include <cstdio>
 #include <cstdlib>
