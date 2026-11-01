@@ -726,6 +726,16 @@ fd 槽位越界写同样只有 asan 能抓；其余存活的是冗余防线（�
   `kFullHintWindow` 是常量（2 ms），没有测量依据：太长会把 Agent 刚腾出的空间白白让掉，太短等于没提示。**超过单条上限（`tx_too_large`）仍返回 `Ok` 只计数**，是调用方的编程错误而不是流量问题，没有为它加一档；要加的话和 `Full` 一样，值加在 `SendResult` 上、实现在 `ShmConnection::Write`。
 - **`ShmConnection` 没有空闲检测与写队列水位**：写环是同步的，不排队；Agent 一侧发给慢 App 的消息环满就丢（`rx_full`），不会像 TCP 那样把慢消费者关掉。
 - **仅 UDS 的数据通道的帧格式**要 Agent 与 App 两端一致（`IFrameCodecFactory`），握手里不协商；配错了表现为连上就协议错误。
+- **不支持经 TCP 连 Agent**：`AddAgentClient` 的端点必须是 `unix://` / `unix-abstract://`（`NetModule::AddAgentClient` 与 `AgentClient::Start` 各查一次，Agent 一侧的 `ShmChannelServer` 也只收 UDS 端点）。
+  这是有意的边界，不是遗漏；没有具体场景驱动之前不做。原因：
+  - **认人靠 `SO_PEERCRED`**：Agent 用内核担保的 uid 做准入，保留着的队列只还给同一个 uid（`Hello` 里的 pid 只是自称）。TCP 上没有对应物，谁能连上端口谁就能自称任意 busid、冒充别人收消息、伪造信封的 `src`；
+    要补就得加认证（令牌 / 签名 / TLS），库里目前都没有。
+  - **跨机之后 Sidecar 的价值基本没了**：共享内存、保留与 Reattach 都用不上，剩下一条普通 TCP 连接加 Agent 的路由。只要传输的话 `AddClient("tcp://…")` 已经有；缺的是 Agent 一侧"这条连接是谁"的登记，也就是上面的认证问题。
+  - **威胁模型会变**：§7 假设对端在本机、信任边界是 uid；TCP 监听把 Agent 变成网络服务，要重新考虑暴露面、握手限速与恶意握手。
+  - **多机部署已经有办法**：一台机器一个 Agent，App 连本机 Agent，Agent 之间经 TCP 链路转发（`NetModule::AddIoServer` / `AddIoClient`，端点是 `tcp://` 或 `unix://`）。"有的机器没法部署 Agent"更干净的做法是那台机器也起一个 Agent。
+  - **值得做的场景**：App 与 Agent 无法同机（容器间没法共享 UDS 卷、开发机连远端 Agent 联调、Agent 铺开之前先让 App 接入）。
+    **最小方案**：TCP 只允许仅 UDS 语义（`kShmRequired` 配 TCP 报错）；`AgentServer` 加可选的 TCP 监听，握手沿用 `Hello` / `Reply`（定长，仅 UDS 时不带 fd），完成后接进现有的 `StreamConnection` 数据通道，busid 唯一性、配额、路由不动；
+    `Hello` 加令牌或签名字段（握手版本要升）；保留与 Reattach 在 TCP 上不存在，文档写清；测试要有 asan 下的恶意握手用例。主要成本在认证方案，不在代码量。
 - **是否需要自旋**：App 主循环默认不自旋；专用轮询线程（Agent 的 IO 线程）值不值得自旋、自旋多长，要靠基准决定。
 - **保留时长的默认值**：暂定 30 秒（Tbuspp2 的 `mq_space_hb_expire` 默认也是 30 秒，笔记里写的）；受 §8 的容量限制。
 - **过期（§4，方案 B 已定）**：每批 `Commit` 读一次时钟的开销要单独量（目标是摊到整批后可忽略）；取批内首条 `TryReserve` 的时刻作为整批的入队时刻，是否过于保守要看实测；握手校验单调时钟差的阈值（1 秒）；`remaining_ms` 是 u32，上限约 49.7 天，超过的由 RPC 层拒绝；信封的字段布局由仓库外定，要和它的维护者对一遍。
