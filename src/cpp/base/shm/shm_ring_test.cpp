@@ -384,6 +384,7 @@ void TestWakeProtocol()
     CHECK(DrainEventFd(efd) == 0);
     for (std::uint64_t i = 1; i <= 3; ++i)
         ExpectOne(c, 40, i);
+    CHECK(ctl.consumer_stats.empty_wakeups.Get() == 0); // 醒来之后有活干：不是空唤醒
 
     // 睡前回头一看，已经有数据：不能睡，标志被清回去，也不用敲 eventfd。
     ProduceOne(p, 40, 4);
@@ -397,6 +398,11 @@ void TestWakeProtocol()
     c.WokeUp();
     CHECK(ctl.consumer_stats.spurious_wakeups.Get() == 1);
     CHECK(ctl.consumer_sleeping.load() == 0);
+    {
+        RecordView v;
+        CHECK(c.Peek(v) == PeekStatus::kEmpty);
+        CHECK(ctl.consumer_stats.empty_wakeups.Get() == 0); // eventfd 本来就是空的：记 spurious，不记 empty
+    }
 
     // 批量 Commit 只敲一次。
     CHECK(c.PrepareToSleep());
@@ -409,6 +415,28 @@ void TestWakeProtocol()
     p.Commit();
     CHECK(ctl.producer_stats.wakeups_sent.Get() == 2);
     CHECK(DrainEventFd(efd) == 1);
+    for (std::uint64_t i = 0; i < 5; ++i)
+        ExpectOne(c, 40, 10 + i);
+
+    // 旧计数：睡前把标志置 1，生产者敲了 eventfd，但消费者没经过 WokeUp 就把记录收走了（睡前回头一看那条路）。
+    // 之后 epoll 因旧计数立刻返回：WokeUp 读到计数，第一次 Peek 是空的，记一次空唤醒；再 Peek 不重复计；随后可以真的睡，eventfd 已读清。
+    CHECK(c.PrepareToSleep());
+    ProduceOne(p, 40, 20);
+    CHECK(ctl.producer_stats.wakeups_sent.Get() == 3);
+    ExpectOne(c, 40, 20);
+    CHECK(ctl.consumer_stats.empty_wakeups.Get() == 0);
+    c.WokeUp();
+    CHECK(ctl.consumer_stats.wakeups_received.Get() == 2);
+    {
+        RecordView v;
+        CHECK(c.Peek(v) == PeekStatus::kEmpty);
+        CHECK(ctl.consumer_stats.empty_wakeups.Get() == 1);
+        CHECK(c.Peek(v) == PeekStatus::kEmpty);
+        CHECK(ctl.consumer_stats.empty_wakeups.Get() == 1);
+    }
+    CHECK(ctl.consumer_stats.spurious_wakeups.Get() == 1);
+    CHECK(c.PrepareToSleep());
+    CHECK(DrainEventFd(efd) == 0);
 }
 
 // 双线程压力：生产者随机停顿，消费者按"搬空 → 自旋一小段 → PrepareToSleep → poll 等 eventfd"的协议工作。

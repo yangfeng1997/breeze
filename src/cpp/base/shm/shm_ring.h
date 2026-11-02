@@ -145,6 +145,8 @@ private:
     std::uint64_t cur_size_ = 0; // 最近一次 Peek 的记录占用；0 表示没有可 Pop 的
     std::uint32_t cur_len_ = 0;
     bool corrupt_ = false;
+    // WokeUp 读到计数之后、第一次 Peek 之前为真：这次 Peek 是空的就记一次 empty_wakeups。只有消费者线程碰，不在共享内存里。
+    bool wake_pending_ = false;
 };
 
 } // namespace breeze::shm

@@ -83,6 +83,9 @@ struct ConsumerStats
     Counter wakeups_received; // 醒来时 eventfd 里确实有计数
     Counter spurious_wakeups; // 醒来时 eventfd 是空的
     Counter inflight_skipped; // 接手时跳过的"处理到一半"的记录数（设计文档 §6.5）
+    // 醒来时 eventfd 里有计数，但随后第一次 Peek 就是空的：计数是旧的（生产者在消费者睡前回头一看的窗口里敲了 eventfd，
+    // 记录却已经在那条路上被收走），白醒一次。追加在末尾：不挪动已有字段，旧版本的对端不会碰它（控制块是整页、初始为零）。
+    Counter empty_wakeups;
 };
 
 // 每条环一页控制块。每个字段独占缓存行，免得两个角色互相拖慢（伪共享）。

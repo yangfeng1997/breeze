@@ -746,3 +746,12 @@ if(BREEZE_BUILD_BENCH AND BREEZE_BUILD_NET)
   target_compile_definitions(net_bench PRIVATE BREEZE_BENCH_MUDUO=1)
   target_compile_options(net_bench PRIVATE -Wall -Wextra)
 endif()
+
+# Agent 与直连 UDS 的对比压测：-DBREEZE_BUILD_AGENT_BENCH=ON 才构建，默认关闭；不需要联网（与 net_bench 的 muduo 基线无关）。
+# 跑法见 bench/run_agent.sh。
+option(BREEZE_BUILD_AGENT_BENCH "构建 agent_bench（Agent 共享内存 / 仅 UDS 与直连 UDS 的对比压测）" OFF)
+if(BREEZE_BUILD_AGENT_BENCH AND BREEZE_BUILD_NET)
+  add_executable(agent_bench bench/agent_bench.cpp)
+  target_link_libraries(agent_bench PRIVATE breeze_net_agent breeze_net breeze_logger)
+  target_compile_options(agent_bench PRIVATE -Wall -Wextra)
+endif()

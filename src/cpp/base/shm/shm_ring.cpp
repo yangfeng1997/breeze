@@ -158,7 +158,14 @@ PeekStatus RingConsumer::Peek(RecordView& out) noexcept
         return PeekStatus::kCorrupt;
     }
     if (w == cursor_)
+    {
+        if (wake_pending_) // 醒来后第一次看就是空的：旧计数，白醒
+        {
+            wake_pending_ = false;
+            v_.control->consumer_stats.empty_wakeups.Add();
+        }
         return PeekStatus::kEmpty;
+    }
     // 不变式 cursor_ <= last_w_ <= w（倒退已在上面排除），所以 w - cursor_ 一定是正数，只需防占用超过容量。
     // w 没对齐、可用字节不足一整条记录时，下面 RecordSize(h.len) > avail 一定成立（记录至少 64 字节）。
     const std::uint64_t avail = w - cursor_;
@@ -184,6 +191,7 @@ PeekStatus RingConsumer::Peek(RecordView& out) noexcept
     out.cursor = cursor_;
     cur_size_ = RecordSize(h.len);
     cur_len_ = h.len;
+    wake_pending_ = false; // 这次醒来有活干
     return PeekStatus::kOk;
 }
 
@@ -280,7 +288,10 @@ void RingConsumer::WokeUp() noexcept
         n = ::read(v_.eventfd, &counter, sizeof(counter));
     } while (n < 0 && errno == EINTR);
     if (n == static_cast<ssize_t>(sizeof(counter)))
+    {
         c.consumer_stats.wakeups_received.Add();
+        wake_pending_ = true;
+    }
     else
         c.consumer_stats.spurious_wakeups.Add();
 }
