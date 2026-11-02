@@ -754,4 +754,12 @@ if(BREEZE_BUILD_AGENT_BENCH AND BREEZE_BUILD_NET)
   add_executable(agent_bench bench/agent_bench.cpp)
   target_link_libraries(agent_bench PRIVATE breeze_net_agent breeze_net breeze_logger)
   target_compile_options(agent_bench PRIVATE -Wall -Wextra)
+  # ring_bench：共享内存环与进程内无锁队列的对比（只依赖 base/shm 与 base/queue），跑法见 bench/run_ring.sh。
+  add_executable(ring_bench bench/ring_bench.cpp)
+  target_link_libraries(ring_bench PRIVATE breeze_shm breeze_queue Threads::Threads)
+  target_compile_options(ring_bench PRIVATE -Wall -Wextra)
+  # wake_bench：睡着的线程 / 进程被唤醒要多久（eventfd + epoll、eventfd、futex、条件变量），不依赖任何库，跑法见 bench/run_wake.sh。
+  add_executable(wake_bench bench/wake_bench.cpp)
+  target_link_libraries(wake_bench PRIVATE Threads::Threads)
+  target_compile_options(wake_bench PRIVATE -Wall -Wextra)
 endif()
