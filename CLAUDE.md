@@ -60,8 +60,9 @@
   用法与 schema 格式见 [tools/configgen/CLAUDE.md](tools/configgen/CLAUDE.md)。目前有 `common.proto`
   （cluster / etcd / redis / mongo，另引用 `net.proto` 的 `net` 段：网络库，字段全有生产默认值，段本身非 required）；
   生成器自带样例在 `tools/configgen/testdata/schema/`
-- `docs/` — 设计文档。服务间通信的基线是
-  [docs/Actor模型与RPC设计.md](docs/Actor模型与RPC设计.md)：实现 RPC 或 actor 层前先读它。
+- `docs/` — 设计文档。C++ 侧 actor 与线程模型的设计基线是
+  [docs/Actor与线程模型设计.md](docs/Actor与线程模型设计.md)：做 actor 层前先读它（**设计阶段，没有代码**：两种执行方式（主循环直接执行 / 有状态 actor；无状态并行用 actor 池加 `Offload`，**不设 worker 执行方式**）、`Dispatcher` 加两个执行器、网络消息与 RPC 的配合、进程间拓扑；已定与未决项见其 §0 / §19；**设计不受现有半成品代码约束**，沿用 / 改 / 重写见其 §15）。
+  [docs/Actor模型与RPC设计.md](docs/Actor模型与RPC设计.md) 是**实验性、偏 Go 的设计，仅供参考，不是事实源**。
   C++ 网络库（`base/queue` / `base/net` / `framework/net`）的设计基线是
   [docs/网络库设计.md](docs/网络库设计.md)：动网络库前先读它；
   Sidecar 的同机共享内存通道（`memfd` + 两条 SPSC 环 + `eventfd`；**`base/shm`、握手与传输协商、保留与 Reattach、控制消息、信封与 Agent 路由转发、`AgentClient`、`NetModule` 接入已实现，控制面、多 loop 的 Agent、`framework/app` 的自检线程尚未实现**）见
