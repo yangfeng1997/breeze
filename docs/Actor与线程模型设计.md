@@ -12,7 +12,7 @@ Agent、信封、共享内存通道见 [共享内存IPC设计.md](共享内存IP
 
 1. **两种执行方式**：主循环直接执行、有状态 actor（§3）。每种对应一个执行器：`MainLoopExecutor`、`ActorExecutor`。**无状态并行不单设执行方式**：用 actor 池（N 个固定键的 actor）加 `Offload`（§3）。原先设计过的第三种"无状态 worker"已取消（用户确认）。
 2. **网络入口注入一个 `Dispatcher`，各执行器向它注册**；IO 线程解出消息后直接分发给对应的执行器（§4）。**没有进程级的"模型"开关**：进程里有哪些模型，由 `main` 装配了哪些模块决定，进程只用一种模型是只装配一个的特例。
-3. **结构**：`MainLoopSystem`、`ActorSystem` 都是 Module，走 Module 生命周期，各自内部持有对应的执行器。`App` 持有 `Dispatcher`（成员，不是 Module）和两个系统的非拥有指针（没装配为空）。
+3. **结构**：`MainLoopSystem`、`ActorSystem` 都是 Module，走 Module 生命周期，各自内部持有对应的执行器。**主循环由 `App` 自动安装、永远存在**（用户选定），`ActorSystem` 按需装配。`App` 持有 `Dispatcher`（成员，不是 Module）；`mainLoop()` 是引用，`actors()` 是非拥有指针（没装配为空）。**新增执行模型 = 实现 `IExecutor`、做成实现 `IExecutorProvider` 的 Module**（用户确认，§4）。
 4. **一个 actor 类（kind）一个 Module，在 `Init` 里向 `ActorSystem` 注册；实例由 `ActorSystem` 管，不是 Module。** 多个 actor 模块都注册到同一个 `ActorSystem`。
 5. 房间服（休闲多人）与场景（MMO）是不同游戏类型的进程的需求，互不耦合；一个进程里可有多种 kind。
 6. **多线程用哈希分片就够了。** kind 的注册结构里预留可选的"分片组"名字，默认大家同一组，需要时给场景单独一组。
@@ -26,8 +26,12 @@ Agent、信封、共享内存通道见 [共享内存IPC设计.md](共享内存IP
 14. **App 层面的编排（停机阶段等）暂缓**，先由 `main` 手动调（§15、§19 第 1 项）。
 15. **命名**：发起端 `CallHandle`，应答端 `ReplyHandle`，应答方法 `Complete`；不叫 future / promise，因为它们不能阻塞取结果，也不挂续接（§8）。
 16. **链式调用**：B 的处理函数返回 `void`，应答经 `ReplyHandle` 晚点回；下游调用的默认超时取 `剩余 − 预留`；下游的框架错误映射成 `kUpstream`，业务错误原样透传（§8）。
+17. **Shard 入口按 kind 分车道**（`inbox[shard][kind]`，每条自带上限），**不让网络线程直接投进实例邮箱**，实例仍只归所属 Shard 线程（§7、§9）。
+18. **一个进程只有一个 `ActorSystem`**，里面可有多个 kind，一个 kind 可实现多个生成的服务接口；不支持同进程多个 `ActorSystem` 实例，隔离靠分片组（§5）。
+19. **IDL 生成统一的 RPC 接口，业务通过各执行模型的登记器（`IMethodRegistrar`）绑定**，不是每个模型各有一套登记 API（用户提出的方向，§8）。
+20. **客户端命令与服务间 RPC 要区分**（用户确认）；机制是 service 级的 `audience`，见 §8（**提议**）。
 
-**提议**（未确认，见 §19）：统一的 Shard 结构（§9）、`Locator` 接缝（§14）、`ActorContext` 不给 `App` / 模块引用（§5）、显式创建为默认（§6）、本地消息统一用字节（§10）、actor 池的分片函数与选择器（§3、§9）、`Correlation` 结构与回调契约（§8）、`Status` 的形状（§8）、未覆盖需求的清单（§16）等。
+**提议**（未确认，见 §19）：统一的 Shard 结构（§9）、`Locator` 接缝（§14）、`ActorContext` 不给 `App` / 模块引用（§5）、显式创建为默认（§6）、本地消息统一用字节（§10）、actor 池的分片函数与选择器（§3、§9）、`Correlation` 结构与回调契约（§8）、`Status` 的形状（§8）、`HandlerContext` 与 IDL 生成器的细节（`audience`、`msg_id`、登记器，§8）、未覆盖需求的清单（§16）等。
 
 ## 1. 需求
 
@@ -36,7 +40,7 @@ Agent、信封、共享内存通道见 [共享内存IPC设计.md](共享内存IP
 - **业务单线程是默认约定**（§10）：actor 内部的代码不应该加锁。多线程只在确有 CPU 压力时打开，且不改业务代码。
 - **玩家要从库里加载**，所以激活是异步的；加载期间到达的消息不能丢，也不能处理。
 - **同一个 actor 的消息严格串行**；同一连接发给同一个 actor 的消息保序。
-- **网络消息进来的路径要短**：IO 线程直接到目标执行器的入口队列，不多绕线程。
+- **网络消息进来的路径要短**：IO 线程直接到目标执行器的入口车道，不多绕线程。
 - **RPC 要和两种执行方式都配合**：应答必须回到发起调用的那个执行上下文里处理。
 - **停机要排空**：所有 actor 有机会存盘。
 
@@ -58,7 +62,7 @@ Agent、信封、共享内存通道见 [共享内存IPC设计.md](共享内存IP
    ▼
 Dispatcher（App 成员；登记表：消息号 → 执行器 + 处理函数；Start 前冻结）
    ├─ MainLoopExecutor（MainLoopSystem）：入主循环队列，主循环线程上直接执行
-   └─ ActorExecutor  （ActorSystem）   ：入目标分片的入口队列，在 actor 的回合里执行
+   └─ ActorExecutor  （ActorSystem）   ：入目标分片的入口车道，在 actor 的回合里执行
 RPC 应答：不查登记表，按 seq 回到发起方的执行上下文（§8）
 ```
 
@@ -91,8 +95,8 @@ RPC 应答：不查登记表，按 seq 回到发起方的执行上下文（§8�
 
 - **池 = 一个 kind，N 个固定键（`0..N-1`）的实例**，启动时显式创建（§6）。`ActorKind::pool_size` 大于 0 表示这是池 kind。成员是普通 actor：同一成员内串行，成员之间并行；处理函数不存状态靠约定，框架不强制（别家同样靠约定）。
 - **目标写 `Pool(kind)`**：调用方不选键，由**选择器**挑一个成员，等价于 `Actor(kind, 选出的键)`。网络消息的消息号登记给池 kind 时，`Dispatcher` 同样用选择器挑成员，不读信封的 `route_key`。
-- **选择器第一版是轮转**（原子计数，IO 线程、主循环、分片线程都能调）。以后要"最空闲优先"，读各分片入口队列的深度计数即可；但只看排队数看不见"正在跑的慢任务"（Akka.NET 的 `SmallestMailbox` 就只读 `NumberOfMessages`；Orleans 的 `StatelessWorker` 先找"没在执行"的成员，都忙才比等待数）。
-- **池只在 S1 起有并行收益**：S0 只有一个分片，池退化为串行。S1 起成员在各分片线程上，IO 线程直接投入分片入口队列，不绕主循环。池 kind 的分片函数见 §9。
+- **选择器第一版是轮转**（原子计数，IO 线程、主循环、分片线程都能调）。以后要"最空闲优先"，读各分片入口车道的深度计数即可；但只看排队数看不见"正在跑的慢任务"（Akka.NET 的 `SmallestMailbox` 就只读 `NumberOfMessages`；Orleans 的 `StatelessWorker` 先找"没在执行"的成员，都忙才比等待数）。
+- **池只在 S1 起有并行收益**：S0 只有一个分片，池退化为串行。S1 起成员在各分片线程上，IO 线程直接投入分片入口车道，不绕主循环。池 kind 的分片函数见 §9。
 - **慢任务和阻塞不要放进池**：成员占着分片线程，会拖住同片的别的 actor。重计算和阻塞走 `Offload`（共享队列，哪个线程空闲谁取，没有分片的队头阻塞）。
 
 **为什么取消**：读过的框架里，"无状态并行"都是普通 actor 加选择器，没有专门的 worker 执行方式。
@@ -127,15 +131,24 @@ silver-server 的先例值得保留两点：进程级默认执行器之外，**�
 - **登记者类型决定执行方式**：模块登记的处理函数走主循环；`ActorKind` 登记的走 actor（池 kind 也是 `ActorKind`）。调用方不传第三个参数，不会传错。
 - **允许显式指定执行器覆盖默认**（用于特殊消息）。
 - **同一个消息号不能被两边登记**，注册时报错，在 `Init` 阶段暴露。
+- **登记项带一个对 `Dispatcher` 不透明的字段（cookie）**，只有对应的执行器能解释：主循环不需要，actor 放 `KindId`，actor 池放选择器信息。`Dispatcher` 只负责"消息号到执行器"，不懂各模型自己的路由。
 - **`App` 在所有 `Init` 结束之后、`Start` 之前冻结 `Dispatcher`。** 冻结后只读，IO 线程无锁读；冻结之后再登记返回错误。不靠模块依赖顺序，所以不会出现"还有模块在登记、网络已经在收包"的窗口。
 - **没登记的消息号**：请求回"无处理者"的明确错误，单向消息计数并限频记日志；不静默丢，也不悄悄落到主循环。
 
 ### 接口草图（**不是定稿**）
 
 ```cpp
-class IExecutor {
+class IExecutor {                               // 新模型要实现的全部，见下面"新增一种执行模型"
 public:
-    virtual SubmitResult Submit(DispatchedMessage&&) noexcept = 0;  // 线程安全、非阻塞
+    // 请求 / 单向消息。线程安全、非阻塞。**不得在调用线程里、在 Submit 返回之前内联执行处理函数**，
+    // 即使目标恰好就在调用方所在的线程：否则调用方持锁、重入、栈深都会出问题。
+    // gRPC 的 EventEngine::Run 也是这条规矩（"Implementations must not execute the closure in the calling thread
+    // before Run returns"）。
+    virtual SubmitResult Submit(DispatchedMessage&&) noexcept = 0;
+    // 应答：投给 Correlation::ctx 所属的上下文，优先于请求，线程安全
+    virtual SubmitResult SubmitResponse(DispatchedResponse&&) noexcept = 0;
+    virtual CtxRange contexts() const = 0;      // 占用的 ctx 号区间：主循环 {0}，actor 每个 Shard 一个
+    virtual ExecutorStats stats() const = 0;    // 统一的指标出口（队列深度、排队延迟、各类拒绝计数）
 };
 
 class IExecutorProvider {                       // 能力接口，和 ITickable / IWaker 同一个机制
@@ -146,8 +159,8 @@ public:
 
 class Dispatcher {
 public:
-    ExecutorId AddExecutor(ExecutorKind, IExecutor&);       // Init 阶段（App 在 Build 后自动调）
-    Status On(MsgId, ExecutorId, Handler);                  // Init 阶段，重复登记报错
+    ExecutorId AddExecutor(ExecutorKind, IExecutor&);       // Init 阶段（App 在 Build 后自动调）；按 contexts() 分配 ctx 号空间
+    Status On(MsgId, ExecutorId, Handler, Cookie = {});     // Init 阶段，重复登记报错；Cookie 对 Dispatcher 不透明
     DispatchResult Dispatch(const Envelope&, SharedBuffer) noexcept;  // IO 线程调用，只读
     // Freeze 由 App 调
 };
@@ -155,34 +168,49 @@ public:
 class App {
 public:
     Dispatcher& dispatcher();
-    MainLoopSystem* mainLoop() const;   // 非拥有指针；没装配为 nullptr
-    ActorSystem*    actors()   const;
+    MainLoopSystem& mainLoop() const;   // 永远非空：App 自动安装
+    ActorSystem*    actors()   const;   // 非拥有指针；没装配为 nullptr
 };
 ```
 
 ### 指针怎么来
 
 - `App` 在 `Build` 阶段已经按能力接口筛选模块（`ITickable`、`IWaker`，裸指针由 `modules_` 拥有，`app.h` 的注释）。沿用同一个机制：两个系统都实现 `IExecutorProvider`，`Build` 时筛出来、登记进 `Dispatcher`。
-- 两个成员指针只是这个筛选结果的便捷访问。没装配的系统对应指针为空，`App` 不构造任何一个。
+- `mainLoop()` 是引用，因为主循环由 `App` 自动安装、永远存在；`actors()` 是指针，没装配时为空，`App` 不构造它。两者都只是筛选结果的便捷访问。
 - **代价**：`App` 的头文件要前向声明这两个类，将来加第三种执行器要改 `App`。如果要避免，可以只保留 `GetModule<T>` 加按种类取 `IExecutor*`。已选前者，因为这两种是框架核心概念，值得有一等入口。
 
-### `MainLoopSystem`
+### `MainLoopSystem`（**已定**：App 自动安装的内建 Module）
 
-- Module，内部是 `MainLoopExecutor`，实现 `IWaker`（`Wake` 就是 `Drain`）。名字与 `ActorSystem` 同构，也避免和 `App::RunLoop` 混淆。
-- **每个进程都要装。** 没装时，模块在 `Init` 里向它登记处理函数会得到明确的错误，不是静默失效。
-- `MainLoopExecutor` 从 `NetModule` 里搬出来（现在 `NetModule::Wake` 就是它的 `Drain`），`NetModule` 旧的 `AddServer(IMainLoopHandler)` 路径改为向 `MainLoopSystem` 要它。这是对现有代码的小重构，标成提议。
+- 它是 Module，内部是 `MainLoopExecutor`，实现 `IWaker`（`Wake` 就是 `Drain`）和 `IExecutorProvider`，所以在 `Dispatcher` 眼里和别的执行模型长得一样。名字与 `ActorSystem` 同构，也避免和 `App::RunLoop` 混淆。
+- **`App` 自动安装它，`main` 不用也不能漏装**：`Build` 时 `App` 在用户模块之前放进去，所有用户模块**隐式依赖它**，拓扑序里排在最前。`mainLoop()` 因此永远非空，模块在 `Init` 里向它登记不用判空，也不需要 `DependsOn("mainloop")`。备选是显式 `RegisterModule`，会有"忘了装"的失败；或做成 `App` 成员，生命周期上和别的模型不对称。
+- **析构顺序**：模块按拓扑逆序析构，它排在最前，所以最后才析构，寿命比所有用户模块都长；未消费的消息直接丢弃，不回调业务（和现在 `MainLoopExecutor` 的析构一致）。
+- **要先把网络专用的 `MainLoopExecutor` 拆成两半**（对现有代码的重构，**提议**）：
+  - **通用部分**放进这个 Module，不依赖 `base/net`：`Submit` / `SubmitResponse` / `Drain(budget)`、入口限额、统计，以及主循环这个上下文的 RPC 挂起表和 `TimerWheel`。队列用 MPSC，因为生产者不止 IO 线程：S1 的分片线程、`Offload` 的工作线程、Agent 适配器都会投。
+  - **网络适配器**留在 `framework/net`：`IConnectionHandler` → 解信封 → `Dispatcher::Dispatch`，每连接和全局的字节预算与 `PauseRead`（据 `Submit` 的入口结果）。`NetModule::Wake` 里调 `Drain` 的那段随之消失。
+- **定时器精度**：主循环上的 RPC 超时用 `TimerWheel`，沿用 `App` 的 tick 粒度（默认约 33 ms 一帧，`app_options.h`），"时间轮非空"要算进 `RunLoop` 的 `ticking` 条件；要更精确再改成 `wait_until(min(下次 tick, 时间轮最近到期))`（§19）。
+
+### 新增一种执行模型要做什么（**已定**：做成实现 `IExecutorProvider` 的 Module）
+
+1. **实现 `IExecutor`**：`Submit`（不得内联执行）、`SubmitResponse`、`contexts()`、`stats()`；自己的线程、队列和排空；线程用 `jthread` 并监听 `StopToken`（`~App` 的约束）；在文档里写明处理函数能不能阻塞、会不会拖住别的消息（gRPC `EventEngine` 的 README 也要求实现者说明回调会不会阻塞轮询）。
+2. **做成实现 `IExecutorProvider` 的 Module**：`Build` 时 `App` 把它登记进 `Dispatcher`（`AddExecutor`，同时按 `contexts()` 分配 ctx 号空间）。
+3. **提供这个模型的登记器**（实现 `IMethodRegistrar`，§8）：业务（IDL 生成的 `Register*`）通过它把消息号绑到这个模型；登记项可以带模型自己的不透明 cookie（actor：`KindId`）。
+4. 登记在 `Init`，`Start` 前冻结；之后消息按登记表**自动**派发，应答按 `Correlation::ctx` **自动**找到发起方所在的执行器。
+
+不会自动发生的事：没有任何消息号绑定过来，它收不到消息；一个消息号只能绑一个模型；不支持运行期热插拔；停机排空要它自己提供（App 层的停机阶段暂缓）。
+
+按这个办法，"多线程 worker 分片模型"这类将来的需求是**新增一个 `IExecutor`**，不动核心；现在的分片线程由 S1 的 `ActorExecutor` 提供。
 
 ### 网络入口
 
 - IO 线程上放一个适配器（实现 `IConnectionHandler`，和 `AgentRouter` 同一个位置）：解信封，调 `Dispatcher::Dispatch`。
 - `NetModule` 增加一个收 `app().dispatcher()` 的入口；`AddAgentClient` 增加一个在 IO 线程直接处理的重载（现在只收 `IMainLoopHandler`）。
 - 载荷在 IO 线程上拷成 `SharedBuffer`（回调里的视图只在回调内有效），这是一次拷贝。
-- **`Dispatch` 按信封类型分两路**：请求和单向消息查消息号表，得到执行器后 `Submit`；应答不查表，按 `seq` 里的上下文号送回发起方的执行器（§8）。
+- **`Dispatch` 按信封类型分两路**：请求和单向消息查消息号表，得到执行器后 `Submit`；应答不查表，按 `Correlation::ctx` 找到所属执行器、调它的 `SubmitResponse`（§8）。
 
 ### 装配
 
 ```cpp
-app.RegisterModule(MainLoopSystem);   // 每个进程都要
+// 主循环（MainLoopSystem）由 App 自动安装，不用写
 app.RegisterModule(NetModule);        // 入口收 app.dispatcher()
 app.RegisterModule(ActorSystem);      // 要 actor（含 actor 池）才装
 // 业务模块和 actor kind 在 Init 里登记处理函数
@@ -202,11 +230,12 @@ ActorSystem（Module）
  └─ 每个 Shard 一张本地表：(KindId, Key) → 实例
 ```
 
-- **kind 是静态的**：`PlayerModule` / `RoomModule` / `SceneModule` 各自 `DependsOn("actor")`，在 `Init` 里 `actors->Register(kind)`，它会替这个 kind 向 `Dispatcher` 登记它处理的消息号。`ActorSystem::Start` 冻结 kind 表。
+- **kind 是静态的**：`PlayerModule` / `RoomModule` / `SceneModule` 各自 `DependsOn("actor")`，在 `Init` 里 `actors->Register(kind)` 拿到这个 kind 的**登记器**（`IMethodRegistrar`），再调 IDL 生成的 `Register*Service(...)`，把服务的方法按消息号绑到这个 kind 上（§8）。`ActorSystem::Start` 冻结 kind 表。
 - **实例是动态的**：由 `ActorSystem` 按 kind 的工厂创建，只在所属 Shard 的线程里创建、运行、销毁。
 - **地址是 `(KindId, Key)`**，`Key` 是 64 位无符号整数（玩家 id、房间 id、场景 id）。业务代码里不出现节点号。
+- **一个进程只有一个 `ActorSystem`，里面可以有多个 kind**（已定）。一个 kind 可以实现多个生成的服务接口（对同一个 kind 的登记器多次调用 `Register*`，消息号全局唯一）；每个 kind 有自己的配置（分片组、tick、邮箱和车道上限、激活策略、`pool_size`）。**不支持同进程多个 `ActorSystem` 实例**：`App` 只有一个入口，要不同的线程配置就用分片组。别的项目：protoactor 的 `NewActorSystem()`、Akka.NET 的 `ActorSystem.Create(name, ...)` 允许创建多个（系统是普通对象，不是全局单例），Orleans 有在一个进程里起多个 silo 的测试宿主（`InProcTestCluster`），主要用于测试和多名字场景。将来要在一个进程里模拟多节点，应该起多个 `App`，不是多个 `ActorSystem`（`App` 是否被进程级单例挡住，没查）。
 - **注册时检查冲突**：kind 重名、消息号被两个登记者同时认领，在 `Init` 阶段返回带原因的错误。
-- **消息号决定 kind**（**提议**）：一个消息号只属于一个登记者，注册时登记"消息号 → 执行器"。游戏服按命令号派发是常见做法。备选是在信封里加显式的 kind 字段，见 §19。
+- **消息号决定 kind**（**提议**）：一个消息号只属于一个登记者，注册时登记"消息号 → 执行器"。游戏服按命令号派发是常见做法。有了 IDL，这个绑定在登记时由生成的 `Register*` 完成，不再手写消息号列表。备选是在信封里加显式的 kind 字段，见 §19。
 
 ### 接口草图（**不是定稿**）
 
@@ -214,30 +243,38 @@ ActorSystem（Module）
 struct ActorKind {
     KindId id;
     std::string_view name;
-    std::vector<MsgId> handles;
+    // 处理哪些消息号不在这里写：由 IDL 生成的 Register*Service 经登记器绑定（§8）
     std::move_only_function<std::unique_ptr<IActor>(Key)> create;
     std::chrono::milliseconds tick_interval{0}; // 0 = 不 tick（场景才设）
     std::string group = "default";              // 分片组，§9
     std::uint32_t pool_size = 0;                // >0：这是 actor 池，成员键 0..pool_size-1，§3
     ActivationPolicy activation = ActivationPolicy::kExplicit; // 提议默认显式创建
     MailboxLimits mailbox;                      // 每实例条数 / 字节上限
+    InboxLimits inbox;                          // 本 kind 在每个 Shard 上的入口车道上限，§7
 };
 
 class IActor {
 public:
     virtual ~IActor() = default;
     virtual void OnActivate(ActorContext&, ActivationHandle) = 0;   // 异步：加载完成后 handle.Complete(status)
-    virtual void OnMessage(ActorContext&, const ActorMessage&, ReplyHandle) = 0; // Oneway 时句柄为空，§8
+    // 业务消息不走 OnMessage：actor 类同时实现 IDL 生成的服务接口，方法签名统一为
+    //   void Login(HandlerContext&, const LoginReq&, ReplyHandle<LoginRsp>);   // Oneway 时句柄为空，§8
+    // 需要 actor 特有的能力（self()、定时器、Fail）时，用 OnActivate 里保存下来的 ActorContext。
     virtual void OnTick(ActorContext&, Clock::time_point now, std::chrono::milliseconds dt) {}
     virtual void OnDeactivate(ActorContext&, DeactivationReason, DeactivationHandle) = 0; // 异步：存盘
 };
 
-class ActorContext {                            // 提议：只有这些能力，不给 App / 模块引用
+class HandlerContext {                          // 所有执行模型都提供；IDL 生成的方法只依赖它（§8）
 public:
-    Key self() const;
-    void Send(KindId, Key, MsgId, SharedBuffer);            // 位置透明，异步
+    const RequestInfo& request() const;                     // src、trace_id、剩余时间；客户端来源时有 client_role
+    void Send(Target, MsgId, SharedBuffer);                 // 位置透明，异步
     CallHandle Call(Target, MsgId, SharedBuffer, Timeout, ReplyFn); // §8；返回值只用于 Cancel，可以忽略
     bool Cancel(CallHandle);                                // 只能在发起方的上下文里调，§8
+};
+
+class ActorContext : public HandlerContext {    // 提议：只有这些能力，不给 App / 模块引用
+public:
+    Key self() const;
     TimerId SetTimer(std::chrono::milliseconds, std::move_only_function<void()>);
     void CancelTimer(TimerId);
     void PostToMain(std::move_only_function<void()>);       // 要用主循环模块（数据库等）时，结果再以消息回来
@@ -268,14 +305,16 @@ Activating ──成功──▶ Active ──回收 / 停机 / Fail──▶ De
 
 ### `Deliver` / `Submit` 只返回入口级结果
 
-`kOk / kNoSuchKind / kShardFull / kShuttingDown`。"这个实例不存在、邮箱满了、处理失败"是在 Shard 线程上才知道的，所以是**异步的响应或计数**，不是返回值。
+`kOk / kNoSuchKind / kLaneFull / kShuttingDown`。"这个实例不存在、邮箱满了、处理失败"是在 Shard 线程上才知道的，所以是**异步的响应或计数**，不是返回值。
 
 ### 背压：两层限额
 
-1. **Shard 入口队列的总上限**（生产者一侧，原子计数）：超限时 `Submit` 返回 `kShardFull`，适配器据此对来源连接 `PauseRead`（沿用 `MainLoopExecutor` 的入口背压思路），不阻塞 IO 线程。
-2. **每个实例的邮箱上限**（消费者一侧，在 Shard 线程上从入口队列取出、放进实例邮箱时检查）：超限的请求回"邮箱满"，单向消息丢并计数。**邮箱必须有界，入队必须有结果，不悄悄丢**——只有 Orleans 在配置后明确拒绝并通知发送方，skynet 只告警，protoactor 丢最旧。
+1. **每条入口车道的上限**（生产者一侧，原子计数）：每个 Shard 对每个 kind 各有一条入口车道（§9），每条自带上限。超限时 `Submit` 返回 `kLaneFull`，**只拒这个 kind**；适配器据此对来源连接 `PauseRead`（沿用 `MainLoopExecutor` 的入口背压思路），不阻塞 IO 线程。
+2. **每个实例的邮箱上限**（消费者一侧，在 Shard 线程上从入口车道取出、放进实例邮箱时检查）：超限的请求回"邮箱满"，单向消息丢并计数。**邮箱必须有界，入队必须有结果，不悄悄丢**——只有 Orleans 在配置后明确拒绝并通知发送方，skynet 只告警，protoactor 丢最旧。
 
-**队头阻塞**：一条连接上的消息可能发往不同的执行器或不同的实例，一个分片满了就暂停整条连接会连累别的。所以对"按实体"的目的地，满了应该给请求回错误、单向消息丢并计数；只有整体过载时才暂停读连接。
+**为什么入口按 kind 分车道，不是每个 Shard 一个共用队列**：共用队列只有一个总计数，不知道消息属于哪个 kind。第二层限额只在消息被 Shard 线程取出之后才起作用，保护不到入口；Shard 线程被某个 kind 占住（重的 tick、洪峰）时，所有 kind 发往这个分片的消息都堆在同一个入口里，计数到顶后**别的 kind 也被拒**。分车道之后每个 kind 的积压和上限互相隔离。更重的隔离用分片组（独立的 Shard 线程）。
+
+**队头阻塞**：一条连接上的消息可能发往不同的执行器或不同的实例，一条车道满了就暂停整条连接会连累别的。所以对"按实体"的目的地，满了应该给请求回错误、单向消息丢并计数；只有整体过载时才暂停读连接。
 
 ### 终态：每条消息都有明确的结局
 
@@ -331,7 +370,7 @@ RPC 一律异步。主循环或 Shard 上同步等，等于自己等自己：应
 ② 投递
    同进程：Dispatch → 目标执行器 Submit（只入队，不内联执行）
    跨进程：信封 → Agent 路由 → 对端 IO 线程 → Dispatch
-                                               ③ 入主循环队列 / 分片入口队列 → 邮箱
+                                               ③ 入主循环队列 / 分片入口车道 → 邮箱
                                                   出队时再判一次过期 → 处理函数
                                                ④ ReplyHandle.Complete(状态, 载荷)
 ⑤ 应答：Direct 发给请求的 src，Correlation 原样带回
@@ -345,9 +384,9 @@ RPC 一律异步。主循环或 Shard 上同步等，等于自己等自己：应
 | 调用方 → 目标 | 请求落点 | 应答落点 |
 |---|---|---|
 | 主循环 → 主循环（同进程） | **不走 `Call`，直接调模块接口** | — |
-| 主循环 → actor | 目标分片的入口队列 | 主循环的应答通路 |
+| 主循环 → actor | 目标分片的入口车道 | 主循环的应答通路 |
 | actor → 主循环 | 主循环队列 | 发起方所在 Shard 的应答通路 |
-| actor → actor | 同片：邮箱；异片：目标片入口队列 | 发起方所在 Shard |
+| actor → actor | 同片：邮箱；异片：目标片入口车道 | 发起方所在 Shard |
 | 跨进程（四种都一样） | 多一段信封、Agent 路由、对端 IO 线程 | 多一段 Agent 回程 |
 
 现有代码里和这个过程相关的几点：
@@ -412,7 +451,7 @@ struct Correlation {          // 取代信封里的 u64 seq：仍是 8 字节，
 | `Call` 的回调 | `void` | — |
 | `ctx.Send`（单向） | `void` | 单向本来就"可以丢"，失败只计数；以后要给调用方背压提示（像网络层的 `SendResult::Full`）再加返回值，同样源码兼容 |
 
-`Submit` / `Dispatch` 的入口级结果（`kOk` / `kNoSuchKind` / `kShardFull` / `kShuttingDown`）是框架内部给适配器用的，业务看不到，见 §7。
+`Submit` / `Dispatch` 的入口级结果（`kOk` / `kNoSuchKind` / `kLaneFull` / `kShuttingDown`）是框架内部给适配器用的，业务看不到，见 §7。
 
 ### `Status`（**提议**）
 
@@ -432,7 +471,7 @@ struct Status {                  // 平凡可拷贝；线上就是信封的 err_
 | `kNoRoute`（1） | 路由表里没有目标 | Agent |
 | `kUnavailable`（2） | 目标存在但送不到 | Agent |
 | `kTimeout` | 超时 | 发起方的 `TimerWheel` |
-| `kOverloaded` | 在途数超限、入口队列满、邮箱满（§7 的"邮箱满"） | 发起方或被调方 |
+| `kOverloaded` | 在途数超限、入口车道满、邮箱满（§7 的"邮箱满"） | 发起方或被调方 |
 | `kNoHandler` | 消息号没登记 | `Dispatcher` |
 | `kNoSuchActor` | kind 或实例不存在（显式创建策略） | `ActorSystem` |
 | `kActivationFailed` | 激活失败 | `ActorSystem` |
@@ -496,6 +535,61 @@ Target::Pool(kind);                             // actor 池（§3）
 target.Timeout(std::chrono::milliseconds{3000}); // 单次调用的超时上限，返回副本
 ```
 
+### IDL 生成统一的 RPC 接口（**提议**，方向是用户提出的）
+
+目标：业务看到的 RPC 接口只有一套，不是每个执行模型各有一套登记 API。
+
+**IDL 管契约和寻址，不管谁来执行；生成的代码与模型无关，模型只实现一个很小的登记器：**
+
+```cpp
+class IMethodRegistrar {                        // 每个执行模型提供一个（模型作者实现，业务不直接碰）
+public:
+    // 消息号 + 类型擦除的处理函数（已含解码、调用类型化方法、包装 ReplyHandle）。
+    // thunk 带一个 impl 参数，由模型在调用时给出：主循环是登记时绑定的模块，actor 是邮箱里取到的那个实例。
+    virtual Status Bind(MsgId, MethodThunk) = 0;
+};
+
+// IDL 生成（对所有模型都一样）。生成的方法统一签名：
+//   void Login(HandlerContext&, const LoginReq&, ReplyHandle<LoginRsp>);
+Status RegisterPlayerService(IMethodRegistrar&, PlayerService* impl_or_null);
+```
+
+业务只写一行 `RegisterXxxService(registrar, impl)`，换模型只换传进去的登记器，不用重新生成。主循环的登记器直接绑到 `Dispatcher::On`；`actors->Register(kind)` 返回的是该 kind 的登记器。
+
+- **前例**：GameserverNew 的 `tools/protoc-gen-svcstub` 同样生成"绑定 route、解码、`Reply`、业务方法到 dispatcher"的注册函数。gRPC 用生成的 `Service` 加 `WithAsyncMethod_X` / `WithCallbackMethod_X` 混入按方法选风格，**生成器要为每种风格各产出一份**，加新风格就要改生成器；我们用运行期登记器，只生成一份，多一次间接调用，和入队相比可以忽略。
+- **`HandlerContext`**（§5 草图）是所有模型都提供的公共基类：`request()`（src、`trace_id`、剩余时间，客户端来源时还有 `client_role`）、`Call` / `Send` / `Cancel`；`ActorContext` 派生它，再加 `self()`、定时器、`Offload`、`PostToMain`、`Fail`。**显式参数，不用线程局部的"当前上下文"**：回调回到发起方上下文时要自己恢复隐式上下文，测试要搭环境，tsan 和 asan 也难查。
+  - 别家：protoactor 的 `Context` 由小接口组合，非 actor 的 `RootContext` 和 actor 的 `Context` 共用 `SenderContext`；gRPC 有公共基类 `ServerContextBase`，同步和回调风格各派生一个，生成的方法按风格收不同类型（所以生成器要知道有几种风格）；Akka 的 `Context` 和 Orleans 的 `RuntimeContext.Current` 是隐式的。
+  - 生成的方法通用的是**签名**，不是实现里依赖什么：想在几种模型间搬来搬去的实现，要遵守最严的规则（比如不碰模块）。
+
+**IDL 里放什么、不放什么**：
+
+| 放 | 不放 |
+|---|---|
+| 消息与方法，`_Req` / `_Rsp` / `_Send` 命名决定 `Call` 还是 `Send` | 在哪个执行模型上跑 |
+| 寻址：属于哪类微服务（`Target::Service`）；按实体寻址时用哪个字段当实体键 | 线程、分片、邮箱等承载配置 |
+| `audience` 和消息号（见下） | |
+
+**消息号（`msg_id`）**：
+- **线上是数字，名字用在 IDL、日志、指标、工具里。** 字符串不上线路：信封路由区"定长、固定偏移、纯数字、没有字符串"是设计前提（`envelope.h`），每条多约 27 字节，不可信输入还多出一块变长解析面。查表本身的 CPU 开销不是主要理由（热缓存微基准，名字约 27 字节，登记 200 到 20000 项：整数键 `FlatHashMap<u32>` 1.3 到 1.8 ns，字符串键 16 到 34 ns，线上带字符串再哈希成 u32 约 6 到 13 ns）。
+- **默认由生成器对"服务名/方法名"取稳定哈希**（`base/hash` 的 `MurmurHash64A` 取低 32 位），**全局查冲突**，冲突或结果为 0 时生成失败，用显式 `(msg_id)` 解决。哈希只在生成器里算，生成的是常量，Go 侧不用实现同一个哈希。这等于一个不需要握手的"名字到数字"字典（pitaya 的做法是路由字符串加握手下发字典，`SetDictionary`）。
+- 生成表同时带名字，登记时可以按名字查 id，日志和 `MessageStats`（已支持按 id / 名字统计）显示名字。按名字的通用入口（给 GM 工具、压测机器人用，gRPC 有 generic service）需要时再生成 `ResolveMethod(name) → id`。
+- GameserverNew 的后端 RPC 用 route 字符串（`Header.Route`），`cmd_id` 只在客户端协议里，手写在客户端消息定义的选项上（`proto/cs/cs_item.proto`），网关把 cmdID 翻译成 route 字符串。
+
+**客户端命令与服务间 RPC 要区分（用户确认），机制是 service 级的 `audience`（提议）。** 形状相同（`_Req` / `_Rsp` / `_Send`、生成的注册与分发、`HandlerContext`、执行器都共用），区分的理由是四件事：**信任边界**（客户端是不可信输入，不能触达内部方法）、**身份**（客户端命令要玩家 id）、**错误可见性**（`kUpstream` 等不能泄漏给客户端）、**推送**（服务端到客户端的 `_Send` 目标是客户端连接）。
+
+```
+audience = INTERNAL      // 默认：只给内部服务调用，客户端不可达
+audience = CLIENT        // 客户端可调：登记处理函数，进网关白名单
+audience = CLIENT_PUSH   // 服务端推给客户端：只生成发送端存根，后端没有处理函数
+```
+
+- **用 service 级，不用方法级**：service 是承载和评审的单位，不会在一个内部 service 里意外暴露某个方法；GameserverNew 的 `kind` 也是 service 级。要让客户端调某个内部能力，写一个薄的 `CLIENT` service 去显式调内部那个，这一层还能放客户端专有的校验。
+- **强制点三处**：①网关用生成的白名单，只转发 `CLIENT` service 的消息号（GameserverNew 的网关也只转发路由表里登记过的 `cmdID`，其余回 `ERR_NO_ROUTE`）；②后端对带"客户端来源"flag 的信封，只允许命中 `CLIENT` service 的消息号，其余回 `kNoHandler`（不暴露方法存在），这个 flag 只有网关会设，客户端协议不是我们的信封，客户端设不了；③网关出口把框架错误（< 1000）统一映射成通用客户端错误码，业务错误透传。
+- **`CLIENT` 的消息号必须显式 `(msg_id)`**（生成器没写就报错）：客户端是已发布的二进制，id 要稳定，改名不能让它变。`INTERNAL` 默认哈希。
+- **身份**：`request().client_role()` 只对客户端来源有值。**实体键必须来自已认证的会话，不能取自客户端消息体**，否则客户端能直接寻址别的玩家的 actor。GameserverNew 的网关也是从会话里取角色 id（header 的 `ClientRoleID`）。
+- **客户端协议自己的请求关联**（cmd 加客户端 `seq`）由网关翻译，不进内部 `Correlation`：GameserverNew 的 `forwardToBackend` 把客户端 `SeqID` 留在闭包里，用 `RspCmdID` 回给客户端。
+- **推送**：`Target::Client(role)` 要经 Agent 路由到持有该会话的网关；"会话到网关"的映射没设计（§19）。
+
 ### 回调还是协程
 
 行业分两派：写起来像同步代码（skynet 的 Lua 协程，`skynet.lua` 里 `session_id_coroutine` 把应答对到挂起的协程；Orleans 的 `async/await`；silver-server 的协程阻塞 channel），或回调、future（CAF 的 `request(dest, timeout)` 加 `.then`；protoactor 的 `NewFuture(系统, 超时)`）。
@@ -516,7 +610,7 @@ target.Timeout(std::chrono::milliseconds{3000}); // 单次调用的超时上限�
 
 ```
 Shard
- ├─ 入口队列：多生产者单消费者（MpscQueue，每个生产者内部有序）
+ ├─ 入口车道：每个 kind 一条，多生产者单消费者（MpscQueue，每个生产者内部有序），每条自带上限（§7）
  ├─ 本地表：(KindId, Key) → 实例（只有本 Shard 的线程碰，不用锁）
  ├─ 每个实例一个邮箱：普通队列（只有本 Shard 的线程碰，不用原子量）
  ├─ 就绪队列：有消息的实例
@@ -524,11 +618,78 @@ Shard
  ├─ TimerWheel：本 Shard 独占（TimerWheel 非线程安全）
  └─ 看门狗计数（§12）
 
-Run(budget)：先处理应答，再从入口队列批量取出消息、分发进各实例邮箱；
+Run(budget)：先处理应答，再轮转着从各条入口车道批量取出消息、分发进各实例邮箱；
              按就绪队列轮转，每个实例每轮最多处理 N 条；然后推进定时器。
 ```
 
-**跨线程的只有入口队列。** 实例的邮箱和本地表都是 Shard 私有，所以不需要 protoactor / skynet 那样的"已调度"原子标志：串行是 Shard 单线程保证的。
+**跨线程的只有入口车道。** IO 线程定位车道只用两样只读的东西：冻结后的"消息号 → kind"表，和 `hash(kind, key) % N`，不碰本地表（实例只在所属 Shard 线程上创建和销毁）。 实例的邮箱和本地表都是 Shard 私有，所以不需要 protoactor / skynet 那样的"已调度"原子标志：串行是 Shard 单线程保证的。
+
+### 入口层与直接投递（实测）
+
+问题：网络线程能不能不经过 Shard 的入口层、直接投进实例邮箱（skynet、protoactor 的做法）？**结论：保留入口层，不直接投递。**
+
+- **直接投递靠三样东西**：全局的地址表（skynet：读写锁加引用计数；protoactor：1024 个分片的并发 map，加 `PID` 里原子缓存的进程指针和 `dead` 标志）；每个 actor 一个线程安全的邮箱（skynet：自旋锁加环形数组，初始约 1.6 KB；protoactor：Vyukov 节点式无锁队列）；"已调度"标志（skynet 的 `in_global` 加全局自旋锁队列；protoactor 的 CAS `schedulerStatus`）。
+- **入口层多出的一跳**只是移动一个小结构（头加 `SharedBuffer` 句柄），不拷贝载荷：单线程微基准约 8.5 ns/条（5.8 → 14.3 ns）。
+- **跨线程对比**（1 个 Shard 线程，1000 个 actor，处理函数只做 `state++`，Release，每条消息的总耗时，5 次取中位数）：
+
+| 生产线程 | 现设计（共享入口加私有邮箱） | 直接投递，skynet 式（读锁查表、引用计数、自旋锁邮箱、已调度标志） | 直接投递，乐观下限（生产者直接持指针） |
+|---|---|---|---|
+| 1 | 15.0 ns | 75.0 ns | 31.5 ns |
+| 2 | 13.9 ns | 51.3 ns | 19.6 ns |
+| 4 | 14.0 ns | 52.1 ns | 11.3 ns |
+
+  64 和 10000 个 actor 的趋势相同（那两组是在没加 `NDEBUG` 的构建下测的）。乐观下限只有 4 个生产线程时才比现设计快（约 20%），而它忽略了实例回收的安全性，生产环境做不到。
+- **保留入口层的理由**：C++ 没有 GC，直接投递要自己做引用计数或 hazard pointer；并发面扩大（地址表、邮箱、调度标志、实例状态机），本机验证不了 tsan；省的只有几纳秒，实现不好反而更慢。
+- **局限**：饱和压测；处理函数近乎为空；只有 1 个 Shard；不含延迟；没试节点式无锁邮箱；不含激活和配额。
+
+**`MpscQueue` 实测**（Release，16 字节消息，i9-14900KF 的 WSL2，32 个逻辑核，不绑核，单次测量，数字是百万条/秒；用的是修了峰值采样之后的代码，见下）：
+
+| 生产线程数 | 1 | 2 | 4 | 8 | 16 | 31 |
+|---|---|---|---|---|---|---|
+| `MpscQueue`（带 token） | 34.9 | 260.1 | 470.0 | 563.0 | 638.6 | 495.8 |
+| `MpscQueue`（隐式生产者） | 34.3 | 156.8 | 259.4 | 352.8 | 463.8 | 407.0 |
+| 每生产者一条 `SpscQueue`（`MainLoopExecutor` 的做法） | 39.7 | 106.2 | 658.4 | 493.0 | 609.2 | 610.4 |
+| 自旋锁加 vector（整块换走） | 30.2 | 24.3 | 19.8 | 14.4 | 10.7 | 8.2 |
+| mutex 加 deque（整块换走） | 47.4 | 22.0 | 16.9 | 13.3 | 10.1 | 14.8 |
+| Vyukov 节点队列（每条 new） | 10.8 | 16.0 | 17.6 | 16.2 | 16.5 | 18.4 |
+
+P=2 的波动很大（几次运行里 `MpscQueue` 带 token 测到 141 到 265），表里是最后一轮，不要读成精确值。
+
+- **比简单实现快一个数量级**：生产线程多了，锁版本和每条分配的版本下降或持平，`MpscQueue` 带 token 在 4 到 16 个生产线程时是 470 到 639。
+- **长寿的生产线程要用 `ProducerToken`**：P=4 时 470 对 259。
+- **批量取出的大小影响很大**（4 个生产线程，带 token）：批量 1 → 57.1，4 → 129.8，16 → 210.9，64 → 358.1，256 → 470.7，1024 → 360.4，4096 → 346.9（上一轮 1024 测到 442、4096 测到 281，波动大）。**Shard 线程一次取 256 条左右**，取 1 条慢约 8 倍，超过 256 不再变好。
+- **每生产者一条 `SpscQueue` 没有显著更快**：生产线程 ≥ 4 时和 `MpscQueue` 同量级，P=1 相当。
+- **单条延迟**（1 个生产者定速 10 万条/秒，消费者自旋）：p50 带 token 170 ns、隐式生产者 177 ns、每生产者一条 `SpscQueue` 118 ns、自旋锁 204 ns、Vyukov 160 ns；p99 在 14 到 33 µs，p99.9 在 80 到 146 µs，max 在 0.3 到 1 ms。尾部是未绑核加 WSL2 的调度抖动，各实现的差别在噪声里，不能据此排名。
+- **消费者停摆时的内存**：每条 16 字节载荷约占 19.3 字节（节点式的 Vyukov 是 32 字节）。队列无界，要上限的调用方自己计数。
+- **不能拿它当每个实例的邮箱**：每个队列最小约 3.4 KB，4 个生产线程各投过之后约 11.9 KB（默认构造约 61 KB），普通 deque 邮箱约 0.7 KB。
+
+**已修复的问题：峰值采样拖慢批量取出。** `MpscQueue::TryDequeueBulk` 和 `SpscQueue::TryDequeueBulk` 原来每次调用都先 `SamplePeak()`，里面调 `size_approx()`：`ConcurrentQueue` 的要遍历所有生产者、读各自的 `tailIndex`；`ReaderWriterQueue` 的要遍历全部块，**复杂度随队列深度增长**。修复前的对照实验（同样的队列，去掉采样，5 次中位数，百万条/秒）：
+
+| | 修复前（带采样） | 原生（无采样） |
+|---|---|---|
+| `MpscQueue`，P=4 / 16 / 31 | 452 / 599 / 328 | 483 / 644 / 521 |
+| `SpscQueue` 每生产者一条车道，P=4 / 8 | 4 / 6 | 494 / 687 |
+
+`SpscQueue` 会在队列变深时**越慢越积压**：消费者落后，队列变深，每次取出要遍历的块更多，更慢（修复前 P=2 时 7 次里 4 次只有 2 到 4 Mops，其余从 20 到 194，是同一个机制）。
+
+- **修法**（已改，`base/queue/{mpsc,spsc}_queue.h`）：`PeakApprox` 改成**近似下界**：首次、此后每 `kPeakSampleEvery`（1024）次调用才用 `size_approx` 精确采样一次，其余调用用"本次取出的条数"更新（零开销的下界）。`kPeakSampleEvery` 必须是 2 的幂（`static_assert`）。短于采样间隔的积压可能被低估，`MainLoopExecutor` 的 `queue_peak` 因此也是下界。
+- **间隔怎么选的**（实测，8 条车道、**积压无界**：生产者不限速，每条车道积压到上百万条，占不采样吞吐的比例）：间隔 64 约 31%，256 约 62%，1024 约 73%，4096 约 86%。
+- **修复后**（同样的对照，5 次中位数）：`MpscQueue` P=4 / 16 / 31 是 485 / 649 / 502，原生是 472 / 644 / 523，持平；`SpscQueue` P=4 / 8 是 449 / 636，原生是 469 / 835。
+- **`SpscQueue` P=8 的残余差距只在积压无界时出现**（隔离实验，P=8，每轮交替 15 轮，中位数，百万条/秒；每条车道积压上限由生产者自旋限制）：
+
+  | 每车道积压上限 | 原生 | 现状（间隔 1024） | 间隔 64 |
+  |---|---|---|---|
+  | 无界 | 746 | 574 | 246 |
+  | 65536 | 860 | 760 | 730 |
+  | 4096 | 745 | 760 | 756 |
+  | 1024 | 649 | 666 | 689 |
+
+  - **机制**：`ReaderWriterQueue` 的块最大 512 个元素（`MAX_BLOCK_SIZE`），`size_approx` 顺着 `next` 指针逐块走，每块一次缓存未命中；积压 150 万条约 3000 个块，一次采样几百微秒。**一次采样的代价与深度成正比，而间隔按调用次数算**，所以积压越深开销越大。
+  - **排除了的原因**：只去掉 `size_approx`（保留下界更新）就回到原生（735 对 730）；把 `peak_` / `sample_tick_` 隔到独立缓存行没有改善（550 对 589，不是伪共享）；把采样慢路径挪成 `noinline` 没有改善（615 对 621，不是代码生成）。
+  - **结论**：积压有界时（§7 的车道上限、`MainLoopExecutor` 的字节预算）没有差距，连间隔 64 也持平；无界积压只出现在不限速的压测里。没做的改进：让间隔随上次采到的深度变大。
+  - **局限**：单机、WSL2 未绑核，各格最小到最大跨度很宽（如 426 到 899），"持平"指中位数在噪声内；上限 65536 那一格差约 12%，范围有重叠，不能说清有没有差距。
+- **测试**：`queue_test` 新增 `TestSpscPeakSampling` / `TestSpscPeakLowerBound` / `TestMpscPeakSampling` / `TestMpscPeakLowerBound`，在 debug、asan、release 下通过；7 个变异（去掉下界、每次都采样、首次不采样、间隔不是 2 的幂等）全部被杀死。
+- **曾经未解释的现象（现已解释）**：把 `SpscQueue` 预分配 400 万个元素后只有约 1 Mops/s（修复前）。预分配是事先建好并串成环的约 8200 个块，`size_approx` 不管装了多少都要走完整个环，每次出队约 0.3 到 0.8 ms，与 1 Mops 吻合；修复后同一压测 P=1 / 2 / 4 / 8 的中位数是 224 / 325 / 422 / 309。**注意**：这次没有重跑修复前的版本做对照，"约 1 Mops"是当时的记录，解释依据是机制与耗时估算加修复前后的变化。
 
 ### S0：一个 Shard 跑在主循环上（默认）
 
@@ -650,16 +811,16 @@ S1 的线程循环怎么写有两个选择（复用 `EventLoop` 的唤醒与定�
 | 现有 | 处理 | 理由 |
 |---|---|---|
 | `framework/app` 的启动编排（`Module` 的 `Init` / `Start`、拓扑排序、冻结） | **沿用** | 满足"每个 kind 一个 Module、`Start` 冻结 kind 表" |
-| `App` | **改**：新增 `Dispatcher` 成员、`Build` 时筛选 `IExecutorProvider`、`Init` 结束后冻结 `Dispatcher`、两个系统的非拥有指针 | §4 |
+| `App` | **改**：新增 `Dispatcher` 成员、`Build` 时筛选 `IExecutorProvider`、`Init` 结束后冻结 `Dispatcher`、**自动安装主循环这个 Module 并让所有用户模块隐式依赖它**、`mainLoop()` 引用和 `actors()` 指针 | §4 |
 | `ITickable` / `IWaker` | **沿用** | `MainLoopSystem` 和 S0 的 `ActorSystem` 正好是这两个能力，`Wake` 的"单轮预算由模块自定、返回 true 表示还有积压"够用 |
 | **App 的停机**（现在"只管启动，不管停机"，由 `main` 手动调各模块的 `Shutdown`） | **暂缓**：维持现状 | App 层面的编排先不考虑（用户 2026-11-03）。actor 的排空由 `ActorSystem` 自己提供，`main` 手动调。将来做时参考 GameserverNew 的 `Stopper.SaveAndStop(done)`，见 §19 第 1 项 |
 | **启动就绪**（GameserverNew 的 `ReadyWaiter`） | **借鉴**，形状为**提议** | 需要异步初始化的模块实现 `WaitReady`，App 在 `Start` 之后、进主循环之前等它们，各有超时。我们的应答要经主循环才处理，所以**等待期间要泵主循环**，不能阻塞（GameserverNew 等就绪时没泵，只能由模块自己的线程触发就绪）。这是 App 层的改动，细节见 §19 第 23 项 |
-| `MainLoopExecutor` | **演进**：成为 `MainLoopSystem` 的内部角色，从 `NetModule` 搬出，加 `Submit`；原来的 `Wrap(IMainLoopHandler)` 保留给旧用法 | 它已有每个 IO 线程一条 SPSC 队列、带预算的 `Drain`、入口背压，基本满足需求，不重写 |
+| `MainLoopExecutor` | **拆成两半**（提议）：通用部分（`Submit` / `SubmitResponse` / `Drain(budget)`、入口限额、统计、主循环上下文的挂起表和 `TimerWheel`，MPSC 队列）成为 `MainLoopSystem` 的内部角色，不依赖 `base/net`；网络适配器（解信封、每连接和全局字节预算、`PauseRead`）留在 `framework/net` | 现在的实现是网络专用的（每个 IO 线程一条 `SpscQueue<Event>`，依赖 `base/net/connection/*` 和 `IMainLoopHandler`），`framework/app` 不能依赖它；生产者也不止 IO 线程。带预算的 `Drain`、入口背压的思路保留 |
 | `NetModule` | **改**：增加收 `Dispatcher` 的入口；`AddAgentClient` 增加在 IO 线程直接处理的重载 | §4 |
 | `ThreadPool::Post` | **沿用**，给 `Offload` 用 | 无 key 共享队列，满了返回 false，`Stop` 排空 |
-| `ThreadPool::PostKey` | **不用它做分片执行器** | 它的全部队列共用一把锁（头注释明说面向微秒级以上的任务），也没有每片的定时器；分片要的是"每片一个线程加入口队列加自己的 `TimerWheel`"，这是另一个结构。`ThreadPool` 本身不改 |
+| `ThreadPool::PostKey` | **不用它做分片执行器** | 它的全部队列共用一把锁（头注释明说面向微秒级以上的任务），也没有每片的定时器；分片要的是"每片一个线程加入口车道加自己的 `TimerWheel`"，这是另一个结构。`ThreadPool` 本身不改 |
 | `EventLoop` | **不直接用**，S2 时评估能否抽取它的唤醒和定时器部分 | 它是网络内部类型，带 epoll 和连接表；Shard 不需要这些 |
-| `MpscQueue` / `SpscQueue` / `SharedBuffer` / `TimerWheel` / `Now` / `MurmurHash64A` | **沿用** | 契约都满足（每个生产者内部有序、定时器单线程使用、`Now` 是原子量、哈希结果稳定） |
+| `MpscQueue` / `SpscQueue` / `SharedBuffer` / `TimerWheel` / `Now` / `MurmurHash64A` | **沿用** | 契约都满足（每个生产者内部有序、定时器单线程使用、`Now` 是原子量、哈希结果稳定）。`TryDequeueBulk` 里的峰值采样问题已修（见 §9「入口层与直接投递（实测）」），`PeakApprox` 现在是近似下界 |
 | 信封与 Agent 路由（`dst`、`route_key`、`msg_id`、`remaining_ms`、`Direct` 路由） | **沿用，`seq` 改成 `Correlation`**（提议，§8） | 其余够用。还没上线，信封直接改、不考虑兼容；如果选了"信封加显式 kind 字段"也直接改 |
 | `Actor模型与RPC设计.md` | **不继承** | 实验性，偏 Go |
 
@@ -698,19 +859,39 @@ S1 的线程循环怎么写有两个选择（复用 `EventLoop` 的唤醒与定�
 **借鉴**：Orleans 的激活状态机、慢请求与卡死检测、非 Valid 激活的单独处理、异常回给调用方；skynet 的版本计数器监控；protoactor 的两方法 `Dispatcher` 接缝思路、`MailboxMiddleware` 的指标钩子；Akka 的命名 dispatcher、`Stash`。
 **不借鉴**：监督树与父子关系、工作窃取（负载均衡好，但 actor 迁线程、验证难）、无界邮箱、Orleans 的迁移与重平衡（它自己也标为实验性：`AddActivationRebalancer`、`AddActivationRepartitioner`；重平衡按激活数与内存的熵衡量，重分区按 grain 之间的调用次数把通信密的搬到一起）。
 
+### 与 gRPC C++ 的对照（RPC 这一层）
+
+读了本机的 gRPC 源码（`doc/statuscodes.md`、`include/grpcpp/` 下的 `client_context.h`、`server_context.h`、`support/server_callback.h`、`impl/propagation_bits.h`、`include/grpc/event_engine/`），没测过它的性能，不下快慢的结论。它们不是同一类东西：gRPC 是通用的跨语言 RPC 框架，我们是游戏服进程内加同机 sidecar 的消息和 RPC 层，和 actor 执行模型绑在一起。
+
+| 维度 | gRPC C++ | 我们（设计，未实现） |
+|---|---|---|
+| 回调在哪跑 | gRPC 自己的线程上，可并发，不许阻塞（`server_callback.h`），没有回到发起方的亲和性，业务要自己同步或切线程 | 回到**发起方的执行上下文**，串行、不加锁，实例回收则丢弃 |
+| 服务端必须应答 | 必须 `Finish(Status)`，库不替你收尾 | `ReplyHandle` 析构自动回 `kNoReply` |
+| 异步风格 | 同步、`CompletionQueue`、回调三套并存 | 一套回调，协程以后加，没有同步版本 |
+| 超时 | `set_deadline`；`FromServerContext` 默认把 **deadline 和取消**一起传给子调用（`GRPC_PROPAGATE_DEFAULTS`） | deadline 沿链传，且显式预留回程时间；**没有取消传播** |
+| 取消 | `TryCancel` 传到服务端，服务端 `IsCancelled` / `OnCancel`（尽力而为） | `Cancel` 只在本地丢弃，对端仍处理完，靠 deadline 兜底 |
+| 错误模型 | 整数码加字符串，17 个规范码，库只产生其中一小部分 | 只有码，框架与业务数值分区（§8 `Status`） |
+| 流式 | 一元、服务端流、客户端流、双向流 | 没有，用 `Oneway` 推送代替 |
+| 元数据、拦截器 | 变长 key-value；有拦截器 | 信封固定字段；没有拦截器 |
+| 服务发现、负载均衡、重试、健康检查、TLS | 都有 | Agent 路由表有 `Any` / `Hash` / `Broadcast`；控制面没做，重试明确不做，跨机无 TLS |
+| 代码生成 | protoc 插件，强类型存根，每种风格各生成一份 | 方向是一份生成加运行期登记器（§8），生成器没设计 |
+| 传输 | HTTP/2 over TCP | 同机共享内存环加 Agent，跨机 TCP |
+
+**借鉴的**：`Submit` 不得内联执行的契约（来自 `EventEngine::Run`）、新执行模型的实现清单（来自 `EventEngine` 的 README，§4）、库产生的码和应用的码分清（`doc/statuscodes.md`，我们用数值分区）。**不借鉴的**：三套风格并存且规则各不相同（它自己在 `SetServerApiType` 里要为"把方法覆盖成另一种类型"打日志，说明这是个坑）。**可能要补的**：拦截器（中间件）钩子，追踪、指标、鉴权会用到（§19）；取消传播，收益对游戏服不大，先不做。
+
 ## 18. 验证计划与落地路线
 
 | 阶段 | 内容 | 要证伪 / 验证什么 |
 |---|---|---|
 | **S0** | `App` 增加 `Dispatcher` 和能力筛选；`MainLoopSystem`（演进 `MainLoopExecutor`）；`ActorSystem` 加统一的 Shard 结构跑在主循环上，加一两个 kind 与测试 | `Dispatcher`：重复登记报错、冻结后登记报错、未登记消息号的终态、执行器缺失时的明确错误；同键严格串行；同一连接发给同一 actor 保序；跨 kind 发消息；每轮预算的公平性（一个刷屏的 actor 不饿死别人）；激活期间的消息处理与加载失败；定时器；停机排空；两层背压与所有终态（§7 表）；RPC：挂起表、超时、应答与超时竞争、`late_reply` / `unknown_seq` / `stale_epoch` 计数、应答不被慢请求堵住；`ReplyHandle` 析构自动回错、延迟应答、跨线程析构；`Call` 失败路径异步回调；`Cancel` 的各种时机（完成后、超时后、失败后调用，取消后晚到的应答计 `late_reply`）；`duplicate_reply` / `no_reply` 计数；发起实例回收后回调不被调用；`Join` / `Each` / `Seq` 的汇合与终止；链式调用：下游超时早于上游、剩余不足预留时不发下游调用、下游框架错误映射成 `kUpstream`、等待期间实例回收则上游收到 `kNoReply` |
-| **S1** | 把场景 kind 放进独立分片组，每片一个线程；有"进程内无状态并行"的真实需求时，加 actor 池 | 同键仍然串行；分片间互不阻塞；入口队列的延迟和吞吐（**需要压测**）；asan 下的并发用例；**tsan 上真机**；池 kind：成员落在不同分片（`key % N`）、选择器轮转均匀、同一成员内串行、`Offload` 不占分片线程 |
+| **S1** | 把场景 kind 放进独立分片组，每片一个线程；有"进程内无状态并行"的真实需求时，加 actor 池 | 同键仍然串行；分片间互不阻塞；入口车道的延迟和吞吐、各 kind 的车道互不拖累（**需要压测**）；asan 下的并发用例；**tsan 上真机**；池 kind：成员落在不同分片（`key % N`）、选择器轮转均匀、同一成员内串行、`Offload` 不占分片线程 |
 | **S2** | 评估是否换更专用的分片循环、抽取 `EventLoop` 的通用部分 | 只在 S1 实测出瓶颈时做 |
 
 ## 19. 未决项
 
 1. **App 是否增加停机阶段**（§15）：**暂缓**，先由 `main` 手动调（用户：App 层面的编排先不考虑）。将来做时参考 GameserverNew 的 `Stopper.SaveAndStop(done)`：非阻塞、`done` 回主循环、等待期间继续泵主循环、每模块有超时；超时检查要放在循环顶部，放在"队列空"分支里会被持续到达的任务饿死。会改变 `framework/app` 与 Go 版的对照关系。
-2. **实体 kind 来自消息号还是信封里的显式字段**（§5）：消息号定 kind 零改动，但"一个消息号只属于一个登记者"；显式字段更灵活，要改信封（现在 `reserved0` 要求为 0，需升版本）。
-3. **客户端命令和服务之间的 RPC 要不要分两张注册表**：silver-server 是两张（RPC 按 `rpcId`，客户端消息按 CS 命令号）。
+2. **实体 kind 来自消息号还是信封里的显式字段**（§5）：消息号定 kind 零改动，但"一个消息号只属于一个登记者"；显式字段更灵活，要改信封（现在 `reserved0` 要求为 0，需升版本）。有了 IDL，绑定在登记时由生成的 `Register*` 完成（§8），这里只剩"信封要不要带显式 kind"。
+3. **客户端命令和服务之间的 RPC 要不要区分**：**已决**，要区分（用户确认）；不用两张表，用一张表加 service 级 `audience`（INTERNAL / CLIENT / CLIENT_PUSH），见 §8。silver-server 和 GameserverNew 都是两张表，这里没有照搬。
 4. **Deactivating 期间到达的消息**：拒绝并回"正在停用"（默认），还是排队后重新激活。
 5. **`ctx.Fail` 后是否存盘**：默认不存，避免把坏状态写进库。
 6. **激活失败后重试的退避**：谁触发（下一条消息，还是调用方）、间隔多少、最大次数。
@@ -723,17 +904,24 @@ S1 的线程循环怎么写有两个选择（复用 `EventLoop` 的唤醒与定�
 13. **单向消息在激活失败时只计数记日志**：按信封约定的提议，用户未单独表态。
 14. **创建策略默认显式**：提议，用户未单独表态。
 15. **RPC 回调还是协程**（§8）：提议第一版回调。
-16. **actor 池的选择器与分片**（§3、§9）：第一版轮转；是否加"最空闲优先"（读各分片入口队列深度，只看排队数看不见在跑的慢任务）；池 kind 的分片函数是否用 `key % N`；以及是否真的需要进程内无状态并行（没有需求就不做）。
+16. **actor 池的选择器与分片**（§3、§9）：第一版轮转；是否加"最空闲优先"（读各分片入口车道深度，只看排队数看不见在跑的慢任务）；池 kind 的分片函数是否用 `key % N`；以及是否真的需要进程内无状态并行（没有需求就不做）。
 17. **独占线程的分片组**、**场景内并行**：倾向于明确不做（§16）。
-18. **`MainLoopExecutor` 搬出 `NetModule` 的重构**（§4、§15）和 **`IExecutorProvider` 的具体形状**。
+18. **`MainLoopExecutor` 拆成通用部分与网络适配器的重构细节**（§4、§15）；`IExecutor` / `IExecutorProvider` 的形状 §4 已有草图；主循环自动安装的实现细节（隐式依赖、拓扑序最前）。
 19. **未覆盖需求清单**（§16）里哪些要在后续设计里补。
 20. **`Correlation` 的位宽与纪元取法**（§8）：16 / 16 / 32 位是草案；纪元取启动时刻秒数的低 16 位，还是别的。
 21. **回调契约**（§8）：至多一次、发起实例回收后不调、`Cancel` 之后不调，是否都接受。
 22. **编排辅助的语义**（§8）：`Join` 要不要快速失败；聚合层是否自带 deadline；多个错误怎么汇总。
 23. **启动就绪等待的形状**（§15）：等待期间泵主循环；超时默认值；失败是否中止启动；与第 1 项同属 App 层，要不要一起暂缓。
-24. **接口定义与生成器**（§8）：命名规则已定（`_Req` / `_Rsp` / `_Send`），生成器是否做、何时做、生成什么（强类型存根、注册函数）。
+24. **接口定义与生成器**（§8）：方向已定（一份生成加运行期登记器，命名规则 `_Req` / `_Rsp` / `_Send`），生成器何时做、生成什么（强类型存根、注册函数、网关白名单）、`thunk` 的 `impl` 参数的具体形状待定。
 25. **`Target` 的具体写法**（§8）：草图不是定稿。
 26. **`Status` 的形状**（§8，提议）：只有码、没有消息串是否够用（细节放 `body`）；`MapUpstream` 对业务错误是否一律透传；`deadline_reserve` 的默认值（要实测）。
+27. **入口车道的细节**（§7、§9）：每条车道的默认上限和配置位置；Shard 线程轮转各车道时每轮每条取多少（公平策略）；kind 很多时车道数（分片数 × kind 数）的开销。直接投递的重新评估要等有实测瓶颈（§9 记了对比数据）。
+28. **拦截器（中间件）钩子**（§17）：追踪、指标、鉴权要不要在 `Dispatcher` 层加。GameserverNew 的 `core/dispatcher` 有 `Middleware`，gRPC 有 interceptors，我们现在没有。
+29. **"会话到网关"的映射与推送路由**（§8）：`Target::Client(role)` 怎么找到持有该会话的网关。
+30. **`msg_id` 的细节**（§8）：冲突检查的范围（所有 proto 一起）；是否提交一份生成的 id 清单文件，让改名导致的 id 变化在评审里可见；`ResolveMethod(name)` 何时做。
+31. **`HandlerContext` 与 `audience` 的细节**（§8）：`RequestInfo` 里放什么；`CLIENT` service 的处理函数是否都带 `client_role`；`CLIENT_PUSH` 的发送端存根形状。
+32. **主循环 RPC 超时的精度**（§4）：沿用 tick 粒度（约 33 ms），还是改成 `wait_until(min(下次 tick, 时间轮最近到期))`。
+33. **峰值采样间隔**（§9）：`kPeakSampleEvery` 现为 1024；积压有界（每车道 ≤ 4096）时间隔 64 也与不采样持平，只有无界积压才慢（见 §9 的隔离实验），不必再放大；要不要让间隔随上次采到的深度变大；`queue_peak` 是下界是否够用。
 
 ## 附：不做的事
 

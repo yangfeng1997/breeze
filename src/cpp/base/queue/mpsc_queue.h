@@ -6,6 +6,10 @@
 // - TryDequeueBulk 返回 n < limit ⇒ 队列已空。
 // - TryEnqueue 失败 = 没有预分配空间，不是容量上限；需要硬上限的调用方自带计数。
 // - 固定的长寿生产线程可以持有 ProducerToken，比隐式生产者快；token 必须先于队列销毁。
+// - PeakApprox 是历史峰值的**近似下界**：首次、此后每 kPeakSampleEvery 次批量出队用 size_approx 采样一次，
+//   其余调用用"本次取出的条数"更新；短于采样间隔的积压可能被低估。
+//   不能每次都采样：ConcurrentQueue::size_approx 要遍历所有生产者并读各自的 tailIndex，
+//   生产者多时明显拖慢批量出队（31 个生产者约 -37%，对照实验见 docs/Actor与线程模型设计.md §9；queue_test 的 TestMpscPeak*）。
 // - 队列不负责唤醒，也没有阻塞版本。
 
 #pragma once
@@ -14,6 +18,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <utility>
 
 #include "base/queue/internal/thread_role.h"
@@ -77,25 +82,39 @@ public:
     {
         consumer_.Check();
         SamplePeak();
-        return q_.try_dequeue_bulk(out, limit);
+        const std::size_t n = q_.try_dequeue_bulk(out, limit);
+        BumpPeak(n); // 零开销的下界：本次取出了这么多，队列至少有过这么深
+        return n;
     }
 
     std::size_t SizeApprox() const { return q_.size_approx(); }
 
-    // 历史峰值：消费者在每次批量出队前采样 SizeApprox，生产者路径没有额外开销。
+    // 采样间隔（调用次数，必须是 2 的幂）。1024 次调用一次：size_approx 要遍历所有生产者，不能进热路径；
+    // 峰值只是监控用的近似下界（SpscQueue 上的对照实验见它的同名常量）。
+    static constexpr std::uint32_t kPeakSampleEvery = 1024;
+    static_assert((kPeakSampleEvery & (kPeakSampleEvery - 1)) == 0, "kPeakSampleEvery 必须是 2 的幂（用掩码取模）");
+
+    // 历史峰值的近似下界（见文件头契约）。生产者路径没有额外开销。
     std::size_t PeakApprox() const noexcept { return peak_.load(std::memory_order_relaxed); }
 
 private:
     void SamplePeak() noexcept
     {
-        const std::size_t s = q_.size_approx();
-        if (s > peak_.load(std::memory_order_relaxed))
-            peak_.store(s, std::memory_order_relaxed); // 只有消费者写
+        if ((sample_tick_++ & (kPeakSampleEvery - 1)) != 0)
+            return; // 首次调用 tick 为 0，会采样
+        BumpPeak(q_.size_approx());
+    }
+
+    void BumpPeak(std::size_t v) noexcept
+    {
+        if (v > peak_.load(std::memory_order_relaxed))
+            peak_.store(v, std::memory_order_relaxed); // 只有消费者写
     }
 
     moodycamel::ConcurrentQueue<T> q_;
     queue_detail::ThreadRole consumer_;
     std::atomic<std::size_t> peak_{0};
+    std::uint32_t sample_tick_ = 0; // 只有消费者读写，不需要原子
 };
 
 } // namespace breeze

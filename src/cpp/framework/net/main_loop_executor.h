@@ -43,7 +43,7 @@ struct InboundLimits
 struct ExecutorStats
 {
     std::uint64_t queued_events = 0;  // 各队列里尚未分发的事件数（近似）
-    std::uint64_t queue_peak = 0;     // 单条队列的历史峰值（近似，消费者在每次批量出队前采样）
+    std::uint64_t queue_peak = 0;     // 单条队列的历史峰值（近似下界，采样节奏见 SpscQueue 头注释）
     std::uint64_t inflight_bytes = 0; // 已入队、未分发的 payload 字节，全局合计
     std::uint64_t pauses = 0;         // 因在途上限而 PauseRead 的累计次数
     std::uint64_t dispatched = 0;     // 主循环已分发的事件数

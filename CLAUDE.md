@@ -17,7 +17,7 @@
   Go 命令要在 `src/go/` 下跑，或用 `go -C src/go ...`
 - `src/cpp` — C++ 侧，`CMakeLists.txt` 在此。**所有 `#include` 都从 `src/cpp` 起算**（`#include "base/net/endpoint/endpoint.h"`），`src/cpp` 是唯一的 include 根，各库不配自己的 include 目录，扁平名编译不过。目录不拦，**include 约定由 `tools/check_includes.py` 守着**（`includes_test`）：`base/` 不能 include `framework/`；net 之外的非测试代码只许 include net 的公开头清单（`PUBLIC_HEADERS`），新增公开头要加进清单。`framework/app` 对照 Go 版
   `src/go/core/app` 实现，语义以后者的 CLAUDE.md 为准。
-  `base/queue` 是 SPSC/MPSC 无锁队列（包 moodycamel，公开 API 不暴露其类型），网络库的底座；
+  `base/queue` 是 SPSC/MPSC 无锁队列（包 moodycamel，公开 API 不暴露其类型），网络库的底座；**`PeakApprox` 是近似下界**（首次与每 1024 次批量出队才用 `size_approx` 采样，其余用取出条数，**别改成每次都采**：它要遍历生产者 / 全部块，随队列深度增长，会让消费者越慢越积压，对照实验见 [docs/Actor与线程模型设计.md](docs/Actor与线程模型设计.md) §9）；批量出队一次取 256 条左右最快，长寿生产线程要用 `ProducerToken`；
   `base/buffer` 是 `SharedBuffer`（引用计数的不可变字节块切片，业务回调的消息类型）与 `Buffer`（带读写游标的缓冲），只依赖标准库，网络库与业务都用；
   `base/thread`（仅 Linux）是 `Thread` / `this_thread` / `WaitGroup` / `SpinLock` / `ThreadPool`，创建失败返回 errno、库内不抛异常，设计与来源见 [docs/线程基础库.md](docs/线程基础库.md)（**tsan 同样没在本机跑过**）；
   `base/assert`（仅 Linux）是 `ASSERT_*` 防御式断言（Debug 失败 abort，Release 走防御式控制流并按调用点限流记日志），`base/backtrace`（仅 Linux）是 `Backtrace` 调用栈文本化（独立库，不依赖日志与断言）；
@@ -61,7 +61,7 @@
   （cluster / etcd / redis / mongo，另引用 `net.proto` 的 `net` 段：网络库，字段全有生产默认值，段本身非 required）；
   生成器自带样例在 `tools/configgen/testdata/schema/`
 - `docs/` — 设计文档。C++ 侧 actor 与线程模型的设计基线是
-  [docs/Actor与线程模型设计.md](docs/Actor与线程模型设计.md)：做 actor 层前先读它（**设计阶段，没有代码**：两种执行方式（主循环直接执行 / 有状态 actor；无状态并行用 actor 池加 `Offload`，**不设 worker 执行方式**）、`Dispatcher` 加两个执行器、网络消息与 RPC 的配合、进程间拓扑；已定与未决项见其 §0 / §19；**设计不受现有半成品代码约束**，沿用 / 改 / 重写见其 §15）。
+  [docs/Actor与线程模型设计.md](docs/Actor与线程模型设计.md)：做 actor 层前先读它（**设计阶段，没有代码**：两种执行方式（主循环直接执行 / 有状态 actor；无状态并行用 actor 池加 `Offload`，**不设 worker 执行方式**）、`Dispatcher` 加两个执行器、网络消息与 RPC 的配合（IDL 生成统一接口，客户端命令与内部 RPC 用 service 级 `audience` 区分）、进程间拓扑；已定与未决项见其 §0 / §19；**设计不受现有半成品代码约束**，沿用 / 改 / 重写见其 §15）。
   [docs/Actor模型与RPC设计.md](docs/Actor模型与RPC设计.md) 是**实验性、偏 Go 的设计，仅供参考，不是事实源**。
   C++ 网络库（`base/queue` / `base/net` / `framework/net`）的设计基线是
   [docs/网络库设计.md](docs/网络库设计.md)：动网络库前先读它；

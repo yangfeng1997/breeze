@@ -4,6 +4,7 @@
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <iterator>
@@ -110,6 +111,38 @@ void TestSpscPeak()
     CHECK(q.PeakApprox() == 5); // 峰值只升不降
 }
 
+// 峰值是近似下界：首次与每 kPeakSampleEvery 次调用才用 size_approx 精确采样，其余调用只用"本次取出的条数"更新。
+void TestSpscPeakSampling()
+{
+    using Q = SpscQueue<int>;
+    Q q;
+    std::vector<int> out;
+    CHECK(q.TryDequeueBulk(std::back_inserter(out), 1) == 0); // 第 0 次调用：采样，队列是空的
+    CHECK(q.PeakApprox() == 0);
+    constexpr int kTotal = 2 * static_cast<int>(Q::kPeakSampleEvery); // 要比采样间隔多，才够连续取 1 条那么多次
+    for (int i = 0; i < kTotal; ++i)
+        q.Enqueue(i);
+    // 第 1 到 kPeakSampleEvery-1 次调用不采样：每次只取 1 条，峰值只靠"取出条数"这个下界，停在 1
+    for (std::uint32_t i = 1; i < Q::kPeakSampleEvery; ++i)
+        CHECK(q.TryDequeueBulk(std::back_inserter(out), 1) == 1);
+    CHECK(q.PeakApprox() == 1);
+    // 第 kPeakSampleEvery 次调用：采样，看到的是剩下的那些
+    CHECK(q.TryDequeueBulk(std::back_inserter(out), 1) == 1);
+    CHECK(q.PeakApprox() == kTotal - (Q::kPeakSampleEvery - 1));
+}
+
+// 没轮到采样的那次调用，取出的条数也会抬高峰值：一次取走的积压不会被漏掉。
+void TestSpscPeakLowerBound()
+{
+    SpscQueue<int> q;
+    std::vector<int> out;
+    CHECK(q.TryDequeueBulk(std::back_inserter(out), 1) == 0); // 第 0 次：采样（空）
+    for (int i = 0; i < 300; ++i)
+        q.Enqueue(i);
+    CHECK(q.TryDequeueBulk(std::back_inserter(out), 300) == 300); // 第 1 次：不采样
+    CHECK(q.PeakApprox() == 300);
+}
+
 void TestSpscStress()
 {
     constexpr int kCount = 200000;
@@ -200,6 +233,35 @@ void TestMpscPeak()
     CHECK(q.PeakApprox() == 5);
 }
 
+// 同 TestSpscPeakSampling：采样节奏和下界语义对 MpscQueue 一样。
+void TestMpscPeakSampling()
+{
+    using Q = MpscQueue<int>;
+    Q q;
+    std::vector<int> out;
+    CHECK(q.TryDequeueBulk(std::back_inserter(out), 1) == 0);
+    CHECK(q.PeakApprox() == 0);
+    constexpr int kTotal = 2 * static_cast<int>(Q::kPeakSampleEvery); // 要比采样间隔多，才够连续取 1 条那么多次
+    for (int i = 0; i < kTotal; ++i)
+        q.Enqueue(i);
+    for (std::uint32_t i = 1; i < Q::kPeakSampleEvery; ++i)
+        CHECK(q.TryDequeueBulk(std::back_inserter(out), 1) == 1);
+    CHECK(q.PeakApprox() == 1);
+    CHECK(q.TryDequeueBulk(std::back_inserter(out), 1) == 1);
+    CHECK(q.PeakApprox() == kTotal - (Q::kPeakSampleEvery - 1));
+}
+
+void TestMpscPeakLowerBound()
+{
+    MpscQueue<int> q;
+    std::vector<int> out;
+    CHECK(q.TryDequeueBulk(std::back_inserter(out), 1) == 0);
+    for (int i = 0; i < 300; ++i)
+        q.Enqueue(i);
+    CHECK(q.TryDequeueBulk(std::back_inserter(out), 300) == 300);
+    CHECK(q.PeakApprox() == 300);
+}
+
 struct Item
 {
     int producer;
@@ -267,6 +329,8 @@ int main()
     TestSpscBulkContract();
     TestSpscMoveOnly();
     TestSpscPeak();
+    TestSpscPeakSampling();
+    TestSpscPeakLowerBound();
     TestSpscStress();
 
     TestMpscBasic();
@@ -274,6 +338,8 @@ int main()
     TestMpscBulkContract();
     TestMpscMoveOnlyAndToken();
     TestMpscPeak();
+    TestMpscPeakSampling();
+    TestMpscPeakLowerBound();
     TestMpscPerProducerOrder();
 
     std::puts("queue_test: ok");
