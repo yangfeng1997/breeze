@@ -2,7 +2,7 @@
 
 **状态**（2026-11-03）：**设计阶段，没有代码。** §0 列的"已定"是用户明确同意过的；其余是我提出、尚未确认的，文中标"**提议**"，汇总在 §19。
 **设计不受现有代码约束**：`framework/app`、`MainLoopExecutor`、`ThreadPool`、信封等大多是半成品，本文从需求出发，哪些沿用、哪些改、哪些重写见 §15。
-旧的 [Actor模型与RPC设计.md](Actor模型与RPC设计.md) 是实验性、偏 Go 的设计，**仅供参考，不是事实源**；本文不继承它的结论。
+旧的实验性设计 `Actor模型与RPC设计.md`（偏 Go）已于 2026-11-05 删除，不是事实源，本文不继承它的结论；要查旧内容：`git show fa84592:docs/Actor模型与RPC设计.md`。
 **线程安全没有在 tsan 下验证过**（本机跑不了，见 [网络库设计.md](网络库设计.md) §11.2）：S1 以后的多线程部分上真机前不算验证过。
 Agent、信封、共享内存通道见 [共享内存IPC设计.md](共享内存IPC设计.md)。
 
@@ -22,7 +22,7 @@ Agent、信封、共享内存通道见 [共享内存IPC设计.md](共享内存IP
 10. **设计不受现有半成品代码约束**：能用就用、能优化就优化、不满足就改、必要时重写。项目还没上线，信封、握手、协议都可以直接改，不考虑兼容。
 11. **RPC 必须异步**，没有同步版本（§8）。
 12. **应答用 `ReplyHandle`**：处理函数没回过就析构，自动回"无应答"错误（§8）。
-13. **借鉴 GameserverNew 的几处**（§8、§15）：编排辅助 `Join` / `Each` / `Seq`；接口定义里 `_Req` / `_Rsp` 生成 `Call`、`_Send` 生成 `Send`，不匹配的组合生成器报错；`Target` 链式构造（值类型，返回副本）；启动就绪等待。
+13. **借鉴 GameserverNew 的几处**（§8、§15）：编排辅助 `Join` / `Each` / `Seq`；接口定义里由 `rpc` 签名决定生成 `Call` 还是 `Send`（原先的 `_Req` / `_Rsp` / `_Send` 命名规则已被第 21 条取代）；`Target` 链式构造（值类型，返回副本）；启动就绪等待。
 14. **App 层面的编排（停机阶段等）暂缓**，先由 `main` 手动调（§15、§19 第 1 项）。
 15. **命名**：发起端 `CallHandle`，应答端 `ReplyHandle`，应答方法 `Complete`；不叫 future / promise，因为它们不能阻塞取结果，也不挂续接（§8）。
 16. **链式调用**：B 的处理函数返回 `void`，应答经 `ReplyHandle` 晚点回；下游调用的默认超时取 `剩余 − 预留`；下游的框架错误映射成 `kUpstream`，业务错误原样透传（§8）。
@@ -30,6 +30,8 @@ Agent、信封、共享内存通道见 [共享内存IPC设计.md](共享内存IP
 18. **一个进程只有一个 `ActorSystem`**，里面可有多个 kind，一个 kind 可实现多个生成的服务接口；不支持同进程多个 `ActorSystem` 实例，隔离靠分片组（§5）。
 19. **IDL 生成统一的 RPC 接口，业务通过各执行模型的登记器（`IMethodRegistrar`）绑定**，不是每个模型各有一套登记 API（用户提出的方向，§8）。
 20. **客户端命令与服务间 RPC 要区分**（用户确认）；机制是 service 级的 `audience`，见 §8（**提议**）。
+21. **接口定义用 gRPC 的 schema 写法**（用户选定，2026-11-05，§8）：proto 里写 `service` / `rpc`，**只用 schema 语法，不用 gRPC 的代码与运行时**，由自研生成器生成。`rpc` 签名决定 `Call`（有应答类型）还是 `Send`（返回 `google.protobuf.Empty`，单向）；`stream` 生成器报错；`CLIENT` service 的请求消息不许标 `route_key`；**第一版所有 `msg_id` 手写**，不做哈希；**单向方法只生成 `Send` 存根，处理函数没有 `ReplyHandle`、不涉及应答类型**。
+22. **消息编解码用 libprotobuf**（用户选定，2026-11-05，§8、§19 第 35 项）。**请求体在处理函数执行时解码**（执行器线程，不在 IO 线程）；解码失败：请求回框架错误码"解码失败"，单向消息计数加限频日志，不断连接（用户选定，依据见 §17 的对照）。
 
 **提议**（未确认，见 §19）：统一的 Shard 结构（§9）、`Locator` 接缝（§14）、`ActorContext` 不给 `App` / 模块引用（§5）、显式创建为默认（§6）、本地消息统一用字节（§10）、actor 池的分片函数与选择器（§3、§9）、`Correlation` 结构与回调契约（§8）、`Status` 的形状（§8）、`HandlerContext` 与 IDL 生成器的细节（`audience`、`msg_id`、登记器，§8）、未覆盖需求的清单（§16）等。
 
@@ -258,7 +260,7 @@ public:
     virtual ~IActor() = default;
     virtual void OnActivate(ActorContext&, ActivationHandle) = 0;   // 异步：加载完成后 handle.Complete(status)
     // 业务消息不走 OnMessage：actor 类同时实现 IDL 生成的服务接口，方法签名统一为
-    //   void Login(HandlerContext&, const LoginReq&, ReplyHandle<LoginRsp>);   // Oneway 时句柄为空，§8
+    //   void Login(HandlerContext&, const LoginReq&, ReplyHandle<LoginRsp>);   // 单向（返回 Empty）的方法没有第三个参数，§8
     // 需要 actor 特有的能力（self()、定时器、Fail）时，用 OnActivate 里保存下来的 ActorContext。
     virtual void OnTick(ActorContext&, Clock::time_point now, std::chrono::milliseconds dt) {}
     virtual void OnDeactivate(ActorContext&, DeactivationReason, DeactivationHandle) = 0; // 异步：存盘
@@ -328,6 +330,7 @@ Activating ──成功──▶ Active ──回收 / 停机 / Fail──▶ De
 | 正在停用 / 停机 | 回"正在停用"/"正在停机" | 计数 |
 | 已过期 | **不回**（调用方早已判超时） | 丢并计数 |
 | 处理函数失败 | 回"处理失败" | 计数 + 日志 |
+| 请求体解码失败（**已定**，依据见 §17） | 回"解码失败"（框架错误码） | 计数 + 限频日志，不记载荷内容 |
 
 错误码见 §8 的 `Status`：框架错误 1..999（沿用 Agent 现有的 1、2：`kRouteErrNoRoute`、`kRouteErrUnavailable`），业务错误 ≥ 1000。
 
@@ -422,11 +425,11 @@ struct Correlation {          // 取代信封里的 u64 seq：仍是 8 字节，
 
 ### `ReplyHandle`（**已定**）
 
-- 处理函数从 `OnMessage` 的参数里拿到一个只能移动的 `ReplyHandle`（`Oneway` 时是空句柄，对它调 `Complete` 无效）。应答只经这个句柄回，`ActorContext` 上没有 `Reply(request, ...)`。
+- 处理函数从 `OnMessage` 的参数里拿到一个只能移动的 `ReplyHandle`（IDL 生成的单向方法没有这个参数，见 §8）。应答只经这个句柄回，`ActorContext` 上没有 `Reply(request, ...)`。
 - `Complete(status, body)` 只生效一次；**析构时还没回过，自动回"无应答"错误。** 这样处理函数忘了回、实例被回收时，调用方不用等到超时。
 - **可以跨回合存活**（延迟应答，如等库加载完再回）。它只持有请求头的拷贝和回送通路，不引用实例，也不引用邮箱里的消息缓冲，所以实例回收之后、或在别的线程上析构，自动回错误都还能发出去。回送通路（同进程投应答通路、跨进程发信封）因此必须线程安全。
 - **带剩余预算**：回之前核对，扣完处理时间不剩就不回（Agent 对 `remaining_ms` 为 0 的消息按无效丢弃）；应答的 `remaining_ms` 取剩余预算。
-- **`Complete` 返回 `void`**，另给 `explicit operator bool`（句柄有效且还欠一个应答；`Oneway` 的空句柄为 `false`）。重复调用：`ASSERT_*`（Debug 下 abort，Release 忽略并按调用点限流记日志），计 `duplicate_reply`。处理函数不碰句柄就返回，句柄析构时自动回"无应答"，计 `no_reply`，忘了回的 bug 就会暴露出来。
+- **`Complete` 返回 `void`**，另给 `explicit operator bool`（句柄有效且还欠一个应答）。重复调用：`ASSERT_*`（Debug 下 abort，Release 忽略并按调用点限流记日志），计 `duplicate_reply`。处理函数不碰句柄就返回，句柄析构时自动回"无应答"，计 `no_reply`，忘了回的 bug 就会暴露出来。
 - 对照 GameserverNew：`OnceReply`（`rpc/dispatcher.go`）只保证至多回一次，不保证至少回一次；处理函数忘了回，调用方等默认的 120 秒超时。
 
 ### `CallHandle`、`CallResult` 与返回值（命名**已定**，其余**提议**）
@@ -522,7 +525,13 @@ A 收到 CallResult ◀──
 
 ### 接口定义与 `Target`（**已定**）
 
-- **命名决定生成什么**：`_Req` 加 `_Rsp` 生成 `Call`，`_Send` 生成 `Send`（单向，返回空）；其他组合生成器报错。空响应也定义一个空字段的 `_Rsp`，不用 `Empty`（`Empty` 表示单向）。GameserverNew 用 `_Ntf`，我们用 `_Send`。**生成器本身没有设计**，是否做、何时做见 §19。
+- **接口用 gRPC 的 schema 写法，生成器自研**（用户选定）：proto 里写 `service` 与 `rpc`，**只用它的 schema 语法，不用 gRPC 的代码与运行时**（不跑 `grpc_cpp_plugin`，不用 `cc_generic_services`）。生成器读 `protoc --descriptor_set_out`，和 `tools/configgen` 同一条路（自带 wire 解码器读 descriptor、自定义 option 放 `options.proto` 一类的文件里）。规则：
+  - `rpc M(Req) returns (Rsp)` 生成 `Call`；`returns (google.protobuf.Empty)` 生成 `Send`（单向）。proto 没有 void 类型，`Empty` 是惯例。
+  - 要"只回成功 / 失败、没有数据"的请求，定义一个空字段的 `Rsp`，**它仍是 `Call`，不是单向**。单向方法只生成 `Send` 存根（只有请求参数，不涉及应答类型），处理函数没有 `ReplyHandle`、没有返回值（用户选定）；不生成 `Call` 存根，调用方想 `Call` 会编译失败，不会静默变成不等应答。
+  - `stream`（任一侧）：生成器报错，设计里没有流式。
+  - 命名后缀（`_Req` / `_Rsp` / `_Send`）不再决定语义，取代原先的规则；留作 lint 与否待定。GameserverNew 用的是命名后缀（`_Ntf`），我们改用签名。
+  - option 编号要避开 `config/schema/options.proto` 的 52001–52107（**提议**：另取一段，如 53xxx；改 option 时还要看 `configgen.py` 的 `OPTION_NUMBERS` 核对）。
+  - **生成器本身还没有设计**，何时做、生成什么见 §19 第 24 项。
 - **`Target` 是值类型，链式方法返回副本，不改原对象**（GameserverNew 的 `At` / `ByHash` / `Broadcast` / `Timeout` 同款）。草图，不是定稿：
 
 ```cpp
@@ -550,7 +559,8 @@ public:
 };
 
 // IDL 生成（对所有模型都一样）。生成的方法统一签名：
-//   void Login(HandlerContext&, const LoginReq&, ReplyHandle<LoginRsp>);
+//   void Login(HandlerContext&, const LoginReq&, ReplyHandle<LoginRsp>);   // rpc 有应答类型：Call
+//   void Notify(HandlerContext&, const NotifyReq&);                        // rpc 返回 Empty：Send，无 ReplyHandle、无返回值
 Status RegisterPlayerService(IMethodRegistrar&, PlayerService* impl_or_null);
 ```
 
@@ -565,17 +575,18 @@ Status RegisterPlayerService(IMethodRegistrar&, PlayerService* impl_or_null);
 
 | 放 | 不放 |
 |---|---|
-| 消息与方法，`_Req` / `_Rsp` / `_Send` 命名决定 `Call` 还是 `Send` | 在哪个执行模型上跑 |
+| 消息与 `service` / `rpc`，`rpc` 签名决定 `Call` 还是 `Send`（返回 `Empty` 是 `Send`） | 在哪个执行模型上跑 |
 | 寻址：属于哪类微服务（`Target::Service`）；按实体寻址时用哪个字段当实体键 | 线程、分片、邮箱等承载配置 |
 | `audience` 和消息号（见下） | |
 
 **消息号（`msg_id`）**：
 - **线上是数字，名字用在 IDL、日志、指标、工具里。** 字符串不上线路：信封路由区"定长、固定偏移、纯数字、没有字符串"是设计前提（`envelope.h`），每条多约 27 字节，不可信输入还多出一块变长解析面。查表本身的 CPU 开销不是主要理由（热缓存微基准，名字约 27 字节，登记 200 到 20000 项：整数键 `FlatHashMap<u32>` 1.3 到 1.8 ns，字符串键 16 到 34 ns，线上带字符串再哈希成 u32 约 6 到 13 ns）。
-- **默认由生成器对"服务名/方法名"取稳定哈希**（`base/hash` 的 `MurmurHash64A` 取低 32 位），**全局查冲突**，冲突或结果为 0 时生成失败，用显式 `(msg_id)` 解决。哈希只在生成器里算，生成的是常量，Go 侧不用实现同一个哈希。这等于一个不需要握手的"名字到数字"字典（pitaya 的做法是路由字符串加握手下发字典，`SetDictionary`）。
+- **第一版每个 `rpc` 都手写 `(msg_id)`**（用户选定）：缺省、为 0、两个 `rpc` 重复都生成失败，**检查范围是所有 proto 一起**，所以生成器一次要读全部 RPC proto。不做哈希。
+- **以后要自动分配**：对没写 `(msg_id)` 的取稳定哈希（`base/hash` 的 `MurmurHash64A` 取低 32 位，哈希只在生成器里算，生成的是常量，Go 侧不用实现同一个哈希），已手写的不变，所以是向后兼容的增量。这等于一个不需要握手的"名字到数字"字典（pitaya 的做法是路由字符串加握手下发字典，`SetDictionary`）。
 - 生成表同时带名字，登记时可以按名字查 id，日志和 `MessageStats`（已支持按 id / 名字统计）显示名字。按名字的通用入口（给 GM 工具、压测机器人用，gRPC 有 generic service）需要时再生成 `ResolveMethod(name) → id`。
 - GameserverNew 的后端 RPC 用 route 字符串（`Header.Route`），`cmd_id` 只在客户端协议里，手写在客户端消息定义的选项上（`proto/cs/cs_item.proto`），网关把 cmdID 翻译成 route 字符串。
 
-**客户端命令与服务间 RPC 要区分（用户确认），机制是 service 级的 `audience`（提议）。** 形状相同（`_Req` / `_Rsp` / `_Send`、生成的注册与分发、`HandlerContext`、执行器都共用），区分的理由是四件事：**信任边界**（客户端是不可信输入，不能触达内部方法）、**身份**（客户端命令要玩家 id）、**错误可见性**（`kUpstream` 等不能泄漏给客户端）、**推送**（服务端到客户端的 `_Send` 目标是客户端连接）。
+**客户端命令与服务间 RPC 要区分（用户确认），机制是 service 级的 `audience`（提议）。** 形状相同（`rpc` 签名、生成的注册与分发、`HandlerContext`、执行器都共用），区分的理由是四件事：**信任边界**（客户端是不可信输入，不能触达内部方法）、**身份**（客户端命令要玩家 id）、**错误可见性**（`kUpstream` 等不能泄漏给客户端）、**推送**（服务端到客户端的单向 `Send` 目标是客户端连接）。
 
 ```
 audience = INTERNAL      // 默认：只给内部服务调用，客户端不可达
@@ -585,8 +596,9 @@ audience = CLIENT_PUSH   // 服务端推给客户端：只生成发送端存根�
 
 - **用 service 级，不用方法级**：service 是承载和评审的单位，不会在一个内部 service 里意外暴露某个方法；GameserverNew 的 `kind` 也是 service 级。要让客户端调某个内部能力，写一个薄的 `CLIENT` service 去显式调内部那个，这一层还能放客户端专有的校验。
 - **强制点三处**：①网关用生成的白名单，只转发 `CLIENT` service 的消息号（GameserverNew 的网关也只转发路由表里登记过的 `cmdID`，其余回 `ERR_NO_ROUTE`）；②后端对带"客户端来源"flag 的信封，只允许命中 `CLIENT` service 的消息号，其余回 `kNoHandler`（不暴露方法存在），这个 flag 只有网关会设，客户端协议不是我们的信封，客户端设不了；③网关出口把框架错误（< 1000）统一映射成通用客户端错误码，业务错误透传。
-- **`CLIENT` 的消息号必须显式 `(msg_id)`**（生成器没写就报错）：客户端是已发布的二进制，id 要稳定，改名不能让它变。`INTERNAL` 默认哈希。
-- **身份**：`request().client_role()` 只对客户端来源有值。**实体键必须来自已认证的会话，不能取自客户端消息体**，否则客户端能直接寻址别的玩家的 actor。GameserverNew 的网关也是从会话里取角色 id（header 的 `ClientRoleID`）。
+- **`CLIENT` 的消息号必须显式 `(msg_id)`**（生成器没写就报错）：客户端是已发布的二进制，id 要稳定，改名不能让它变。第一版所有 service 都手写，见上。
+- **身份**：`request().client_role()` 只对客户端来源有值。**实体键必须来自已认证的会话，不能取自客户端消息体**，否则客户端能直接寻址别的玩家的 actor。GameserverNew 的网关也是从会话里取角色 id（header 的 `ClientRoleID`）。所以 **`CLIENT` service 的请求消息里不许标 `route_key`**（生成器报错，用户确认）：actor 的键由网关从会话取出、写进信封的 `route_key`（**提议**），不来自消息体。
+- **网关路由表**（用户：后续在 gatesvr 做）：`cmd_id` → 后端服务类型，再经 `Locator` 定位到该类型服务的具体节点（§14）。上面强制点①的白名单就是这张表的一部分。表从哪来（由 proto 里的服务类型生成，还是配置）没定，见 §19 第 34 项。
 - **客户端协议自己的请求关联**（cmd 加客户端 `seq`）由网关翻译，不进内部 `Correlation`：GameserverNew 的 `forwardToBackend` 把客户端 `SeqID` 留在闭包里，用 `RspCmdID` 回给客户端。
 - **推送**：`Target::Client(role)` 要经 Agent 路由到持有该会话的网关；"会话到网关"的映射没设计（§19）。
 
@@ -822,8 +834,6 @@ S1 的线程循环怎么写有两个选择（复用 `EventLoop` 的唤醒与定�
 | `EventLoop` | **不直接用**，S2 时评估能否抽取它的唤醒和定时器部分 | 它是网络内部类型，带 epoll 和连接表；Shard 不需要这些 |
 | `MpscQueue` / `SpscQueue` / `SharedBuffer` / `TimerWheel` / `Now` / `MurmurHash64A` | **沿用** | 契约都满足（每个生产者内部有序、定时器单线程使用、`Now` 是原子量、哈希结果稳定）。`TryDequeueBulk` 里的峰值采样问题已修（见 §9「入口层与直接投递（实测）」），`PeakApprox` 现在是近似下界 |
 | 信封与 Agent 路由（`dst`、`route_key`、`msg_id`、`remaining_ms`、`Direct` 路由） | **沿用，`seq` 改成 `Correlation`**（提议，§8） | 其余够用。还没上线，信封直接改、不考虑兼容；如果选了"信封加显式 kind 字段"也直接改 |
-| `Actor模型与RPC设计.md` | **不继承** | 实验性，偏 Go |
-
 ## 16. 未覆盖的需求（**提议**：明确列出，不在两种执行方式里解决）
 
 执行模型这一层，两种加 actor 池和 `Offload` 是够的，这个判断依据是读过的几个框架里"无状态并行"都是普通 actor 加选择器（§3），不是对真实负载的统计。Orleans 还有进程级的 `SystemTarget`，我只确认了名字和 `IsSystemTarget()` 的处理。**"覆盖了多少"给不出百分比。** 下面是两种之外的需求：
@@ -879,6 +889,31 @@ S1 的线程循环怎么写有两个选择（复用 `EventLoop` 的唤醒与定�
 
 **借鉴的**：`Submit` 不得内联执行的契约（来自 `EventEngine::Run`）、新执行模型的实现清单（来自 `EventEngine` 的 README，§4）、库产生的码和应用的码分清（`doc/statuscodes.md`，我们用数值分区）。**不借鉴的**：三套风格并存且规则各不相同（它自己在 `SetServerApiType` 里要为"把方法覆盖成另一种类型"打日志，说明这是个坑）。**可能要补的**：拦截器（中间件）钩子，追踪、指标、鉴权会用到（§19）；取消传播，收益对游戏服不大，先不做。
 
+### 请求体在哪一步解码、解码失败怎么办（对照别家，**已定**）
+
+2026-11-05 读了各项目 GitHub 上 master / main 分支的源码（只看这一个问题，没通读，没测性能）。表里"没查到"的格子是这次抓取的文件里没有，不是不存在：
+
+| 框架 | 在哪一步解码 | 解码失败 |
+|---|---|---|
+| gRPC Go（`rpc_util.go` 的 `recv`、`server.go` 的 `wrapUnaryHandler`） | 处理这条 RPC 的流程里，由生成的 handler 调 `RecvMsg` 时触发 | 回 `codes.Internal`，"failed to unmarshal the received message" |
+| gRPC C++（`method_handler.h`） | 框架驱动的 `Deserialize` 回调，不在 `RunHandler` 里；跑在哪个线程头文件里没有 | 状态非 OK 就不调业务，经 `ServerSendStatus` 回给调用方；具体状态码没查到 |
+| brpc（`baidu_rpc_protocol.cpp` 的 `ProcessRpcRequest`） | 同一个函数里同步解析，解析完才调业务方法（业务方法可以再转线程池） | `SetFailed(EREQUEST, "Fail to parse request=…")`，回错误应答 |
+| Akka Artery（`Codecs.scala`） | 远程流里单独的 `Deserializer` 阶段，**在投递到 actor 邮箱之前** | 记 error 日志、丢弃；不进 dead letters，不隔离连接；不通知发送方 |
+| protoactor-go（`endpoint_reader.go`） | 收包的 goroutine，**在 `Root.Send` 之前** | 记日志后 `return err`，**整条接收流被终止**；不通知发送方 |
+| skynet（`skynet.lua`） | 目标服务自己的线程上、恢复处理协程之前（`p.unpack`） | `unpack` 本身抛错时，"给调用方回 `PTYPE_ERROR`"那段不会执行（只有处理函数抛错才回），没有错误应答 |
+
+**能看出的**：
+- **两派。** actor 框架（Akka、protoactor）在入口解码，邮箱里是类型化对象，失败时它们丢弃或断流、不通知发送方（这是它们的选择，不是入口解码必然如此：我们的信封带请求类型，入口也可以直接回错误）；RPC 框架（gRPC、brpc）解码失败回错误应答，gRPC Go 用 `Internal`，brpc 用专门的 `EREQUEST`。
+- **做 RPC 的没有静默丢请求的。** skynet 是反例，调用方拿不到错误。
+- **protoactor 的"断整条流"代价最大**：一条坏消息连累同一连接上所有消息。
+
+**已定**（用户 2026-11-05 选定执行时解码，按下面四条）：
+1. **解码放在 thunk 里、处理函数执行时**（执行器线程，不在 IO 线程）。理由：IO 线程只做定长解析（§4）；邮箱里存字节，和 §10 的"本地消息统一用字节"一致；邮箱满、实例不存在、已过期这些拒绝都发生在解码之前，过载时不白花 CPU（Akka、protoactor 的入口解码做不到这点，坏消息和好消息一样先花解码的代价）。代价：坏消息先占一个邮箱额度；解码耗时算进该实例的回合，大消息会拖慢同 Shard 的别的实例，所以载荷大小要在入口限制。
+   **入口解码的好处（反方）**：解码的 CPU 落在多个 IO 线程上，不占串行的 Shard 线程（S0 时就是主循环）；解不开的坏消息不进邮箱；入口可以直接回错误。它的代价：邮箱要存类型化对象（每种消息一个类型的队列，或 `unique_ptr<Message>` 加堆分配与虚析构），和 §10 的"本地消息统一用字节"冲突；被邮箱拒绝的消息也先花了解码；同进程调用没有 IO 线程，"入口"变成发起方线程。**哪边更划算没测过**，要等有真实消息和负载再比。
+2. **终态**：请求回框架错误码"解码失败"（1..999 段，码值见 §19 第 12 项），单向消息计数加限频日志；日志只记 `msg_id`、来源、长度，不记载荷（不可信输入）；计数按 `msg_id` 分，不按实例。回错误由 thunk 直接发，处理函数没被调用。
+3. **不做"断整条连接"。** 是否对"同一来源连续解码失败"踢连接，留给网关：`CLIENT` 来源本来就不可信；`INTERNAL` 来源的解码失败是 bug，应当报警。
+4. proto3 没有 `required`，解码失败只来自线格式损坏；字段取值是否合法是业务校验，不算框架的解码失败。
+
 ## 18. 验证计划与落地路线
 
 | 阶段 | 内容 | 要证伪 / 验证什么 |
@@ -912,16 +947,18 @@ S1 的线程循环怎么写有两个选择（复用 `EventLoop` 的唤醒与定�
 21. **回调契约**（§8）：至多一次、发起实例回收后不调、`Cancel` 之后不调，是否都接受。
 22. **编排辅助的语义**（§8）：`Join` 要不要快速失败；聚合层是否自带 deadline；多个错误怎么汇总。
 23. **启动就绪等待的形状**（§15）：等待期间泵主循环；超时默认值；失败是否中止启动；与第 1 项同属 App 层，要不要一起暂缓。
-24. **接口定义与生成器**（§8）：方向已定（一份生成加运行期登记器，命名规则 `_Req` / `_Rsp` / `_Send`），生成器何时做、生成什么（强类型存根、注册函数、网关白名单）、`thunk` 的 `impl` 参数的具体形状待定。
+24. **接口定义与生成器**（§8）：方向已定（一份生成加运行期登记器；gRPC schema 写法，`rpc` 签名决定 `Call` / `Send`，`Empty` 是单向，`stream` 报错）。待定：生成器何时做、生成什么（强类型存根、注册函数、网关白名单）；`thunk` 的 `impl` 参数的具体形状；命名后缀是否留作 lint。**已定**：单向方法只生成 `Send`、处理函数没有 `ReplyHandle`；处理函数执行时解码，请求回"解码失败"，单向计数加限频日志，不断连接（§17 对照了 gRPC、brpc、Akka、protoactor、skynet；§7 终态表已加一行）。
 25. **`Target` 的具体写法**（§8）：草图不是定稿。
 26. **`Status` 的形状**（§8，提议）：只有码、没有消息串是否够用（细节放 `body`）；`MapUpstream` 对业务错误是否一律透传；`deadline_reserve` 的默认值（要实测）。
 27. **入口车道的细节**（§7、§9）：每条车道的默认上限和配置位置；Shard 线程轮转各车道时每轮每条取多少（公平策略）；kind 很多时车道数（分片数 × kind 数）的开销。直接投递的重新评估要等有实测瓶颈（§9 记了对比数据）。
 28. **拦截器（中间件）钩子**（§17）：追踪、指标、鉴权要不要在 `Dispatcher` 层加。GameserverNew 的 `core/dispatcher` 有 `Middleware`，gRPC 有 interceptors，我们现在没有。
 29. **"会话到网关"的映射与推送路由**（§8）：`Target::Client(role)` 怎么找到持有该会话的网关。
-30. **`msg_id` 的细节**（§8）：冲突检查的范围（所有 proto 一起）；是否提交一份生成的 id 清单文件，让改名导致的 id 变化在评审里可见；`ResolveMethod(name)` 何时做。
+30. **`msg_id` 的细节**（§8）：第一版手写，冲突检查范围是所有 proto 一起（已定）；手写要不要按服务划号段、避免多人改同一区间冲突；是否提交一份生成的 id 清单文件，让改名或改号在评审里可见；何时加"没写就取哈希"的自动分配；`ResolveMethod(name)` 何时做。
 31. **`HandlerContext` 与 `audience` 的细节**（§8）：`RequestInfo` 里放什么；`CLIENT` service 的处理函数是否都带 `client_role`；`CLIENT_PUSH` 的发送端存根形状。
 32. **主循环 RPC 超时的精度**（§4）：沿用 tick 粒度（约 33 ms），还是改成 `wait_until(min(下次 tick, 时间轮最近到期))`。
 33. **峰值采样间隔**（§9）：`kPeakSampleEvery` 现为 1024；积压有界（每车道 ≤ 4096）时间隔 64 也与不采样持平，只有无界积压才慢（见 §9 的隔离实验），不必再放大；要不要让间隔随上次采到的深度变大；`queue_peak` 是下界是否够用。
+34. **网关路由表**（§8，用户：后续在 gatesvr 做）：`cmd_id` → 后端服务类型 → `Locator` → 节点；表由 proto 里的服务类型生成还是单独配置；与第 29 项（会话到网关的映射）互为反向，一起设计。
+35. **消息的编解码运行时**（§8）：**已定**用 libprotobuf（用户选定）。要做：给 C++ 的 `vcpkg.json` 加 protobuf（现在没有；Go 侧 `go.mod` 已有 `google.golang.org/protobuf`）；生成器除了 RPC 存根，还要调 `protoc --cpp_out` 生成消息类。待查：本机 `protoc` 是 3.21.12，要和 vcpkg 里的 libprotobuf 对上版本（生成代码会校验版本，不一致编译就报错，**没在本仓库试过**）；`ParseFromArray` 可以直接读 `SharedBuffer` 的连续内存，但 `string` / `bytes` 字段默认会拷进消息对象，这点**没测过**，是否要紧要等有真实消息。
 
 ## 附：不做的事
 
