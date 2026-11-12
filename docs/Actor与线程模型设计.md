@@ -34,9 +34,9 @@ Agent、信封、共享内存通道见 [共享内存IPC设计.md](共享内存IP
 22. **消息编解码用 libprotobuf**（用户选定，2026-11-05，§8、§19 第 35 项）。**请求体在处理函数执行时解码**（执行器线程，不在 IO 线程）；解码失败：请求回框架错误码"解码失败"，单向消息计数加限频日志，不断连接（用户选定，依据见 §17 的对照）。
 23. **actor 不提供 `PostToMain`**（用户选定，2026-11-05，§10）：actor 访问主循环里的模块，一律对该模块登记的 rpc 发统一的 `Call`，不管目标在本进程还是远端。`Offload` 不在此列（它是把计算挪去线程池，不是调另一个组件）。
 24. **调用方只给对象 id，位置透明**（用户选定，2026-11-05，§8、§14）：业务不写 kind、不写节点；IDL 在 service 级声明 `service_type` 与 `object_type`，请求里用 `(route_key)` 标出对象 id 字段，生成的存根据此带出对象类型。`Locator` 按（服务类型，对象类型，id）（如 `scenesvr.player.12345`）解析出节点：对象创建时登记到注册中心，进程内缓存查询结果（注册中心的实现与唯一性保证**未定**，§19 第 36 项）。**`ActorKind` 仍是 `ActorSystem` 内部概念，对象类型与 kind 分开**；主循环模型没有 kind，只有对象类型。
-25. **主循环模型的对象由业务的管理器自己管**（比如 scenesvr 上一个主循环同时管场景、玩家、boss），创建和销毁时调与 `ActorSystem` 在激活和回收时自动调的**同一个**通用 `Register` / `Unregister`（用户选定，§14）。
+25. **主循环模型的实体由框架提供的 `EntityManager<T>` 统一管理**（用户选定，2026-11-05，§14）：业务模块（`PlayerModule`、`SceneModule`，一个模块可以持有多个，比如 scenesvr 同时管场景、玩家、boss）用 `Adopt` / `Activate` / `Remove` 管理实体，**登记与注销在接口里自动联动对象目录**，业务不直接调 `Register`。**命名**：框架组件叫 `EntityManager`，业务那一层叫 `XxxModule`，不再叫"管理器"。`EntityManager` 是模块的成员变量，不是登记进某个系统的 kind。
 
-**提议**（未确认，见 §19）：统一的 Shard 结构（§9）、`Locator` 接缝（§14）、`ActorContext` 不给 `App` / 模块引用（§5）、显式创建为默认（§6）、本地消息统一用字节（§10）、actor 池的分片函数与选择器（§3、§9）、`Correlation` 结构与回调契约（§8）、`Status` 的形状（§8）、`HandlerContext` 与 IDL 生成器的细节（`audience`、`msg_id`、登记器，§8）、未覆盖需求的清单（§16）、对象解析器与统一的"对象不存在"错误码、`Register` 的异步与 RAII 句柄（§8、§14）等。
+**提议**（未确认，见 §19）：统一的 Shard 结构（§9）、`Locator` 接缝（§14）、`ActorContext` 不给 `App` / 模块引用（§5）、显式创建为默认（§6）、本地消息统一用字节（§10）、actor 池的分片函数与选择器（§3、§9）、`Correlation` 结构与回调契约（§8）、`Status` 的形状（§8）、`HandlerContext` 与 IDL 生成器的细节（`audience`、`msg_id`、登记器，§8）、未覆盖需求的清单（§16）、对象解析器与统一的"对象不存在"错误码、`Register` 的异步与 RAII 句柄（§8、§14）、`EntityManager` 的接口与它和 `ActorSystem` 共用生命周期层（§6、§14）等。
 
 ## 1. 需求
 
@@ -306,6 +306,8 @@ Activating ──成功──▶ Active ──回收 / 停机 / Fail──▶ De
 - **空闲回收**：默认不开，按 kind 可选。参考 Orleans 的 `ActivationCollector`：按"最后访问时间加存活期限"分桶，周期定时器扫描。
 - **停机**：App 层的停机阶段暂缓（§19 第 1 项），`ActorSystem` 自己提供排空，由 `main` 在合适的时机调用。排空顺序：先拒绝新消息（回"正在停机"），再对所有实例 `Deactivate`，等存盘完成或到截止时间。
 
+**与主循环模型共用生命周期层（提议，§14 的 `EntityManager`）**：上面的状态、激活失败、显式 / 按需创建、回收，都与邮箱无关。拆成一层共用：`ActorSystem` 每个 Shard 的本地表用它，再叠加每实例邮箱；主循环模块用 `EntityManager` 直接使用它。只做一份，不在两处各写一套。
+
 ## 7. 消息投递与终态
 
 ### `Deliver` / `Submit` 只返回入口级结果
@@ -359,7 +361,7 @@ Activating ──成功──▶ Active ──回收 / 停机 / Fail──▶ De
 4. **超时用该上下文的 `TimerWheel`，应答和超时竞争时终态唯一。** 先到的赢，后到的丢弃并计数，而且**分开计数**：`late_reply`（应答晚于超时）和 `unknown_seq`（没对上）。silver-server 的 `recvSSResRpc` 注释里写了这两种情况原来在日志里分不清。
 5. **deadline 沿用信封的 `remaining_ms`**，被调方出队时再判过期（§7）。
 6. **主循环模块和 actor 都能发、都能收。** 回调在发起方自己的上下文里执行；被调方只管 `ReplyHandle::Complete`，不关心对方在哪种执行方式里。
-7. **统一的 `Call`**：目标是 `Object(对象类型, id)`（actor 与主循环管理器里的对象都是它）、`Pool(对象类型)`（§3）或 `Service(service_type, 路由方式)`（§14）；业务一般不手写 `Target`，由生成的存根按 IDL 填。同进程调用和跨进程调用用同一个入口，由 `Locator` 决定本地投递还是走信封加 Agent。
+7. **统一的 `Call`**：目标是 `Object(对象类型, id)`（actor 与主循环 `EntityManager` 里的对象都是它）、`Pool(对象类型)`（§3）或 `Service(service_type, 路由方式)`（§14）；业务一般不手写 `Target`，由生成的存根按 IDL 填。同进程调用和跨进程调用用同一个入口，由 `Locator` 决定本地投递还是走信封加 Agent。
 
 ### 异步（**已定**：没有同步版本）
 
@@ -423,7 +425,7 @@ struct Correlation {          // 取代信封里的 u64 seq：仍是 8 字节，
 
 1. **永远异步完成**：失败（在途数超限、无路由、`Locator` 答"非本地"）也投回自己的应答通路，下一轮执行，不在 `Call` 的栈里调。否则回调会在调用方处理函数执行到一半时重入。GameserverNew 的 `Core.Call` 同样如此（关闭或发送失败都经 `Poster` 投回，`core.go`）。
 2. **回调在发起方的上下文里执行**，不需要加锁。
-3. **回调被调用，就说明发起实例仍活着、代次相同。** 挂起项记录发起实例 `(kind, key, 代次)`，应答到达或超时触发时核对，对不上就丢弃。每一项都有超时，必然回收，所以惰性清理就够，不建按实例的索引。回调里可以放心用捕获的 `this`。**这条保证只对 actor 成立**：主循环管理器里的对象没有代次，见 §14。
+3. **回调被调用，就说明发起实例仍活着、代次相同。** 挂起项记录发起实例 `(kind, key, 代次)`，应答到达或超时触发时核对，对不上就丢弃。每一项都有超时，必然回收，所以惰性清理就够，不建按实例的索引。回调里可以放心用捕获的 `this`。**这条保证只对 actor 成立**：主循环模块里的对象默认没有代次（`EntityManager` 可以统一发，见 §14）。
 4. **至多一次**：成功、错误、超时各调一次；发起实例被回收时不调；`Cancel` 之后不调。`Cancel` 在发起方的上下文里同步生效，不存在"取消的同时应答正好来了"的竞争。
 5. **必须带超时，没有"无限等"。**
 
@@ -611,7 +613,7 @@ audience = CLIENT_PUSH   // 服务端推给客户端：只生成发送端存根�
 
 ### 用法示例（草图）
 
-**不是定稿**：类型化存根的形状、`Result<T>`、`ObjectResolver`、`ObjectRegistration`、`locator()`、`mainLoop().registrar()` 这些名字和形状都还没定（§19 第 24、36 到 41 项），写出来是为了看流程。
+**不是定稿**：类型化存根的形状、`Result<T>`、`ObjectResolver`、`EntityManager`、`mainLoop().registrar()` 这些名字和形状都还没定（§19 第 24、36 到 42 项），写出来是为了看流程。
 
 proto：
 
@@ -667,26 +669,25 @@ Status PlayerModule::Init() {
 // 对象的登记与注销由 ActorSystem 在激活和回收时自动做
 ```
 
-接收方 B，主循环里的管理器（同一个模块可以再登记场景、boss 等服务，各自一个解析器）：
+接收方 B，主循环里的业务模块（持有 `EntityManager`，同一个模块可以再持有 `EntityManager<Scene>`、`EntityManager<Boss>`，§14）：
 
 ```cpp
 class Player : public ScenePlayerService { /* 实现 GetInfo / Kick，可以和 A 共用业务代码 */ };
 
-Status SceneModule::Init() {
-    return RegisterScenePlayerService(app().mainLoop().registrar(),
-        [this](ObjectId id) -> ScenePlayerService* {          // 在主循环线程上被调用
-            auto it = players_.find(id);  return it == players_.end() ? nullptr : it->second.get();
-        });                                                   // 返回空：框架直接回 kNoSuchObject
-}
-void SceneModule::OnPlayerEnter(ObjectId id) {
-    players_[id] = std::make_unique<Player>(id);              // 先加载完
-    regs_[id] = locator().Register(ScenePlayerService::kObjectType, id,
-                    [id](Status s) { /* 登记完成，才通知客户端成功 */ });
-}
-void SceneModule::OnPlayerLeave(ObjectId id) {
-    regs_.erase(id);        // RAII，析构即 Unregister，先注销
-    players_.erase(id);     // 再销毁
-}
+class PlayerModule : public Module {                          // 业务模块：登录流程、广播、二级索引、遍历 tick
+    EntityManager<Player> players_{ ScenePlayerService::kObjectType, EntityConfig<Player>{ /* 钩子等 */ } };
+public:
+    Status Init() override {
+        return RegisterScenePlayerService(app().mainLoop().registrar(),
+                                          players_.Resolver<ScenePlayerService>());   // 解析不到：框架回 kNoSuchObject
+    }
+    void OnEnter(ObjectId id, PlayerState s) {                // 玩家带着状态进入
+        players_.Adopt(id, std::make_unique<Player>(std::move(s)),
+                       [id](Status) { /* 登记完成，才通知客户端成功 */ });   // 本地立即可用，对外可见要等登记完成
+    }
+    void OnLeave(ObjectId id) { players_.Remove(id); }        // 本地先摘除，再异步注销
+    void Tick()               { players_.ForEach([](Player& p) { p.Tick(); }); }   // 同步遍历：选主循环模型的理由
+};
 ```
 
 调用方（比如邮件服里的一个处理函数）：
@@ -890,7 +891,7 @@ S1 的线程循环怎么写有两个选择（复用 `EventLoop` 的唤醒与定�
 `Call` 的目标是 `Object(对象类型, id)`、`Pool(对象类型)`（§3）或 `Service(service_type, 路由方式)`（业务一般不手写，由生成的存根按 IDL 填）：
 
 - **`Service(service_type, 路由)`**：微服务这一层。Agent 路由已经支持：信封的 `service_type` 配合 `Direct` / `Any` / `Hash` / `Broadcast`（`envelope.h`、`route_table.h`），含义是"某类服务的某个实例"。Agent 本身就是 sidecar。
-- **`Object(对象类型, id)`**：对象这一层。对象可以在 actor 里，也可以由主循环里的管理器管理，调用方不关心。先由 `Locator` 查位置得到节点（见下），再发 `Direct`，信封填 `dst = 节点`、`route_key = 对象 id`，到目标进程后进 `Dispatcher`，按消息号找到登记者。
+- **`Object(对象类型, id)`**：对象这一层。对象可以在 actor 里，也可以由主循环模块的 `EntityManager` 管理，调用方不关心。先由 `Locator` 查位置得到节点（见下），再发 `Direct`，信封填 `dst = 节点`、`route_key = 对象 id`，到目标进程后进 `Dispatcher`，按消息号找到登记者。
 - **`Pool(对象类型)`**：actor 池（§3）。选择器挑出一个成员后等价于 `Object(对象类型, 选出的键)`，同样先过 `Locator`。
 - 接收方不区分来源：消息到了目标进程，进同一个 `Dispatcher`、同一套处理函数和 RPC 应答路径，不管调用方是本进程的 actor、本机另一个进程还是别的机器。
 
@@ -904,23 +905,23 @@ S1 的线程循环怎么写有两个选择（复用 `EventLoop` 的唤醒与定�
 
 **已定**（用户选定，2026-11-05）：
 
-- **调用方只给对象 id，不写 kind、不写节点。** 对象不管在 actor 里还是在主循环的管理器里，调用方式一样。
+- **调用方只给对象 id，不写 kind、不写节点。** 对象不管在 actor 里还是在主循环模块的 `EntityManager` 里，调用方式一样。
 - **注册键是（服务类型，对象类型，id）**，如 `scenesvr.player.12345`：同一个玩家 id 在 `scenesvr` 和 `mailsvr` 里是两种对象，键不同，不冲突，也不会拿 id 发给错误的类型。服务类型与对象类型在 IDL 的 service 级声明（§8），生成的存根带出来，业务代码里看不见。
 - **三个概念分开**：
 
 | 概念 | 属于 | 用来做什么 |
 |---|---|---|
-| `ActorKind` | `ActorSystem` 内部 | 工厂、分片组、邮箱和车道上限、tick。**主循环模型没有它** |
+| `ActorKind` | `ActorSystem` 内部 | 生命周期配置（工厂、激活策略）加执行配置（分片组、邮箱和车道上限、tick）。**主循环模型没有它**，只有其中的生命周期配置 `EntityConfig`（见下） |
 | 对象类型（`scenesvr.player`） | IDL 声明；注册中心的键 | 存根、`Locator`、登记 |
-| 对象 id | 信封的 `route_key` | 路由；主循环模型里业务拿它去管理器里查 |
+| 对象 id | 信封的 `route_key` | 路由；主循环模型里经 `EntityManager` 的解析器查 |
 
-- **登记**：对象创建时登记、销毁时注销，用同一个通用接口。actor 由 `ActorSystem` 在激活和回收时自动调；主循环模型由业务的管理器在创建和销毁对象时自己调。
+- **登记**：对象创建时登记、销毁时注销，用同一个通用接口。actor 由 `ActorSystem` 在激活和回收时自动调；主循环模型由框架的 `EntityManager` 在 `Adopt` / `Activate` / `Remove` 时自动调，业务不直接调（见下面的 `EntityManager` 小节）。
 - **位置解析**：进程里的 `Locator`（AppRouter）按键查本地缓存，未命中再查注册中心，结果写缓存，后面直接取缓存。
 
-**提议**（细节，见 §19 第 36 到 41 项）：
+**提议**（细节，见 §19 第 36 到 42 项）：
 
-- **`Register` 是异步的**（RPC 一律异步，第 11 条）：`Register(object_type, id, on_done)`，完成回调之前别人找不到它，比如登录流程等登记完成再通知客户端成功。返回一个只能移动的 RAII 句柄（`ObjectRegistration`），存在对象旁边，析构即 `Unregister`，免得主循环管理器忘了注销留下陈旧项（忘了注销的后果：调用方被路由过来后收到"不存在"，作废缓存重查，但注册表里的旧项还在，下次又查到）。
-- **顺序**：先加载完状态再登记，先注销再销毁。`ActorSystem` 在 `Active` 登记（倾向；`Activating` 阶段邮箱已在收消息，也可以更早）。
+- **`Register` 是异步的**（RPC 一律异步，第 11 条）：`Register(object_type, id, on_done)`，完成回调之前别人找不到它，比如登录流程等登记完成再通知客户端成功。返回一个只能移动的 RAII 句柄（`ObjectRegistration`），析构即 `Unregister`；`EntityManager` 内部持有它，业务一般不直接碰，只有绕开 `EntityManager` 直接调 `Register` 的特殊场景才自己持有。忘了注销的后果：调用方被路由过来后收到"不存在"，作废缓存重查，但注册表里的旧项还在，下次又查到。
+- **顺序**：对象 `Active` 之后才登记（`ActorSystem` 倾向在 `Active` 登记；`Activating` 阶段邮箱已在收消息，也可以更早）。注销：`EntityManager::Remove` 先从本地表摘除，之后解析器返回空、调用方收到 `kNoSuchObject`，再异步注销；注销只影响注册表整洁，不影响安全，所以业务不用自己记"先注销再销毁"。
 - **定位策略按对象类型**：声明为"仅本进程"的（主循环单例、MMO 场景内部）不碰注册中心，`Locator` 恒答本地；其余走注册中心。原因是每次 `Call` 多一次缓存读，同节点 actor 互调也一样，开销**没测过**（§9 的前提之一是 IO 线程不碰全局地址表）。
 - **缓存失效与重发**：对端答 `kNoSuchObject`（明确没处理）→ 作废缓存、重查一次、按新位置重发；`kUnavailable`（进程宕机等）也作废缓存。**重发只针对"明确未处理"，最多一次，属于定位，不算自动重试**（附录里"不做"的重试指超时后不知道有没有处理的情形）。
 - **防暴露**：注册中心只管"能不能被找到"，不管"能不能被打到"：远端知道节点地址也能直接发信封。接收侧仍要按对象类型检查是否允许远端访问，和 `audience` 同一类机制。
@@ -928,7 +929,7 @@ S1 的线程循环怎么写有两个选择（复用 `EventLoop` 的唤醒与定�
 
 **接收方两种模型的差异**（调用方不需要关心地址，但要知道行为不同）：
 
-- **解析器**（**提议**）：主循环登记时不绑模块，而传 `ObjectResolver`（对象 id → 实现指针，在主循环线程上调）。thunk 执行时先解析，返回空就由框架回 `kNoSuchObject`（单向则计数），不调处理函数。这样"对象不存在"由框架保证，不靠处理函数自觉；actor 的实例由 Shard 本地表查出，两边 thunk 形状一致。一个主循环模块可以登记多个服务，各自一个解析器（玩家、场景、boss）。
+- **解析器**（**提议**）：主循环登记时不绑模块，而传 `ObjectResolver`（对象 id → 实现指针，在主循环线程上调）。thunk 执行时先解析，返回空就由框架回 `kNoSuchObject`（单向则计数），不调处理函数。这样"对象不存在"由框架保证，不靠处理函数自觉；actor 的实例由 Shard 本地表查出，两边 thunk 形状一致。一个主循环模块可以登记多个服务，各自一个解析器（玩家、场景、boss）。解析器通常由 `EntityManager::Resolver<Iface>()` 给出，业务不手写。
 - **同一个服务里的方法要寻址不同类型的对象**：拆成多个服务，或定义共同的对象类型（如 `scenesvr.entity`，玩家和 boss 共用一个 id 空间）。`object_type` 是服务级，不做方法级覆盖。
 - 差异表：
 
@@ -936,14 +937,66 @@ S1 的线程循环怎么写有两个选择（复用 `EventLoop` 的唤醒与定�
 |---|---|---|
 | 串行粒度 | 每对象串行，对象之间并行 | 所有对象串行在一个线程，一个慢处理拖住全体 |
 | 背压 | 每实例邮箱上限加每车道上限 | 只有全局队列和字节预算，没有"单对象邮箱满" |
-| 生命周期 | 有激活失败、正在停用等终态，空闲回收，显式创建 | 管理器自己管，框架给不出统一终态 |
+| 生命周期 | 有激活失败、正在停用等终态，空闲回收，显式创建 | 用 `EntityManager::Activate` 时与 actor 相同；只用 `Adopt` 时没有激活状态（**提议**） |
 | 回调安全 | 发起实例被回收则丢弃回调（§8 回调契约第 3 条） | **没有代次，回调仍会执行，捕获的对象指针可能已悬空** |
 
-回调安全是**开放点**：想法是发起时记下对象 id，回调前用解析器再解析一次，找不到就丢弃；同一 id 销毁后重建要代次才分得清，要由解析器提供。没细想，§19 第 39 项。
+回调安全的落点（**提议**，没细想）：`EntityManager` 在对象加入时统一发代次，解析器返回（指针，代次）；发起调用时记下对象 id 和代次，回调前复核，对不上就丢弃，和 actor 丢弃回调一致。§19 第 39 项。
 
 **与已定第 9 条的关系**：第 9 条是不做"全集群唯一激活的分布式目录"。查找表和唯一性保证是两回事：只记录"谁创建、在哪"、创建由分配方显式保证唯一，不违背；加 create-if-absent 或租约防双重激活，靠近第 9 条说的；Orleans 式强一致目录（视图号、宕机后重建）就是。注册中心做到哪一级见 §19 第 36 项。
 
 **别家**（读了各家文档，网页抓取摘要，没通读）：Orleans 的目录以 grain id 为键指向 silo，每个 silo 本地缓存查询结果，缓存缺失或失效才远程读，v9 起是强一致目录；Akka Cluster Sharding 的 `ShardCoordinator` 记的是 shard 级位置；Dapr 对（actor type，id）做哈希，placement 服务算出的分区表存在每个 sidecar 本地，没有对象级注册。我们的方案是对象级目录加本地缓存，和 Orleans 最接近；对象级登记的好处是能显式放置（§14 前面选了显式分配），代价是每个对象创建要写一次注册中心。
+
+### `EntityManager`：主循环模型的实体管理（命名与方向**已定**，其余**提议**）
+
+**已定**（用户选定，2026-11-05）：主循环模型的实体不让业务自己维护 `map` 加手工登记，而由框架提供的 `EntityManager<T>` 统一管理，对象的登记与注销在它的接口里自动联动。**命名**：框架组件叫 `EntityManager`；业务那一层叫 `XxxModule`（`PlayerModule`、`SceneModule`），不再叫"管理器"。
+
+| 层 | 名字 | 管什么 |
+|---|---|---|
+| 框架组件 | `EntityManager<T>`（模块的成员变量） | 实例表、`Adopt` / `Activate` / `Remove`、登记与注销、解析器、代次、激活窗口暂存、遍历 |
+| 业务模块 | `PlayerModule` 等 | 登录流程、踢人、广播、限额、二级索引、`Tick` 里遍历、决定何时激活 |
+
+`EntityManager` 只替代业务模块里通用的那部分，不替代模块本身。一个模块可以持有多个（玩家、场景、boss 各一个，一个 `EntityManager` 管一种对象类型）。actor 模型**同样需要**业务层来决定何时 `Activate`、维护在线集合、踢人、广播、限额；`ActorSystem` 只管实例的生命周期（§6），不管这些业务策略（此前这里写"不需要"是错的，用户指出，2026-11-06）。这一层放在哪、怎么和 `ActorSystem` 联动，见 §19 第 43 项。
+
+**接口草图（不是定稿）**：
+
+```cpp
+template <class T>
+struct EntityConfig {                              // 生命周期配置，不含执行配置；ActorKind = EntityConfig + 执行配置
+    std::move_only_function<std::unique_ptr<T>(ObjectId)> create;     // Activate 用
+    ActivationPolicy activation = ActivationPolicy::kExplicit;       // 默认显式，同 §6
+    std::chrono::milliseconds idle_timeout{0};                       // 0 = 不回收
+    std::size_t pending_limit = 64;                                  // 激活窗口内每个对象最多暂存几条
+    std::move_only_function<void(T&)> on_added, on_removed;          // 业务同步二级索引
+};
+
+template <class T>
+class EntityManager {                              // 只能在主循环线程用（Debug 断言）
+public:
+    EntityManager(ObjectType, EntityConfig<T>);    // 对象类型取自 IDL 生成的 kObjectType
+    void   Adopt(ObjectId, std::unique_ptr<T>, OnRegistered = {});   // 对象在别处已构造好（如玩家带状态进入），直接 Active
+    void   Activate(ObjectId, OnActivated);        // 工厂创建，OnActivate 异步加载，完成后 Active
+    void   Deactivate(ObjectId, OnDeactivated);    // 异步存盘，完成后摘除
+    void   Remove(ObjectId);                       // 不存盘，直接摘除
+    T*     Find(ObjectId);
+    void   ForEach(std::function<void(T&)>);       // 同步遍历：选主循环模型的理由
+    std::size_t size() const;
+    template <class Iface> ObjectResolver<Iface> Resolver();         // 交给 RegisterXxxService
+};
+```
+
+要点：
+- **登记联动**：`Adopt` / `Activate` 完成后自动 `Register(object_type, id)`（异步：完成回调之前对外找不到，本地立即可用；各完成回调在登记完成后才调），`Deactivate` / `Remove` 自动 `Unregister`。`ObjectRegistration` 由它内部持有。
+- **`Remove` 的语义**：先本地摘除，之后解析器返回空。遍历期间调用 `Remove` 延迟到遍历结束再摘除，否则迭代器失效。
+- **激活窗口**：解析器结果有三种：找到 / 不存在 / 激活中。激活中的消息暂存在 `EntityManager` 里（只存这个窗口，有界，超限回 `kOverloaded`），激活完成后补投，激活失败则逐条回 `kActivationFailed`，和 §6 一致。主循环模型没有邮箱，所以要自己带这个暂存，但它不是通用邮箱。
+- **钩子而非继承**：业务模块用 `on_added` / `on_removed` 同步二级索引（如按名字查），避免继承把生命周期和业务混在一起。
+- **同一对象类型实现多个服务接口**（如 `Player` 同时实现 `PlayerService` 和 `PlayerAdminService`）：`Resolver<Iface>()` 内部向基类转换。
+- **不需要系统级的 kind**：`EntityManager` 是模块的成员变量，不登记进某个 System、不冻结、不参与"消息号 → 执行器"的路由，只需要 `EntityConfig`。前面说"主循环模型没有 kind"对寻址成立，对生命周期配置要补上这一点。
+- **与 `ActorSystem` 共用生命周期层**（**提议**）：§6 的状态、激活失败、显式 / 按需创建、回收都与邮箱无关，只做一份：Shard 的本地表用它，再叠加每实例邮箱、轮转、tick；主循环模块直接用它。`ActorSystem` 还没有代码，现在这样设计没有迁移成本。**不要在 `EntityManager` 里另写一套。**
+- **警戒线**：`EntityManager` 不加每实体邮箱、公平轮转这类 actor 才有的东西；真需要，就把这类对象做成 actor kind 放在 S0（一个 Shard 跑在主循环线程上）。
+- **选哪个**：需要激活、但不需要实体之间同步直接访问：actor kind（S0）；需要同步直接访问（比如场景里遍历玩家）：`EntityManager`。这个交集有多常见，没法判断。
+- **按需激活与唯一性**：两个节点同时对同一个 id 按需激活会双重激活。默认只做显式 `Activate`（同 §6）；按需激活只给"仅本进程"的对象类型，或等 §19 第 36 项定了唯一性保证再放开。
+- **分阶段**：第一版只做 `Adopt` / `Remove` / `Find` / `ForEach` / `Resolver` 与登记联动；`Activate` / `Deactivate` / 激活窗口暂存是同一组件的第二个入口，等有真实需求（主循环里的实体要按需异步加载），或实现 `ActorSystem` 的生命周期层时一起做。
+- **线程**：只能在主循环线程使用，Debug 断言（仓库对队列的线程角色同样断言）。
 
 ### 不做
 
@@ -1108,9 +1161,11 @@ S1 的线程循环怎么写有两个选择（复用 `EventLoop` 的唤醒与定�
 36. **注册中心与唯一性保证**（§14）：实现用 etcd，还是规划里的 `onlinesvr` 这类服务；保证做到哪一级——只做"谁创建、在哪"的查找表（创建方显式保证唯一，不违背第 9 条）/ create-if-absent 加租约 / Orleans 式强一致（第 9 条说不做）。玩家被两个进程同时持有会写坏数据，所以要选；进程宕机的清理靠租约。写入量（登录登出风暴）与可用性（宕机时已缓存的可用、新查询失败）都**没测过**。仓库里 etcd 只有配置 schema，没有客户端代码。
 37. **缓存失效与重发的规则**（§14）：最多重发几次、重发是否沿用原 `Correlation`、与 `kUnavailable` 的关系、缓存的过期与容量。
 38. **定位策略与热路径**（§14）：按对象类型声明"仅本进程 / 走注册中心"，写在 IDL 还是登记时；缓存的并发读结构与每次 `Call` 的开销（**没测过**）；进程内把对象类型名 intern 成小整数。
-39. **主循环模型的解析器与回调安全**（§14，提议）：解析器的形状（返回接口指针、业务类实现生成的接口，还是管理器自己实现接口）；回调前再解析、代次由谁提供；统一的 `kNoSuchObject` 是否强制所有处理函数使用（缓存失效依赖它）。
+39. **主循环模型的解析器与回调安全**（§14，提议）：解析器的形状（返回接口指针、业务类实现生成的接口，还是业务模块自己实现接口）；回调前再解析、代次由谁提供；统一的 `kNoSuchObject` 是否强制所有处理函数使用（缓存失效依赖它）。
 40. **`Register` 的细节**（§14）：异步加 RAII 句柄是否接受；`ActorSystem` 在 `Activating` 还是 `Active` 登记；重复登记同一 id 的结果（取决于第 36 项）；对象类型名改名的兼容（灰度期间新旧版本互相找不到对方的对象，和 `msg_id` 同理）。
 41. **没有对象 id 的本地服务寻址**（§14）：显式 `Target::Local()`、`Locator` 扩展到 Service 目标、service 级"仅本进程"标记，三选一；接收侧按对象类型 / 服务检查能否被远端访问。另有：主循环模块在非处理函数（`Tick`、定时器）里发调用时 `ctx` 从哪来；应答体解码失败的终态（§7 只定了请求体）。
+42. **`EntityManager` 的细节**（§14）：与 `ActorSystem` 共用生命周期层的拆分何时做（提议 `ActorSystem` 实现时一起）；`Activate` 是否进第一版（提议第一版只做 `Adopt` / `Remove` / `Find` / `ForEach` / `Resolver`）；钩子还是继承（倾向钩子）；遍历期间 `Remove` 的延迟摘除；激活窗口暂存的上限与超限处理；`idle_timeout` 是否第一版就有；按需激活只给"仅本进程"的对象类型，要等第 36 项；`Adopt` / `Activate` 的完成回调是否都在登记完成后调。
+43. **actor 的业务管理层**（§6、§14）：`ActorSystem` 不提供枚举，业务层要自己维护"有哪些实例"的视图，所以需要 `ActorSystem` 的生命周期事件通知（激活完成、回收、`Fail`，带 kind 和 key，类似 Akka 的 `watchWith` 带上 id，否则管理者的表无法清理）；这一层放在主循环业务模块里，还是独立的服务进程（规划里的 `onlinesvr` / `matchsvr`）；集群级的"全局唯一管理者"要等第 36 项定了唯一性保证，在那之前用部署上的单实例进程，不用运行时级的单例 actor；`Activate` 的签名与调用方（§6 末尾已列）。
 
 ## 附：不做的事
 
