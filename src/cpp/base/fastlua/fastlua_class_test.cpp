@@ -4,6 +4,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <ostream>
 #include <string>
 #include <utility>
 
@@ -46,6 +47,51 @@ struct DotObj {
     int value = 5;
     int Get() const { return value; }
 };
+
+// 自动元方法：ToString / == / < / Close。
+struct MetaBase {
+    static inline int closed = 0;
+    int value = 0;
+    explicit MetaBase(int v) : value(v) {}
+    std::string ToString() const { return "MetaBase(" + std::to_string(value) + ")"; }
+    bool operator==(const MetaBase& other) const { return value == other.value; }
+    bool operator<(const MetaBase& other) const { return value < other.value; }
+    void Close() { ++closed; }
+};
+
+struct MetaDerived : MetaBase {
+    explicit MetaDerived(int v) : MetaBase(v) {}
+};
+
+// 只有 operator<< 的类型，走另一条 __tostring 检测路径。
+struct Streamed {
+    int value = 0;
+    explicit Streamed(int v) : value(v) {}
+};
+
+std::ostream& operator<<(std::ostream& os, const Streamed& value) {
+    return os << "Streamed(" << value.value << ')';
+}
+
+// 自动检测没覆盖的元方法，走 .Meta() 逃生门。
+struct LenObj {
+    int size = 0;
+};
+
+int LenObjLen(lua_State* L) {
+    lua_pushinteger(L, 42);
+    return 1;
+}
+
+// shared_ptr 所有权。
+struct SharedObj {
+    int value = 0;
+    explicit SharedObj(int v) : value(v) {}
+};
+
+int SharedValue(std::shared_ptr<SharedObj> obj) {
+    return obj != nullptr ? obj->value : -1;
+}
 
 }  // namespace
 
@@ -106,6 +152,73 @@ int main() {
     // 点号兼容模式：每次访问分配一个闭包，但调用语义正确。
     lua.Class<DotObj>("DotObj").Ctor<>().Method("Get", &DotObj::Get).DotCall();
     CHECK(lua.RunScript("d = DotObj(); assert(d.Get() == 5)").Ok());
+
+    // 自动元方法：__tostring / __eq / __lt / __close；派生类继承基类的元方法。
+    lua.Class<MetaBase>("MetaBase").Ctor<int>();
+    lua.Class<MetaDerived>("MetaDerived").Ctor<int>().Base<MetaBase>();
+    lua.Class<Streamed>("Streamed").Ctor<int>();
+    const auto meta_script = lua.RunScript(R"lua(
+        m1 = MetaBase(1)
+        m2 = MetaBase(1)
+        m3 = MetaBase(2)
+        assert(tostring(m1) == 'MetaBase(1)')
+        assert(m1 == m2)
+        assert(m1 ~= m3)
+        assert(m1 < m3)
+        do local x <close> = MetaBase(9) end
+        d1 = MetaDerived(1)
+        d2 = MetaDerived(1)
+        assert(tostring(d1) == 'MetaBase(1)')
+        assert(d1 == d2)
+        assert(tostring(Streamed(7)) == 'Streamed(7)')
+    )lua");
+    if (!meta_script.Ok()) {
+        std::fprintf(stderr, "meta script failed: %s\n", meta_script.GetError().message.c_str());
+        return 1;
+    }
+    CHECK(MetaBase::closed == 1);
+
+    // 未自动检测的元方法走 Meta 逃生门。
+    lua.Class<LenObj>("LenObj").Ctor<>().Meta("__len", &LenObjLen);
+    CHECK(lua.RunScript("assert(#LenObj() == 42)").Ok());
+
+    // shared_ptr：Lua 持有期间对象存活；C++ 侧仍可自己用 std::weak_ptr 观察。
+    lua.Class<SharedObj>("SharedObj").Ctor<int>().Prop("value", &SharedObj::value);
+    lua.SetFunction("shared_value", &SharedValue);
+
+    auto shared = std::make_shared<SharedObj>(7);
+    std::weak_ptr<SharedObj> weak = shared;
+    lua.Set("shared_obj", shared);
+    CHECK(lua.RunScript("assert(shared_obj.value == 7)").Ok());
+
+    // Lua -> C++：函数参数、Get。
+    auto from_lua = lua.Call<int>("shared_value", shared);
+    CHECK(from_lua.Ok());
+    CHECK(from_lua.Value() == 7);
+    {
+        auto shared_back = lua.Get<std::shared_ptr<SharedObj>>("shared_obj");
+        CHECK(shared_back.Ok());
+        CHECK(shared_back.Value() != nullptr);
+        CHECK(shared_back.Value()->value == 7);
+    }
+
+    // C++ 释放后，Lua 仍持有 shared_obj，对象继续存活。
+    shared.reset();
+    CHECK(!weak.expired());
+    CHECK(lua.RunScript("shared_obj = nil; collectgarbage('collect')").Ok());
+    CHECK(weak.expired());
+
+    // 空 shared_ptr 往返为 nil。
+    lua.Set("empty_shared", std::shared_ptr<SharedObj>{});
+    auto empty_shared = lua.Get<std::shared_ptr<SharedObj>>("empty_shared");
+    CHECK(empty_shared.Ok());
+    CHECK(empty_shared.Value() == nullptr);
+
+    // Class<T>().Ctor 创建的 owned 对象没有控制块，不能反解成 shared_ptr。
+    CHECK(lua.RunScript("owned = SharedObj(3)").Ok());
+    auto not_shared = lua.Get<std::shared_ptr<SharedObj>>("owned");
+    CHECK(!not_shared.Ok());
+    CHECK(not_shared.GetError().code == ErrorCode::kType);
 
     // 枚举表
     lua.Enum("Color", {{"Red", 1}, {"Green", 2}});

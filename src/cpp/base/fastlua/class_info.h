@@ -2,6 +2,7 @@
 
 // 类运行时数据。ObjHeader 永远在 userdata 的最前面；ClassInfo 由 StateData 持有，
 // lua_close 时统一释放。PropDesc 是属性描述符，get/set 收到已经 cast 到声明类型的对象指针。
+// shared_ptr 实例通过 ObjHeader::holder + destroy_holder 持有控制块，__gc 只释放它。
 
 #include <cstdint>
 #include <functional>
@@ -15,6 +16,7 @@ namespace breeze::fastlua {
 
 inline constexpr std::uint64_t kObjCookie = 0x666173746c7561ULL;  // "fastlua"
 inline constexpr std::uint32_t kObjOwned = 1U << 0;
+inline constexpr std::uint32_t kObjShared = 1U << 1;
 
 enum class Policy : std::uint8_t {
     kOwned,     // Lua 拥有：__gc 时 delete
@@ -27,6 +29,9 @@ struct ObjHeader {
     void* obj = nullptr;
     std::uint32_t flags = 0;
     std::uint32_t pad = 0;
+    // shared_ptr 的持有块；destroy_holder 非空时，__gc 只释放它，不 delete obj。
+    void* holder = nullptr;
+    void (*destroy_holder)(void*) = nullptr;
 };
 
 struct PropDesc {

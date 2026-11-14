@@ -238,9 +238,11 @@ struct Stack<std::vector<T>, void> {
     }
 };
 
-// ---------- map ----------
-template <class K, class V>
-struct Stack<std::map<K, V>, void> {
+// ---------- map / unordered_map ----------
+namespace detail {
+
+template <class Map, class K, class V>
+struct MapStack {
     static constexpr const char* kName = "table";
 
     static bool Check(lua_State* L, int idx) {
@@ -260,9 +262,9 @@ struct Stack<std::map<K, V>, void> {
         return true;
     }
 
-    static std::map<K, V> Get(lua_State* L, int idx) {
+    static Map Get(lua_State* L, int idx) {
         idx = lua_absindex(L, idx);
-        std::map<K, V> out;
+        Map out;
         lua_pushnil(L);
         while (lua_next(L, idx) != 0) {
             K key = Stack<K>::Get(L, -2);
@@ -273,12 +275,88 @@ struct Stack<std::map<K, V>, void> {
         return out;
     }
 
-    static void Push(lua_State* L, const std::map<K, V>& values) {
+    static void Push(lua_State* L, const Map& values) {
         lua_createtable(L, 0, static_cast<int>(values.size()));
         for (const auto& [key, value] : values) {
             Stack<K>::Push(L, key);
             Stack<V>::Push(L, value);
             lua_settable(L, -3);
+        }
+    }
+};
+
+}  // namespace detail
+
+template <class K, class V>
+struct Stack<std::map<K, V>, void> : detail::MapStack<std::map<K, V>, K, V> {};
+
+template <class K, class V>
+struct Stack<std::unordered_map<K, V>, void> : detail::MapStack<std::unordered_map<K, V>, K, V> {};
+
+// ---------- array ----------
+template <class T, std::size_t N>
+struct Stack<std::array<T, N>, void> {
+    static constexpr const char* kName = "table";
+
+    static bool Check(lua_State* L, int idx) {
+        idx = lua_absindex(L, idx);
+        if (!lua_istable(L, idx) || static_cast<std::size_t>(lua_rawlen(L, idx)) != N) {
+            return false;
+        }
+        if (!lua_checkstack(L, 2)) {
+            return false;
+        }
+        for (std::size_t i = 0; i < N; ++i) {
+            lua_rawgeti(L, idx, static_cast<lua_Integer>(i + 1));
+            const bool ok = Stack<T>::Check(L, -1);
+            lua_pop(L, 1);
+            if (!ok) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static std::array<T, N> Get(lua_State* L, int idx) {
+        idx = lua_absindex(L, idx);
+        std::array<T, N> out{};
+        for (std::size_t i = 0; i < N; ++i) {
+            lua_rawgeti(L, idx, static_cast<lua_Integer>(i + 1));
+            out[i] = Stack<T>::Get(L, -1);
+            lua_pop(L, 1);
+        }
+        return out;
+    }
+
+    static void Push(lua_State* L, const std::array<T, N>& values) {
+        lua_createtable(L, static_cast<int>(N), 0);
+        for (std::size_t i = 0; i < N; ++i) {
+            Stack<T>::Push(L, values[i]);
+            lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
+        }
+    }
+};
+
+// ---------- span（push-only）----------
+// span 不拥有内存：可以安全地把 C++ 连续区间推给 Lua（返回/Set），
+// 但不能把 Lua 表转成 span 当参数（临时表一弹栈就悬空）。入参请用 std::vector。
+template <class T>
+struct Stack<std::span<T>, void> {
+    static constexpr const char* kName = "table";
+
+    static bool Check(lua_State*, int) { return false; }
+
+    static std::span<T> Get(lua_State*, int) {
+        static_assert(!std::is_same_v<T, T>,
+                      "fastlua: std::span is push-only; use std::vector for parameters");
+        return {};
+    }
+
+    static void Push(lua_State* L, std::span<T> values) {
+        lua_createtable(L, static_cast<int>(values.size()), 0);
+        for (std::size_t i = 0; i < values.size(); ++i) {
+            Stack<std::remove_cv_t<T>>::Push(L, values[i]);
+            lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
         }
     }
 };

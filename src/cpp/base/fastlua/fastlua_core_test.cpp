@@ -107,6 +107,30 @@ int main() {
     CHECK(vec.Value().size() == 3);
     CHECK(vec.Value()[2] == 3);
 
+    // array 往返；长度必须精确匹配。
+    lua.Set("arr", std::array<int, 3>{4, 5, 6});
+    auto arr = lua.Get<std::array<int, 3>>("arr");
+    CHECK(arr.Ok());
+    CHECK(arr.Value()[0] == 4);
+    CHECK(arr.Value()[2] == 6);
+    auto wrong_array = lua.Get<std::array<int, 2>>("arr");
+    CHECK(!wrong_array.Ok());
+    CHECK(wrong_array.GetError().code == ErrorCode::kType);
+
+    // span 是 push-only：C++ 连续区间推给 Lua；不作为入参。
+    const std::array<int, 3> span_source{7, 8, 9};
+    lua.Set("span_values", std::span<const int>(span_source));
+    CHECK(lua.RunScript("assert(span_values[1] == 7 and span_values[3] == 9 and #span_values == 3)").Ok());
+
+    // unordered_map 往返。
+    const std::unordered_map<std::string, int> unordered{{"a", 1}, {"b", 2}};
+    lua.Set("unordered", unordered);
+    auto unordered_back = lua.Get<std::unordered_map<std::string, int>>("unordered");
+    CHECK(unordered_back.Ok());
+    CHECK(unordered_back.Value().size() == 2);
+    CHECK(unordered_back.Value().at("a") == 1);
+    CHECK(unordered_back.Value().at("b") == 2);
+
     // registry 引用：Table / Function
     CHECK(lua.RunScript("bench = {a = 1, b = 2}; function double(x) return x * 2 end").Ok());
 

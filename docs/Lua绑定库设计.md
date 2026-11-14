@@ -50,7 +50,7 @@ sol2 / LuaBridge3：前者上游不支持 5.5（`compat-5.3.h` 的 `#error`、`L
 ## 3. 设计
 
 - **`LuaState` / `LuaStateView`**：`LuaState` 拥有 `lua_State`（`lua_newstate` 或 `luaL_newstate`），`LuaStateView` 是非拥有视图，用于 `luaopen_*`。一个 state 绑定一个线程（一个 Shard）。
-- **`Stack<T>`**：一个 customization point。内置整数（范围/可表示性检查）、浮点、bool、enum、`std::string`、`std::string_view`、`const char*`、`optional`、`vector`、`map`、`tuple`/`pair`（仅返回值多值）、对象指针/引用、`TableView` 栈视图。
+- **`Stack<T>`**：一个 customization point。内置整数（范围/可表示性检查）、浮点、bool、enum、`std::string`、`std::string_view`、`const char*`、`optional`、`vector`、`array`、`map` / `unordered_map`、`span`（push-only）、`tuple`/`pair`（仅返回值多值）、对象指针/引用、`shared_ptr`、`TableView` 栈视图。
 - **两段式 trampoline**（`trampoline.h`）：`Invoke` 里检查参数、构造临时对象、调用用户函数、压返回值；它 normal return 之后，`Trampoline`（只有 `ErrorSlot` 等平凡局部变量）再调用 `RaiseError` → `luaL_typeerror` / `luaL_error`。这样就算 Lua 按 C 编译、`lua_error` 是 longjmp，也不会跳过任何析构。
 - **`Result<T>`**：`Ok()` / `Value()` / `ValueOr()` / `GetError()` / `NotFound()`；错误码含 kNotFound / kRuntime / kSyntax / kMemory / kType / kStack / kBudget / kCancelled / kTimeout 等。缺函数是 `kNotFound`，不是异常。
   - `Value()` 是“已经 `Ok()` 之后”的访问器；在错误上调用属于编程错误，经 `FASTLUA_CHECK`（可接 fatal handler）记录后 abort。需要恢复就用 `Ok()` / `ValueOr()` / `GetError()`。
@@ -58,12 +58,19 @@ sol2 / LuaBridge3：前者上游不支持 5.5（`compat-5.3.h` 的 `#error`、`L
   - “不抛异常”不等于所有 Lua 错误都可恢复：`lua_pushlstring`、`luaL_ref`、表插入等可能分配的操作在 OOM 时会 `longjmp` 到 `lua_atpanic`（fastlua 的 handler 记录后 abort），这类内存错误按致命处理，不承诺跨 C++ 栈恢复。
 - **调用**：`CallGlobal`（按名字，晚绑定，热更友好）、`CallPushed`（函数已在栈上）、`Function::Call`（缓存引用，带 traceback）与 `Function::CallFast`（不挂 traceback）。每次调用一次 `lua_checkstack`，`lua_pcall` 后 `lua_settop` 恢复。
 - **类（`class.h` / `class.cpp`）**：
-  - userdata 布局 `[ObjHeader][外部对象指针]`；`ObjHeader` 带 cookie、ClassInfo、对象指针、所有权标志。
+  - userdata 布局 `[ObjHeader]`（共享所有权时在 header 后**内联** `shared_ptr<void>`，不再单独 `new`）；`ObjHeader` 带 cookie、ClassInfo、对象指针、所有权标志、持有块与释放函数。
   - 类型身份 `kTypeTag<T>` 地址；`GetObjectAs<T>` 先比类型，再沿 `ancestors` 应用注册时生成的 `up` 转换。
   - 每类一个 metatable；纯方法类的 `__index` 直接是方法表，属性类用 C `__index` 查 getters 表（lightuserdata `PropDesc*`，直接调用 getter/setter，无嵌套 Lua 调用）。
   - 所有权：`Policy::kOwned`（默认，`__gc` delete）、`Policy::kBorrowed`（C++ 管，`__gc` 不做事）；`ObjHeader::flags` 决定是否 delete。
+  - `shared_ptr`：按**实例**而不是按类。`PushSharedObject` 把对象放进 userdata 内联的 `shared_ptr<void>`，`ObjHeader` 记录 `holder` + `destroy_holder`；`__gc` 只释放持有块，不 delete 对象。`Stack<std::shared_ptr<T>>` 用 aliasing 构造函数从 `shared_ptr<void>` + `GetObjectAs<T>` 得到正确的 `shared_ptr<T>`（支持基类/多继承指针调整）。只有按 `shared_ptr` 推入的对象能反解成 shared_ptr，`Class<T>().Ctor` 创建的 owned 对象不行（没有控制块）。**不绑定 `weak_ptr`**：Lua 侧无法安全地做“可能已失效”的句柄，C++ 侧需要弱观察时请自行用 `std::weak_ptr`。
   - `AllowFields` 把未知字段存到 uservalue 表（`lua_newuserdatauv` 的 uservalue 数在创建时按类决定）；`DotCall` 只对显式开启的类在方法访问时包装一个闭包，供 quanta 点号脚本迁移。
   - 构造函数：`Ctor<Args...>` 设置类表的 `__call`；参数从索引 2 开始，`new T(args...)`，失败转 `ErrorSlot`。
+  - **自动元方法**（注册类时按 C++ 能力检测）：
+    - `__tostring`：`T::ToString()`（可转 `std::string`）优先，否则 `operator<<(std::ostream&, const T&)`；
+    - `__eq`：`operator==`；`__lt`：`operator<`；
+    - `__close`：`T::Close()` 或 `T::close()`，只对 Lua 的 `local x <close> = obj` 生效；`Close()` 不应 `delete this`（所有权仍归 `__gc`）。
+    - `Base<B>()` 会把基类已有的这四个元方法复制到派生类（派生类自己有的不覆盖），所以基类的比较/打印/关闭语义能被派生对象复用。
+    - 未自动检测 `__le`、算术运算符、`__len`/`__pairs` 等；需要时用 `.Meta("__le", &MyLessEqual)` 显式注册裸 `lua_CFunction`（逃生门，同上）。
 - **引用（`ref.h`）**：`Ref` / `Table` / `Function` 是 registry 引用，move-only，需要第二份独立引用时用显式 `Clone()`；`Control` 引用计数块，`StateData` 的 `__gc` 在 `lua_close` 时把 `state` 置空，所以 `lua_close` 之后析构 `Ref` 是空操作。**线程规则见下，库不实现跨线程引用释放队列。**
 - **线程规则（必须遵守）**：
   - 一个 `LuaState` 只属于一个线程；`Ref` / `Table` / `Function` 必须在该线程创建、使用、析构。
@@ -112,16 +119,50 @@ sol2 / LuaBridge3：前者上游不支持 5.5（`compat-5.3.h` 的 `#error`、`L
 
 其中 **`luabuf` / `slice` / codec 最容易越界**：fastlua 不提供 `luabuf`、`slice`、`lua_codec`，也不提供 `encode` / `decode` / `serialize` 接口，`compat/luakit.h` 故意不转发这些名字。sol2、LuaBridge3 同样没有（sol2 的 `sol::bytecode` 只是 Lua chunk 的 dump/load，不是对象编解码）；luakit 有是因为 quanta 把 RPC 编解码和绑定做在一起，fastlua 不复制这条路线。
 
-**属于绑定库、v1 未覆盖（按需求排期，不能推给业务）**
+**绑定库能力：已覆盖 / 仍有缺口**
+
+已覆盖：
+
+- `__tostring` / `__eq` / `__lt` / `__close` 自动检测（见“自动元方法”）；其它元方法用 `.Meta()` 显式注册。
+- 容器转换：`vector`、`array`、`map`、`unordered_map`、`optional`、`span`（push-only）、`tuple`/`pair`（多返回值）。
+- `shared_ptr` 所有权（见上）。**这不是跨线程特性**，是单线程也需要共享生命周期：实体由 C++ 容器持有、Lua 拿句柄。
+
+`shared_ptr` 的使用边界（不是缺口）：
 
 | 项 | 说明 |
 |---|---|
-| `__tostring` / `__eq` / `__lt` / `__close` | 绑定库核心能力，sol2 / LuaBridge3 都有；v1 未做 |
-| `shared_ptr` / `weak_ptr` 所有权策略 | 绑定库所有权模型；v1 未做 |
-| `array` / `span` / `unordered_map` 等容器转换 | 绑定库转换层；v1 未做 |
-| Lua 5.1–5.4 / LuaJIT / Lua 按 C++ 编译 | 绑定库兼容层；当前 scope 只支持 5.5.1 |
+| `Get<std::shared_ptr<T>>` | 只对“按 shared_ptr 推入”的对象成立；`Class<T>().Ctor` 创建的 owned 对象和 borrowed 对象没有控制块，返回 `kType`。 |
+| `weak_ptr` | **不绑定**。Lua 侧没有安全的非拥有句柄：要么锁成强引用（就是 shared），要么每次访问判空并保活，代价大。C++ 侧需要弱观察时用 `std::weak_ptr`；Lua 侧需要“不延长生命周期”的缓存时用 ID。sol2 / LuaBridge3 也都不支持 `weak_ptr`。 |
+| `enable_shared_from_this` | 不自动使用；将来若要“从 Lua 反解 owned 对象”，再加这个回退。 |
 
-这些是绑定库自己的功能缺口，**不要用“别的库也没做”当理由跳过**；是否实现只看业务需求，不改变“框架职责不越界”的约束。
+### 跨语言生命周期规则（必须遵守）
+
+两套 GC 互相看不见：C++ 的 `Ref`/`Function` 是 Lua registry 的强引用（GC root）；Lua 的 userdata 持有 `shared_ptr`。因此**没有任何库能自动回收跨语言环**，sol2 / LuaBridge3 / luakit 都靠约定，skynet / quanta 靠 ID 和按名字调用绕开。
+
+典型环：
+
+1. C++ 实体成员 `Function on_update` → registry 强引用 Lua 闭包；
+2. 闭包捕获 Lua 的 `entity` 变量/表 → 持有实体 userdata；
+3. userdata 的 `shared_ptr<Entity>` → 实体本身。
+
+结果：registry 引用让闭包永不回收 → `entity` 永不回收 → userdata 永不回收 → 实体永不析构。`entity = nil` 也没用，因为 C++ 的 `Ref` 仍是根。
+
+硬性规则：
+
+- **单向强所有权**：实体由 C++ 管理器拥有；Lua 侧优先用 borrowed 句柄或 ID；只有确实需要跨帧共享时才用 `shared_ptr`。
+- **C++ 不长期持有 Lua 回调**：优先按名字调用（`CallGlobal`、luakit 风格的 `object_call`）或“ID + Lua 表查函数”。必须存 `Function`/`Ref` 时，卸载路径必须显式清空（实体 `unload`/`destory`、定时器取消、连接关闭）。
+- **Lua 缓存 C++ 对象不要形成回指**：用 ID 查管理器；用 borrowed 指针时只能保证“同步调用期间”有效；不要用 shared_ptr 让 Lua 对象反过来拥有 C++ 里又引用 Lua 的东西。
+- **不要指望 `weak_ptr` 或 Lua 弱表**：`weak_ptr` 不在绑定层；Lua 的 `__mode` 弱表只处理 Lua 内部对象，registry 的 C++ 强引用是外部根，弱表管不到。
+- **C++ 侧 `shared_ptr` 之间成环**是标准 C++ 问题，用 `std::weak_ptr` 在 C++ 内部打破；绑定层不介入。
+- **排查手段**：统计存活的 `Function`/`Ref` 数量、实体 weak_ptr 是否过期、`lua_close` 前是否还有业务引用；泄漏时先找“C++ 存 Lua 回调 + Lua 存 C++ 对象”的双向强引用。
+
+仍有缺口（按需求排期，不推给业务）：
+
+| 项 | 说明 |
+|---|---|
+| `__le`、算术/位运算、`__len`/`__pairs` 等元方法 | 不自动检测；用 `.Meta()` 挂裸 `lua_CFunction`。 |
+
+Lua 5.1–5.4 / LuaJIT / Lua 按 C++ 编译**不属于缺口**：本项目 scope 固定 Lua 5.5.1，不做多版本兼容（见“没做的”）。
 
 **已定的 API 策略（保持，不是遗漏）**
 
@@ -165,7 +206,7 @@ std::function<void(int)> f = [shared](int x) { shared->Call<void>(x); };
 
 - 二进制 codec / `luabuf` / `slice` / MPSC ring（luakit 的 encode/decode/serialize 那套）：强依赖协议与缓冲区，单独包（见“不做清单”）。
 - 跨线程待释放引用队列、协程超时定时器、hook 复用器、C++ 栈采集：见“不做清单”，属于框架/运行时/诊断库，fastlua 不做；协程池也暂不做（取消 token 已实现）。
-- LuaJIT / Lua 5.1–5.4 兼容；Lua 按 C++ 编译（会改变 `lua_error` 语义）。
+- LuaJIT / Lua 5.1–5.4 兼容；Lua 按 C++ 编译（会改变 `lua_error` 语义）。scope 固定 Lua 5.5.1，不计划支持低版本。
 - 点号兼容类的冒号调用自动识别（启发式容易歧义；一个类要么冒号，要么点号）。
 - 完整 asan / ubsan / tsan 已在 x86_64 Linux（clang 23）跑过；ARM、GCC 单独编译和真机压测没做。
 - Free-threaded Lua / 多线程共享一个 state（Lua 本身不支持）。
@@ -174,9 +215,9 @@ std::function<void(int)> f = [shared](int x) { shared->Call<void>(x); };
 
 测试（与源码同目录，`CHECK` 失败 abort，不引测试框架）：
 
-- `fastlua_core_test`：全局读写、C++ 函数/lambda、多返回值、脚本错误、optional/vector、Table/Function、`lua_close` 后 `Ref`、可调用对象 GC、C++ 异常转 Lua 错误。
+- `fastlua_core_test`：全局读写、C++ 函数/lambda、多返回值、脚本错误、optional/vector/array/span/unordered_map、Table/Function、`Clone()`、返回值类型检查、`lua_close` 后 `Ref`、可调用对象 GC、C++ 异常转 Lua 错误。
 - `fastlua_check_test`：`ENSURE` 每个调用点只记一次；`CHECK` 在 fork 子进程里 abort。
-- `fastlua_class_test`：构造、方法、属性、继承（属性/方法 cast）、AllowFields、DotCall、所有权/GC、枚举。
+- `fastlua_class_test`：构造、方法、属性、继承（属性/方法 cast）、AllowFields、DotCall、所有权/GC、枚举、自动元方法（`__tostring` / `__eq` / `__lt` / `__close`，含继承）、`shared_ptr` 生命周期。
 - `fastlua_sandbox_test`：内存上限（`AllocStats.failures`）、指令预算（`while true do end` 被中断）、库白名单。
 - `fastlua_coroutine_test`：yield / resume / done / 再次 resume 失败；取消（挂起时与运行中）、token 跨线程析构。
 - `fastlua_ext_test`：table/string/os 工具、循环引用 deepcopy。

@@ -5,7 +5,12 @@ namespace breeze::fastlua {
 int ClassGc(lua_State* L) {
     auto* header = static_cast<ObjHeader*>(lua_touserdata(L, 1));
     if (header != nullptr && header->cookie == kObjCookie) {
-        if ((header->flags & kObjOwned) != 0 && header->cls != nullptr && header->cls->destroy != nullptr) {
+        if (header->destroy_holder != nullptr) {
+            // shared_ptr 持有块：只释放引用，不 delete obj。
+            header->destroy_holder(header->holder);
+            header->holder = nullptr;
+            header->destroy_holder = nullptr;
+        } else if ((header->flags & kObjOwned) != 0 && header->cls != nullptr && header->cls->destroy != nullptr) {
             header->cls->destroy(header);
         }
         header->cookie = 0;
@@ -134,6 +139,31 @@ void CopyMissing(lua_State* L, int from_ref, int to_ref) {
             lua_pop(L, 1);
         }
         lua_pop(L, 1);  // pop value, keep key
+    }
+    lua_settop(L, top);
+}
+
+void CopyMetamethods(lua_State* L, const ClassInfo* base, const ClassInfo* derived) {
+    static constexpr const char* kNames[] = {"__tostring", "__eq", "__lt", "__close"};
+    const int top = lua_gettop(L);
+    lua_rawgeti(L, LUA_REGISTRYINDEX, base->mt_ref);
+    const int from = top + 1;
+    lua_rawgeti(L, LUA_REGISTRYINDEX, derived->mt_ref);
+    const int to = top + 2;
+
+    for (const char* name : kNames) {
+        lua_getfield(L, from, name);
+        if (!lua_isnil(L, -1)) {
+            lua_getfield(L, to, name);
+            if (lua_isnil(L, -1)) {
+                lua_pop(L, 1);
+                lua_pushvalue(L, -1);
+                lua_setfield(L, to, name);
+            } else {
+                lua_pop(L, 1);
+            }
+        }
+        lua_pop(L, 1);
     }
     lua_settop(L, top);
 }

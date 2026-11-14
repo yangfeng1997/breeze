@@ -10,10 +10,16 @@
 //      .AllowFields()
 //      .DotCall();
 //
-// userdata 布局：[ObjHeader][外部对象指针]，对象本身用 new 分配（所有权策略决定谁 delete）。
+// userdata 布局：[ObjHeader]（共享所有权时在 header 后内联 shared_ptr<void>），对象本身用
+// new 分配（所有权策略决定谁 delete）。Stack<std::shared_ptr<T>> 走实例级持有块：
+// __gc 只释放 shared_ptr，不 delete 对象；Get<shared_ptr<U>> 用 aliasing ctor 支持基类调整。
 // 类型身份用 kTypeTag<T> 的地址，不用字符串哈希；基类转换用类注册时生成的 static_cast。
 
+#include <concepts>
+#include <exception>
 #include <functional>
+#include <ostream>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -37,6 +43,7 @@ int ClassNewIndex(lua_State* L);
 int DotThunk(lua_State* L);
 void CopyMissing(lua_State* L, int from_ref, int to_ref);
 void CopyProps(lua_State* L, const ClassInfo* base, ClassInfo* derived, void* (*cast)(void*));
+void CopyMetamethods(lua_State* L, const ClassInfo* base, const ClassInfo* derived);
 
 inline ObjHeader* GetHeader(lua_State* L, int index) {
     if (lua_type(L, index) != LUA_TUSERDATA) {
@@ -95,7 +102,7 @@ void PushBorrowedObject(lua_State* L, T* obj, ClassInfo* cls) {
         return;
     }
     void* raw = lua_newuserdatauv(L, sizeof(ObjHeader), cls->allow_fields ? 1 : 0);
-    new (raw) ObjHeader{kObjCookie, cls, obj, 0, 0};
+    new (raw) ObjHeader{kObjCookie, cls, obj, 0, 0, nullptr, nullptr};
     SetObjectMetatable(L, cls);
 }
 
@@ -107,8 +114,225 @@ void PushOwnedObject(lua_State* L, T* obj, ClassInfo* cls) {
         return;
     }
     void* raw = lua_newuserdatauv(L, sizeof(ObjHeader), cls->allow_fields ? 1 : 0);
-    new (raw) ObjHeader{kObjCookie, cls, obj, kObjOwned, 0};
+    new (raw) ObjHeader{kObjCookie, cls, obj, kObjOwned, 0, nullptr, nullptr};
     SetObjectMetatable(L, cls);
+}
+
+// shared_ptr 持有块直接放在 userdata 的 ObjHeader 之后（不再单独 new）：
+// owner 保留控制块，obj 指向具体的 T（可能是基类子对象）；Get<shared_ptr<U>>
+// 用 aliasing 构造函数从 owner + GetObjectAs<U> 得到正确的 U 指针。
+inline void DestroySharedHolder(void* holder) {
+    static_cast<std::shared_ptr<void>*>(holder)->~shared_ptr();
+}
+
+template <class T>
+void PushSharedObject(lua_State* L, std::shared_ptr<T> obj, ClassInfo* cls) {
+    FASTLUA_CHECK(cls != nullptr, "fastlua: type is not registered");
+    if (!obj) {
+        lua_pushnil(L);
+        return;
+    }
+    void* raw = lua_newuserdatauv(L, sizeof(ObjHeader) + sizeof(std::shared_ptr<void>),
+                                  cls->allow_fields ? 1 : 0);
+    void* holder = static_cast<char*>(raw) + sizeof(ObjHeader);
+    new (holder) std::shared_ptr<void>(obj);
+    new (raw) ObjHeader{kObjCookie, cls, obj.get(), kObjShared, 0, holder, &DestroySharedHolder};
+    SetObjectMetatable(L, cls);
+}
+
+// ---------- 自动元方法 ----------
+// 注册类时按 C++ 能力自动挂到 metatable 上：
+//   __tostring  T::ToString()（可转 std::string）或 operator<<(std::ostream&, const T&)
+//   __eq        operator==
+//   __lt        operator<
+//   __close     T::Close() / T::close()，仅对 Lua 的 <close> 变量生效
+// 只检测“类型自己定义”的能力，不做隐式转换的特殊照顾；基类元方法在 Base<B>() 时复制。
+namespace detail {
+
+template <class T>
+concept HasToStringMethod = requires(const T& value) {
+    { value.ToString() } -> std::convertible_to<std::string>;
+};
+
+template <class T>
+concept HasStreamOutput = requires(std::ostream& stream, const T& value) { stream << value; };
+
+template <class T>
+concept HasEquality = requires(const T& left, const T& right) {
+    { left == right } -> std::convertible_to<bool>;
+};
+
+template <class T>
+concept HasLess = requires(const T& left, const T& right) {
+    { left < right } -> std::convertible_to<bool>;
+};
+
+template <class T>
+concept HasCloseMethod = requires(T& value) { value.Close(); };
+
+template <class T>
+concept HasLowerCloseMethod = requires(T& value) { value.close(); };
+
+template <class T>
+bool BuildToString(lua_State* L, ErrorSlot& err) {
+#if defined(__cpp_exceptions)
+    try {
+#endif
+        T* obj = GetObjectAs<T>(L, 1, nullptr);
+        if (obj == nullptr) {
+            lua_pushliteral(L, "object");
+            return true;
+        }
+        if constexpr (HasToStringMethod<T>) {
+            const std::string text = obj->ToString();
+            lua_pushlstring(L, text.data(), text.size());
+        } else {
+            std::ostringstream stream;
+            stream << *obj;
+            const std::string text = stream.str();
+            lua_pushlstring(L, text.data(), text.size());
+        }
+        return true;
+#if defined(__cpp_exceptions)
+    } catch (const std::exception& e) {
+        err.Set(ErrorCode::kRuntime, e.what());
+        return false;
+    } catch (...) {
+        err.Set(ErrorCode::kRuntime, "unknown C++ exception in __tostring");
+        return false;
+    }
+#endif
+}
+
+template <class T>
+bool BuildEquality(lua_State* L, ErrorSlot& err) {
+#if defined(__cpp_exceptions)
+    try {
+#endif
+        T* left = GetObjectAs<T>(L, 1, nullptr);
+        T* right = GetObjectAs<T>(L, 2, nullptr);
+        lua_pushboolean(L, (left != nullptr && right != nullptr && (*left == *right)) ? 1 : 0);
+        return true;
+#if defined(__cpp_exceptions)
+    } catch (const std::exception& e) {
+        err.Set(ErrorCode::kRuntime, e.what());
+        return false;
+    } catch (...) {
+        err.Set(ErrorCode::kRuntime, "unknown C++ exception in __eq");
+        return false;
+    }
+#endif
+}
+
+template <class T>
+bool BuildLess(lua_State* L, ErrorSlot& err) {
+#if defined(__cpp_exceptions)
+    try {
+#endif
+        T* left = GetObjectAs<T>(L, 1, nullptr);
+        T* right = GetObjectAs<T>(L, 2, nullptr);
+        if (left == nullptr || right == nullptr) {
+            err.Set(ErrorCode::kType, "fastlua: attempt to compare incompatible objects");
+            return false;
+        }
+        lua_pushboolean(L, (*left < *right) ? 1 : 0);
+        return true;
+#if defined(__cpp_exceptions)
+    } catch (const std::exception& e) {
+        err.Set(ErrorCode::kRuntime, e.what());
+        return false;
+    } catch (...) {
+        err.Set(ErrorCode::kRuntime, "unknown C++ exception in __lt");
+        return false;
+    }
+#endif
+}
+
+template <class T>
+bool BuildClose(lua_State* L, ErrorSlot& err) {
+#if defined(__cpp_exceptions)
+    try {
+#endif
+        T* obj = GetObjectAs<T>(L, 1, nullptr);
+        if (obj == nullptr) {
+            err.Set(ErrorCode::kType, "fastlua: __close on an invalid object");
+            return false;
+        }
+        if constexpr (HasCloseMethod<T>) {
+            obj->Close();
+        } else if constexpr (HasLowerCloseMethod<T>) {
+            obj->close();
+        }
+        return true;
+#if defined(__cpp_exceptions)
+    } catch (const std::exception& e) {
+        err.Set(ErrorCode::kRuntime, e.what());
+        return false;
+    } catch (...) {
+        err.Set(ErrorCode::kRuntime, "unknown C++ exception in __close");
+        return false;
+    }
+#endif
+}
+
+}  // namespace detail
+
+template <class T>
+int ClassToString(lua_State* L) {
+    ErrorSlot err{};
+    if (!detail::BuildToString<T>(L, err)) {
+        RaiseError(L, err);
+    }
+    return 1;
+}
+
+template <class T>
+int ClassEqual(lua_State* L) {
+    ErrorSlot err{};
+    if (!detail::BuildEquality<T>(L, err)) {
+        RaiseError(L, err);
+    }
+    return 1;
+}
+
+template <class T>
+int ClassLess(lua_State* L) {
+    ErrorSlot err{};
+    if (!detail::BuildLess<T>(L, err)) {
+        RaiseError(L, err);
+    }
+    return 1;
+}
+
+template <class T>
+int ClassClose(lua_State* L) {
+    ErrorSlot err{};
+    if (!detail::BuildClose<T>(L, err)) {
+        RaiseError(L, err);
+    }
+    return 0;
+}
+
+template <class T>
+void AddAutoMetamethods(lua_State* L, int mt) {
+    if constexpr (std::is_class_v<T>) {
+        if constexpr (detail::HasToStringMethod<T> || detail::HasStreamOutput<T>) {
+            lua_pushcfunction(L, &ClassToString<T>);
+            lua_setfield(L, mt, "__tostring");
+        }
+        if constexpr (detail::HasEquality<T>) {
+            lua_pushcfunction(L, &ClassEqual<T>);
+            lua_setfield(L, mt, "__eq");
+        }
+        if constexpr (detail::HasLess<T>) {
+            lua_pushcfunction(L, &ClassLess<T>);
+            lua_setfield(L, mt, "__lt");
+        }
+        if constexpr (detail::HasCloseMethod<T> || detail::HasLowerCloseMethod<T>) {
+            lua_pushcfunction(L, &ClassClose<T>);
+            lua_setfield(L, mt, "__close");
+        }
+    }
 }
 
 // ---------- 对象指针转换 ----------
@@ -128,6 +352,45 @@ struct Stack<T&, void> {
     static bool Check(lua_State* L, int index) { return GetObjectAs<T>(L, index, nullptr) != nullptr; }
     static T& Get(lua_State* L, int index) { return *GetObjectAs<T>(L, index, nullptr); }
     static void Push(lua_State* L, T& obj) { PushBorrowedObject<T>(L, &obj, GetClass<T>(L)); }
+};
+
+// ---------- shared_ptr ----------
+// Lua 只接受“按 shared_ptr 推入”的对象；Class<T>().Ctor 创建的 owned 对象不能反解成
+// shared_ptr（没有控制块，除非将来支持 enable_shared_from_this）。
+// 不绑定 weak_ptr：Lua 侧做不了安全的非拥有句柄，C++ 侧需要时请自行用 std::weak_ptr。
+template <class T>
+struct Stack<std::shared_ptr<T>, void> {
+    static constexpr const char* kName = "object";
+
+    static bool Check(lua_State* L, int index) {
+        if (lua_type(L, index) == LUA_TNIL) {
+            return true;
+        }
+        const ObjHeader* header = GetHeader(L, index);
+        return header != nullptr && (header->flags & kObjShared) != 0 &&
+               GetObjectAs<T>(L, index, nullptr) != nullptr;
+    }
+
+    static std::shared_ptr<T> Get(lua_State* L, int index) {
+        if (lua_type(L, index) == LUA_TNIL) {
+            return {};
+        }
+        ObjHeader* header = GetHeader(L, index);
+        T* obj = GetObjectAs<T>(L, index, nullptr);
+        if (header == nullptr || obj == nullptr || (header->flags & kObjShared) == 0 || header->holder == nullptr) {
+            return {};
+        }
+        auto* owner = static_cast<std::shared_ptr<void>*>(header->holder);
+        return std::shared_ptr<T>(*owner, obj);
+    }
+
+    static void Push(lua_State* L, std::shared_ptr<T> obj) {
+        if (!obj) {
+            lua_pushnil(L);
+            return;
+        }
+        PushSharedObject<T>(L, std::move(obj), GetClass<T>(L));
+    }
 };
 
 // ---------- 成员函数调用 ----------
@@ -275,6 +538,8 @@ ClassInfo* EnsureClass(lua_State* L, std::string_view name) {
     lua_pushcclosure(L, &ClassNewIndex, 2);
     lua_setfield(L, mt, "__newindex");
 
+    AddAutoMetamethods<T>(L, mt);
+
     cls->mt_ref = luaL_ref(L, LUA_REGISTRYINDEX);
 
     lua_newtable(L);
@@ -387,6 +652,7 @@ public:
         cls_->ancestors.push_back(ClassInfo::Base{base, up});
         CopyMissing(L_, base->methods_ref, cls_->methods_ref);
         CopyProps(L_, base, cls_, up);
+        CopyMetamethods(L_, base, cls_);
         return *this;
     }
 
@@ -407,6 +673,17 @@ public:
 
     ClassBuilder& DotCall() {
         cls_->dot_call = true;
+        return *this;
+    }
+
+    // 显式元方法逃生门（__le / __len / __pairs / 算术等自动检测未覆盖的名字）。
+    // function 是裸 lua_CFunction，自己负责取参和错误处理。
+    ClassBuilder& Meta(std::string_view name, lua_CFunction function) {
+        lua_rawgeti(L_, LUA_REGISTRYINDEX, cls_->mt_ref);
+        lua_pushcfunction(L_, function);
+        const std::string key(name);
+        lua_setfield(L_, -2, key.c_str());
+        lua_pop(L_, 1);
         return *this;
     }
 
