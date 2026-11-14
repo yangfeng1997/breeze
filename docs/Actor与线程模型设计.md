@@ -2,7 +2,7 @@
 
 **状态**（2026-11-03）：**设计阶段，没有代码。** §0 列的"已定"是用户明确同意过的；其余是我提出、尚未确认的，文中标"**提议**"，汇总在 §19。
 **设计不受现有代码约束**：`framework/app`、`MainLoopExecutor`、`ThreadPool`、信封等大多是半成品，本文从需求出发，哪些沿用、哪些改、哪些重写见 §15。
-旧的 [Actor模型与RPC设计.md](Actor模型与RPC设计.md) 是实验性、偏 Go 的设计，**仅供参考，不是事实源**；本文不继承它的结论。
+旧的实验性设计 `Actor模型与RPC设计.md`（偏 Go）已于 2026-11-05 删除，不是事实源，本文不继承它的结论；要查旧内容：`git show fa84592:docs/Actor模型与RPC设计.md`。
 **线程安全没有在 tsan 下验证过**（本机跑不了，见 [网络库设计.md](网络库设计.md) §11.2）：S1 以后的多线程部分上真机前不算验证过。
 Agent、信封、共享内存通道见 [共享内存IPC设计.md](共享内存IPC设计.md)。
 
@@ -22,7 +22,7 @@ Agent、信封、共享内存通道见 [共享内存IPC设计.md](共享内存IP
 10. **设计不受现有半成品代码约束**：能用就用、能优化就优化、不满足就改、必要时重写。项目还没上线，信封、握手、协议都可以直接改，不考虑兼容。
 11. **RPC 必须异步**，没有同步版本（§8）。
 12. **应答用 `ReplyHandle`**：处理函数没回过就析构，自动回"无应答"错误（§8）。
-13. **借鉴 GameserverNew 的几处**（§8、§15）：编排辅助 `Join` / `Each` / `Seq`；接口定义里 `_Req` / `_Rsp` 生成 `Call`、`_Send` 生成 `Send`，不匹配的组合生成器报错；`Target` 链式构造（值类型，返回副本）；启动就绪等待。
+13. **借鉴 GameserverNew 的几处**（§8、§15）：编排辅助 `Join` / `Each` / `Seq`；接口定义里由 `rpc` 签名决定生成 `Call` 还是 `Send`（原先的 `_Req` / `_Rsp` / `_Send` 命名规则已被第 21 条取代）；`Target` 链式构造（值类型，返回副本）；启动就绪等待。
 14. **App 层面的编排（停机阶段等）暂缓**，先由 `main` 手动调（§15、§19 第 1 项）。
 15. **命名**：发起端 `CallHandle`，应答端 `ReplyHandle`，应答方法 `Complete`；不叫 future / promise，因为它们不能阻塞取结果，也不挂续接（§8）。
 16. **链式调用**：B 的处理函数返回 `void`，应答经 `ReplyHandle` 晚点回；下游调用的默认超时取 `剩余 − 预留`；下游的框架错误映射成 `kUpstream`，业务错误原样透传（§8）。
@@ -30,8 +30,13 @@ Agent、信封、共享内存通道见 [共享内存IPC设计.md](共享内存IP
 18. **一个进程只有一个 `ActorSystem`**，里面可有多个 kind，一个 kind 可实现多个生成的服务接口；不支持同进程多个 `ActorSystem` 实例，隔离靠分片组（§5）。
 19. **IDL 生成统一的 RPC 接口，业务通过各执行模型的登记器（`IMethodRegistrar`）绑定**，不是每个模型各有一套登记 API（用户提出的方向，§8）。
 20. **客户端命令与服务间 RPC 要区分**（用户确认）；机制是 service 级的 `audience`，见 §8（**提议**）。
+21. **接口定义用 gRPC 的 schema 写法**（用户选定，2026-11-05，§8）：proto 里写 `service` / `rpc`，**只用 schema 语法，不用 gRPC 的代码与运行时**，由自研生成器生成。`rpc` 签名决定 `Call`（有应答类型）还是 `Send`（返回 `google.protobuf.Empty`，单向）；`stream` 生成器报错；`CLIENT` service 的请求消息不许标 `route_key`；**第一版所有 `msg_id` 手写**，不做哈希；**单向方法只生成 `Send` 存根，处理函数没有 `ReplyHandle`、不涉及应答类型**。
+22. **消息编解码用 libprotobuf**（用户选定，2026-11-05，§8、§19 第 35 项）。**请求体在处理函数执行时解码**（执行器线程，不在 IO 线程）；解码失败：请求回框架错误码"解码失败"，单向消息计数加限频日志，不断连接（用户选定，依据见 §17 的对照）。
+23. **actor 不提供 `PostToMain`**（用户选定，2026-11-05，§10）：actor 访问主循环里的模块，一律对该模块登记的 rpc 发统一的 `Call`，不管目标在本进程还是远端。`Offload` 不在此列（它是把计算挪去线程池，不是调另一个组件）。
+24. **调用方只给对象 id，位置透明**（用户选定，2026-11-05，§8、§14）：业务不写 kind、不写节点；IDL 在 service 级声明 `service_type` 与 `object_type`，请求里用 `(route_key)` 标出对象 id 字段，生成的存根据此带出对象类型。`Locator` 按（服务类型，对象类型，id）（如 `scenesvr.player.12345`）解析出节点：对象创建时登记到注册中心，进程内缓存查询结果（注册中心的实现与唯一性保证**未定**，§19 第 36 项）。**`ActorKind` 仍是 `ActorSystem` 内部概念，对象类型与 kind 分开**；主循环模型没有 kind，只有对象类型。
+25. **主循环模型的实体由框架提供的 `EntityManager<T>` 统一管理**（用户选定，2026-11-05，§14）：业务模块（`PlayerModule`、`SceneModule`，一个模块可以持有多个，比如 scenesvr 同时管场景、玩家、boss）用 `Adopt` / `Activate` / `Remove` 管理实体，**登记与注销在接口里自动联动对象目录**，业务不直接调 `Register`。**命名**：框架组件叫 `EntityManager`，业务那一层叫 `XxxModule`，不再叫"管理器"。`EntityManager` 是模块的成员变量，不是登记进某个系统的 kind。
 
-**提议**（未确认，见 §19）：统一的 Shard 结构（§9）、`Locator` 接缝（§14）、`ActorContext` 不给 `App` / 模块引用（§5）、显式创建为默认（§6）、本地消息统一用字节（§10）、actor 池的分片函数与选择器（§3、§9）、`Correlation` 结构与回调契约（§8）、`Status` 的形状（§8）、`HandlerContext` 与 IDL 生成器的细节（`audience`、`msg_id`、登记器，§8）、未覆盖需求的清单（§16）等。
+**提议**（未确认，见 §19）：统一的 Shard 结构（§9）、`Locator` 接缝（§14）、`ActorContext` 不给 `App` / 模块引用（§5）、显式创建为默认（§6）、本地消息统一用字节（§10）、actor 池的分片函数与选择器（§3、§9）、`Correlation` 结构与回调契约（§8）、`Status` 的形状（§8）、`HandlerContext` 与 IDL 生成器的细节（`audience`、`msg_id`、登记器，§8）、未覆盖需求的清单（§16）、对象解析器与统一的"对象不存在"错误码、`Register` 的异步与 RAII 句柄（§8、§14）、`EntityManager` 的接口与它和 `ActorSystem` 共用生命周期层（§6、§14）等。
 
 ## 1. 需求
 
@@ -94,7 +99,7 @@ RPC 应答：不查登记表，按 seq 回到发起方的执行上下文（§8�
 原先设计过第三种执行方式"无状态 worker"（独立的 `WorkerSystem` / `WorkerExecutor`），**已取消**。无状态并行用一个**普通 `ActorKind`** 表达：
 
 - **池 = 一个 kind，N 个固定键（`0..N-1`）的实例**，启动时显式创建（§6）。`ActorKind::pool_size` 大于 0 表示这是池 kind。成员是普通 actor：同一成员内串行，成员之间并行；处理函数不存状态靠约定，框架不强制（别家同样靠约定）。
-- **目标写 `Pool(kind)`**：调用方不选键，由**选择器**挑一个成员，等价于 `Actor(kind, 选出的键)`。网络消息的消息号登记给池 kind 时，`Dispatcher` 同样用选择器挑成员，不读信封的 `route_key`。
+- **目标写 `Pool(对象类型)`**：调用方不选键，由**选择器**挑一个成员，等价于 `Object(对象类型, 选出的键)`（调用方不写 kind，§14）。网络消息的消息号登记给池 kind 时，`Dispatcher` 同样用选择器挑成员，不读信封的 `route_key`。
 - **选择器第一版是轮转**（原子计数，IO 线程、主循环、分片线程都能调）。以后要"最空闲优先"，读各分片入口车道的深度计数即可；但只看排队数看不见"正在跑的慢任务"（Akka.NET 的 `SmallestMailbox` 就只读 `NumberOfMessages`；Orleans 的 `StatelessWorker` 先找"没在执行"的成员，都忙才比等待数）。
 - **池只在 S1 起有并行收益**：S0 只有一个分片，池退化为串行。S1 起成员在各分片线程上，IO 线程直接投入分片入口车道，不绕主循环。池 kind 的分片函数见 §9。
 - **慢任务和阻塞不要放进池**：成员占着分片线程，会拖住同片的别的 actor。重计算和阻塞走 `Offload`（共享队列，哪个线程空闲谁取，没有分片的队头阻塞）。
@@ -232,7 +237,7 @@ ActorSystem（Module）
 
 - **kind 是静态的**：`PlayerModule` / `RoomModule` / `SceneModule` 各自 `DependsOn("actor")`，在 `Init` 里 `actors->Register(kind)` 拿到这个 kind 的**登记器**（`IMethodRegistrar`），再调 IDL 生成的 `Register*Service(...)`，把服务的方法按消息号绑到这个 kind 上（§8）。`ActorSystem::Start` 冻结 kind 表。
 - **实例是动态的**：由 `ActorSystem` 按 kind 的工厂创建，只在所属 Shard 的线程里创建、运行、销毁。
-- **地址是 `(KindId, Key)`**，`Key` 是 64 位无符号整数（玩家 id、房间 id、场景 id）。业务代码里不出现节点号。
+- **`ActorSystem` 内部用 `(KindId, Key)` 定位实例**，`Key` 是 64 位无符号整数（玩家 id、房间 id、场景 id）。业务代码里不出现节点号，**也不出现 kind**：调用方给的是对象类型加 id，kind 由消息号找到登记者推出（§14）。
 - **一个进程只有一个 `ActorSystem`，里面可以有多个 kind**（已定）。一个 kind 可以实现多个生成的服务接口（对同一个 kind 的登记器多次调用 `Register*`，消息号全局唯一）；每个 kind 有自己的配置（分片组、tick、邮箱和车道上限、激活策略、`pool_size`）。**不支持同进程多个 `ActorSystem` 实例**：`App` 只有一个入口，要不同的线程配置就用分片组。别的项目：protoactor 的 `NewActorSystem()`、Akka.NET 的 `ActorSystem.Create(name, ...)` 允许创建多个（系统是普通对象，不是全局单例），Orleans 有在一个进程里起多个 silo 的测试宿主（`InProcTestCluster`），主要用于测试和多名字场景。将来要在一个进程里模拟多节点，应该起多个 `App`，不是多个 `ActorSystem`（`App` 是否被进程级单例挡住，没查）。
 - **注册时检查冲突**：kind 重名、消息号被两个登记者同时认领，在 `Init` 阶段返回带原因的错误。
 - **消息号决定 kind**（**提议**）：一个消息号只属于一个登记者，注册时登记"消息号 → 执行器"。游戏服按命令号派发是常见做法。有了 IDL，这个绑定在登记时由生成的 `Register*` 完成，不再手写消息号列表。备选是在信封里加显式的 kind 字段，见 §19。
@@ -244,6 +249,7 @@ struct ActorKind {
     KindId id;
     std::string_view name;
     // 处理哪些消息号不在这里写：由 IDL 生成的 Register*Service 经登记器绑定（§8）
+    // 对象类型也不在这里写：取自所登记服务的 IDL 声明；一个 kind 登记的服务对象类型必须一致，不一致 Init 报错（§14）
     std::move_only_function<std::unique_ptr<IActor>(Key)> create;
     std::chrono::milliseconds tick_interval{0}; // 0 = 不 tick（场景才设）
     std::string group = "default";              // 分片组，§9
@@ -258,7 +264,7 @@ public:
     virtual ~IActor() = default;
     virtual void OnActivate(ActorContext&, ActivationHandle) = 0;   // 异步：加载完成后 handle.Complete(status)
     // 业务消息不走 OnMessage：actor 类同时实现 IDL 生成的服务接口，方法签名统一为
-    //   void Login(HandlerContext&, const LoginReq&, ReplyHandle<LoginRsp>);   // Oneway 时句柄为空，§8
+    //   void Login(HandlerContext&, const LoginReq&, ReplyHandle<LoginRsp>);   // 单向（返回 Empty）的方法没有第三个参数，§8
     // 需要 actor 特有的能力（self()、定时器、Fail）时，用 OnActivate 里保存下来的 ActorContext。
     virtual void OnTick(ActorContext&, Clock::time_point now, std::chrono::milliseconds dt) {}
     virtual void OnDeactivate(ActorContext&, DeactivationReason, DeactivationHandle) = 0; // 异步：存盘
@@ -277,7 +283,6 @@ public:
     Key self() const;
     TimerId SetTimer(std::chrono::milliseconds, std::move_only_function<void()>);
     void CancelTimer(TimerId);
-    void PostToMain(std::move_only_function<void()>);       // 要用主循环模块（数据库等）时，结果再以消息回来
     void Offload(std::move_only_function<R()> work, std::move_only_function<void(R)> on_done);
     void Fail(Status reason);                               // §13
 };
@@ -301,6 +306,8 @@ Activating ──成功──▶ Active ──回收 / 停机 / Fail──▶ De
 - **空闲回收**：默认不开，按 kind 可选。参考 Orleans 的 `ActivationCollector`：按"最后访问时间加存活期限"分桶，周期定时器扫描。
 - **停机**：App 层的停机阶段暂缓（§19 第 1 项），`ActorSystem` 自己提供排空，由 `main` 在合适的时机调用。排空顺序：先拒绝新消息（回"正在停机"），再对所有实例 `Deactivate`，等存盘完成或到截止时间。
 
+**与主循环模型共用生命周期层（提议，§14 的 `EntityManager`）**：上面的状态、激活失败、显式 / 按需创建、回收，都与邮箱无关。拆成一层共用：`ActorSystem` 每个 Shard 的本地表用它，再叠加每实例邮箱；主循环模块用 `EntityManager` 直接使用它。只做一份，不在两处各写一套。
+
 ## 7. 消息投递与终态
 
 ### `Deliver` / `Submit` 只返回入口级结果
@@ -322,12 +329,13 @@ Activating ──成功──▶ Active ──回收 / 停机 / Fail──▶ De
 |---|---|---|
 | 消息号没登记 | 回"无处理者" | 计数 + 限频日志 |
 | kind 不存在 | `Submit` 返回 `kNoSuchKind` | 同左，计数 |
-| 实例不存在（显式创建策略） | 回"不存在" | 计数 + 限频日志 |
+| 对象不存在（actor：显式创建策略下实例不存在；主循环模型：解析器返回空，**提议**，§14） | 回"对象不存在"（`kNoSuchObject`） | 计数 + 限频日志 |
 | 实例激活失败 | 回"激活失败" | 计数 + 限频日志 |
 | 邮箱满 | 回"邮箱满" | 丢并计数 |
 | 正在停用 / 停机 | 回"正在停用"/"正在停机" | 计数 |
 | 已过期 | **不回**（调用方早已判超时） | 丢并计数 |
 | 处理函数失败 | 回"处理失败" | 计数 + 日志 |
+| 请求体解码失败（**已定**，依据见 §17） | 回"解码失败"（框架错误码） | 计数 + 限频日志，不记载荷内容 |
 
 错误码见 §8 的 `Status`：框架错误 1..999（沿用 Agent 现有的 1、2：`kRouteErrNoRoute`、`kRouteErrUnavailable`），业务错误 ≥ 1000。
 
@@ -353,7 +361,7 @@ Activating ──成功──▶ Active ──回收 / 停机 / Fail──▶ De
 4. **超时用该上下文的 `TimerWheel`，应答和超时竞争时终态唯一。** 先到的赢，后到的丢弃并计数，而且**分开计数**：`late_reply`（应答晚于超时）和 `unknown_seq`（没对上）。silver-server 的 `recvSSResRpc` 注释里写了这两种情况原来在日志里分不清。
 5. **deadline 沿用信封的 `remaining_ms`**，被调方出队时再判过期（§7）。
 6. **主循环模块和 actor 都能发、都能收。** 回调在发起方自己的上下文里执行；被调方只管 `ReplyHandle::Complete`，不关心对方在哪种执行方式里。
-7. **统一的 `Call`**：目标是 `Actor(kind, key)`、`Pool(kind)`（§3）或 `Service(service_type, 路由方式)`（§14）。同进程调用和跨进程调用用同一个入口，由 `Locator` 决定本地投递还是走信封加 Agent。
+7. **统一的 `Call`**：目标是 `Object(对象类型, id)`（actor 与主循环 `EntityManager` 里的对象都是它）、`Pool(对象类型)`（§3）或 `Service(service_type, 路由方式)`（§14）；业务一般不手写 `Target`，由生成的存根按 IDL 填。同进程调用和跨进程调用用同一个入口，由 `Locator` 决定本地投递还是走信封加 Agent。
 
 ### 异步（**已定**：没有同步版本）
 
@@ -383,7 +391,8 @@ RPC 一律异步。主循环或 Shard 上同步等，等于自己等自己：应
 
 | 调用方 → 目标 | 请求落点 | 应答落点 |
 |---|---|---|
-| 主循环 → 主循环（同进程） | **不走 `Call`，直接调模块接口** | — |
+| 主循环模块 → 主循环模块（同进程，没有对象 id） | **不走 `Call`，直接调模块接口** | — |
+| 任何调用方 → 按对象 id 寻址的目标（含本进程主循环里的对象，**提议**） | 走 `Call`，异步语义与远端一致 | 发起方所在上下文的应答通路 |
 | 主循环 → actor | 目标分片的入口车道 | 主循环的应答通路 |
 | actor → 主循环 | 主循环队列 | 发起方所在 Shard 的应答通路 |
 | actor → actor | 同片：邮箱；异片：目标片入口车道 | 发起方所在 Shard |
@@ -416,17 +425,17 @@ struct Correlation {          // 取代信封里的 u64 seq：仍是 8 字节，
 
 1. **永远异步完成**：失败（在途数超限、无路由、`Locator` 答"非本地"）也投回自己的应答通路，下一轮执行，不在 `Call` 的栈里调。否则回调会在调用方处理函数执行到一半时重入。GameserverNew 的 `Core.Call` 同样如此（关闭或发送失败都经 `Poster` 投回，`core.go`）。
 2. **回调在发起方的上下文里执行**，不需要加锁。
-3. **回调被调用，就说明发起实例仍活着、代次相同。** 挂起项记录发起实例 `(kind, key, 代次)`，应答到达或超时触发时核对，对不上就丢弃。每一项都有超时，必然回收，所以惰性清理就够，不建按实例的索引。回调里可以放心用捕获的 `this`。
+3. **回调被调用，就说明发起实例仍活着、代次相同。** 挂起项记录发起实例 `(kind, key, 代次)`，应答到达或超时触发时核对，对不上就丢弃。每一项都有超时，必然回收，所以惰性清理就够，不建按实例的索引。回调里可以放心用捕获的 `this`。**这条保证只对 actor 成立**：主循环模块里的对象默认没有代次（`EntityManager` 可以统一发，见 §14）。
 4. **至多一次**：成功、错误、超时各调一次；发起实例被回收时不调；`Cancel` 之后不调。`Cancel` 在发起方的上下文里同步生效，不存在"取消的同时应答正好来了"的竞争。
 5. **必须带超时，没有"无限等"。**
 
 ### `ReplyHandle`（**已定**）
 
-- 处理函数从 `OnMessage` 的参数里拿到一个只能移动的 `ReplyHandle`（`Oneway` 时是空句柄，对它调 `Complete` 无效）。应答只经这个句柄回，`ActorContext` 上没有 `Reply(request, ...)`。
+- 处理函数从 `OnMessage` 的参数里拿到一个只能移动的 `ReplyHandle`（IDL 生成的单向方法没有这个参数，见 §8）。应答只经这个句柄回，`ActorContext` 上没有 `Reply(request, ...)`。
 - `Complete(status, body)` 只生效一次；**析构时还没回过，自动回"无应答"错误。** 这样处理函数忘了回、实例被回收时，调用方不用等到超时。
 - **可以跨回合存活**（延迟应答，如等库加载完再回）。它只持有请求头的拷贝和回送通路，不引用实例，也不引用邮箱里的消息缓冲，所以实例回收之后、或在别的线程上析构，自动回错误都还能发出去。回送通路（同进程投应答通路、跨进程发信封）因此必须线程安全。
 - **带剩余预算**：回之前核对，扣完处理时间不剩就不回（Agent 对 `remaining_ms` 为 0 的消息按无效丢弃）；应答的 `remaining_ms` 取剩余预算。
-- **`Complete` 返回 `void`**，另给 `explicit operator bool`（句柄有效且还欠一个应答；`Oneway` 的空句柄为 `false`）。重复调用：`ASSERT_*`（Debug 下 abort，Release 忽略并按调用点限流记日志），计 `duplicate_reply`。处理函数不碰句柄就返回，句柄析构时自动回"无应答"，计 `no_reply`，忘了回的 bug 就会暴露出来。
+- **`Complete` 返回 `void`**，另给 `explicit operator bool`（句柄有效且还欠一个应答）。重复调用：`ASSERT_*`（Debug 下 abort，Release 忽略并按调用点限流记日志），计 `duplicate_reply`。处理函数不碰句柄就返回，句柄析构时自动回"无应答"，计 `no_reply`，忘了回的 bug 就会暴露出来。
 - 对照 GameserverNew：`OnceReply`（`rpc/dispatcher.go`）只保证至多回一次，不保证至少回一次；处理函数忘了回，调用方等默认的 120 秒超时。
 
 ### `CallHandle`、`CallResult` 与返回值（命名**已定**，其余**提议**）
@@ -473,7 +482,7 @@ struct Status {                  // 平凡可拷贝；线上就是信封的 err_
 | `kTimeout` | 超时 | 发起方的 `TimerWheel` |
 | `kOverloaded` | 在途数超限、入口车道满、邮箱满（§7 的"邮箱满"） | 发起方或被调方 |
 | `kNoHandler` | 消息号没登记 | `Dispatcher` |
-| `kNoSuchActor` | kind 或实例不存在（显式创建策略） | `ActorSystem` |
+| `kNoSuchObject`（原 `kNoSuchActor`） | 对象不存在（actor：kind 或实例不存在；主循环模型：解析器返回空，**提议**）；**对端据此让调用方作废位置缓存，§14** | `ActorSystem` / 主循环的 thunk |
 | `kActivationFailed` | 激活失败 | `ActorSystem` |
 | `kDeactivating` | 正在停用 | `ActorSystem` |
 | `kShuttingDown` | 正在停机 | 各执行器 |
@@ -522,7 +531,13 @@ A 收到 CallResult ◀──
 
 ### 接口定义与 `Target`（**已定**）
 
-- **命名决定生成什么**：`_Req` 加 `_Rsp` 生成 `Call`，`_Send` 生成 `Send`（单向，返回空）；其他组合生成器报错。空响应也定义一个空字段的 `_Rsp`，不用 `Empty`（`Empty` 表示单向）。GameserverNew 用 `_Ntf`，我们用 `_Send`。**生成器本身没有设计**，是否做、何时做见 §19。
+- **接口用 gRPC 的 schema 写法，生成器自研**（用户选定）：proto 里写 `service` 与 `rpc`，**只用它的 schema 语法，不用 gRPC 的代码与运行时**（不跑 `grpc_cpp_plugin`，不用 `cc_generic_services`）。生成器读 `protoc --descriptor_set_out`，和 `tools/configgen` 同一条路（自带 wire 解码器读 descriptor、自定义 option 放 `options.proto` 一类的文件里）。规则：
+  - `rpc M(Req) returns (Rsp)` 生成 `Call`；`returns (google.protobuf.Empty)` 生成 `Send`（单向）。proto 没有 void 类型，`Empty` 是惯例。
+  - 要"只回成功 / 失败、没有数据"的请求，定义一个空字段的 `Rsp`，**它仍是 `Call`，不是单向**。单向方法只生成 `Send` 存根（只有请求参数，不涉及应答类型），处理函数没有 `ReplyHandle`、没有返回值（用户选定）；不生成 `Call` 存根，调用方想 `Call` 会编译失败，不会静默变成不等应答。
+  - `stream`（任一侧）：生成器报错，设计里没有流式。
+  - 命名后缀（`_Req` / `_Rsp` / `_Send`）不再决定语义，取代原先的规则；留作 lint 与否待定。GameserverNew 用的是命名后缀（`_Ntf`），我们改用签名。
+  - option 编号要避开 `config/schema/options.proto` 的 52001–52107（**提议**：另取一段，如 53xxx；改 option 时还要看 `configgen.py` 的 `OPTION_NUMBERS` 核对）。
+  - **生成器本身还没有设计**，何时做、生成什么见 §19 第 24 项。
 - **`Target` 是值类型，链式方法返回副本，不改原对象**（GameserverNew 的 `At` / `ByHash` / `Broadcast` / `Timeout` 同款）。草图，不是定稿：
 
 ```cpp
@@ -530,8 +545,8 @@ Target::Service(service_type).Any();            // 某类服务的任一实例
 Target::Service(service_type).Hash(route_key);  // 按键哈希（取模，§14）
 Target::Service(service_type).To(node);         // 指定节点（Direct）
 Target::Service(service_type).Broadcast();      // 只允许 Oneway
-Target::Actor(kind, key);                       // 实体
-Target::Pool(kind);                             // actor 池（§3）
+Target::Object(object_type, id);                       // 实体
+Target::Pool(object_type);                             // actor 池（§3）
 target.Timeout(std::chrono::milliseconds{3000}); // 单次调用的超时上限，返回副本
 ```
 
@@ -545,19 +560,23 @@ target.Timeout(std::chrono::milliseconds{3000}); // 单次调用的超时上限�
 class IMethodRegistrar {                        // 每个执行模型提供一个（模型作者实现，业务不直接碰）
 public:
     // 消息号 + 类型擦除的处理函数（已含解码、调用类型化方法、包装 ReplyHandle）。
-    // thunk 带一个 impl 参数，由模型在调用时给出：主循环是登记时绑定的模块，actor 是邮箱里取到的那个实例。
+    // thunk 带一个 impl 参数，由模型在调用时给出：actor 是邮箱里取到的那个实例；主循环是登记时绑定的模块（没有对象 id 的服务），
+    // 或由解析器按对象 id 解析出的对象（有 object_type 的服务；解析不到由框架回 kNoSuchObject，**提议**，§14）。
     virtual Status Bind(MsgId, MethodThunk) = 0;
 };
 
 // IDL 生成（对所有模型都一样）。生成的方法统一签名：
-//   void Login(HandlerContext&, const LoginReq&, ReplyHandle<LoginRsp>);
-Status RegisterPlayerService(IMethodRegistrar&, PlayerService* impl_or_null);
+//   void Login(HandlerContext&, const LoginReq&, ReplyHandle<LoginRsp>);   // rpc 有应答类型：Call
+//   void Notify(HandlerContext&, const NotifyReq&);                        // rpc 返回 Empty：Send，无 ReplyHandle、无返回值
+// 有 object_type 的服务：第二个参数是解析器 ObjectResolver<PlayerService>（对象 id → 实现指针；actor 的登记器不用它，传空）。
+// 没有 object_type 的服务：第二个参数是实现指针（主循环里绑模块）。生成器按有没有 object_type 生成这两种签名。
+Status RegisterPlayerService(IMethodRegistrar&, ObjectResolver<PlayerService> resolver_or_empty);
 ```
 
-业务只写一行 `RegisterXxxService(registrar, impl)`，换模型只换传进去的登记器，不用重新生成。主循环的登记器直接绑到 `Dispatcher::On`；`actors->Register(kind)` 返回的是该 kind 的登记器。
+业务只写一行 `RegisterXxxService(registrar, 解析器或实现指针)`，换模型只换传进去的登记器，不用重新生成。主循环的登记器直接绑到 `Dispatcher::On`；`actors->Register(kind)` 返回的是该 kind 的登记器。
 
 - **前例**：GameserverNew 的 `tools/protoc-gen-svcstub` 同样生成"绑定 route、解码、`Reply`、业务方法到 dispatcher"的注册函数。gRPC 用生成的 `Service` 加 `WithAsyncMethod_X` / `WithCallbackMethod_X` 混入按方法选风格，**生成器要为每种风格各产出一份**，加新风格就要改生成器；我们用运行期登记器，只生成一份，多一次间接调用，和入队相比可以忽略。
-- **`HandlerContext`**（§5 草图）是所有模型都提供的公共基类：`request()`（src、`trace_id`、剩余时间，客户端来源时还有 `client_role`）、`Call` / `Send` / `Cancel`；`ActorContext` 派生它，再加 `self()`、定时器、`Offload`、`PostToMain`、`Fail`。**显式参数，不用线程局部的"当前上下文"**：回调回到发起方上下文时要自己恢复隐式上下文，测试要搭环境，tsan 和 asan 也难查。
+- **`HandlerContext`**（§5 草图）是所有模型都提供的公共基类：`request()`（src、`trace_id`、剩余时间，客户端来源时还有 `client_role`）、`Call` / `Send` / `Cancel`；`ActorContext` 派生它，再加 `self()`、定时器、`Offload`、`Fail`。**显式参数，不用线程局部的"当前上下文"**：回调回到发起方上下文时要自己恢复隐式上下文，测试要搭环境，tsan 和 asan 也难查。
   - 别家：protoactor 的 `Context` 由小接口组合，非 actor 的 `RootContext` 和 actor 的 `Context` 共用 `SenderContext`；gRPC 有公共基类 `ServerContextBase`，同步和回调风格各派生一个，生成的方法按风格收不同类型（所以生成器要知道有几种风格）；Akka 的 `Context` 和 Orleans 的 `RuntimeContext.Current` 是隐式的。
   - 生成的方法通用的是**签名**，不是实现里依赖什么：想在几种模型间搬来搬去的实现，要遵守最严的规则（比如不碰模块）。
 
@@ -565,17 +584,18 @@ Status RegisterPlayerService(IMethodRegistrar&, PlayerService* impl_or_null);
 
 | 放 | 不放 |
 |---|---|
-| 消息与方法，`_Req` / `_Rsp` / `_Send` 命名决定 `Call` 还是 `Send` | 在哪个执行模型上跑 |
-| 寻址：属于哪类微服务（`Target::Service`）；按实体寻址时用哪个字段当实体键 | 线程、分片、邮箱等承载配置 |
+| 消息与 `service` / `rpc`，`rpc` 签名决定 `Call` 还是 `Send`（返回 `Empty` 是 `Send`） | 在哪个执行模型上跑 |
+| 寻址：service 级的 `service_type`（哪类微服务）与 `object_type`（对象类型，有对象 id 的服务才有）；请求里用 `(route_key)` 标对象 id 字段 | 线程、分片、邮箱等承载配置 |
 | `audience` 和消息号（见下） | |
 
 **消息号（`msg_id`）**：
 - **线上是数字，名字用在 IDL、日志、指标、工具里。** 字符串不上线路：信封路由区"定长、固定偏移、纯数字、没有字符串"是设计前提（`envelope.h`），每条多约 27 字节，不可信输入还多出一块变长解析面。查表本身的 CPU 开销不是主要理由（热缓存微基准，名字约 27 字节，登记 200 到 20000 项：整数键 `FlatHashMap<u32>` 1.3 到 1.8 ns，字符串键 16 到 34 ns，线上带字符串再哈希成 u32 约 6 到 13 ns）。
-- **默认由生成器对"服务名/方法名"取稳定哈希**（`base/hash` 的 `MurmurHash64A` 取低 32 位），**全局查冲突**，冲突或结果为 0 时生成失败，用显式 `(msg_id)` 解决。哈希只在生成器里算，生成的是常量，Go 侧不用实现同一个哈希。这等于一个不需要握手的"名字到数字"字典（pitaya 的做法是路由字符串加握手下发字典，`SetDictionary`）。
+- **第一版每个 `rpc` 都手写 `(msg_id)`**（用户选定）：缺省、为 0、两个 `rpc` 重复都生成失败，**检查范围是所有 proto 一起**，所以生成器一次要读全部 RPC proto。不做哈希。
+- **以后要自动分配**：对没写 `(msg_id)` 的取稳定哈希（`base/hash` 的 `MurmurHash64A` 取低 32 位，哈希只在生成器里算，生成的是常量，Go 侧不用实现同一个哈希），已手写的不变，所以是向后兼容的增量。这等于一个不需要握手的"名字到数字"字典（pitaya 的做法是路由字符串加握手下发字典，`SetDictionary`）。
 - 生成表同时带名字，登记时可以按名字查 id，日志和 `MessageStats`（已支持按 id / 名字统计）显示名字。按名字的通用入口（给 GM 工具、压测机器人用，gRPC 有 generic service）需要时再生成 `ResolveMethod(name) → id`。
 - GameserverNew 的后端 RPC 用 route 字符串（`Header.Route`），`cmd_id` 只在客户端协议里，手写在客户端消息定义的选项上（`proto/cs/cs_item.proto`），网关把 cmdID 翻译成 route 字符串。
 
-**客户端命令与服务间 RPC 要区分（用户确认），机制是 service 级的 `audience`（提议）。** 形状相同（`_Req` / `_Rsp` / `_Send`、生成的注册与分发、`HandlerContext`、执行器都共用），区分的理由是四件事：**信任边界**（客户端是不可信输入，不能触达内部方法）、**身份**（客户端命令要玩家 id）、**错误可见性**（`kUpstream` 等不能泄漏给客户端）、**推送**（服务端到客户端的 `_Send` 目标是客户端连接）。
+**客户端命令与服务间 RPC 要区分（用户确认），机制是 service 级的 `audience`（提议）。** 形状相同（`rpc` 签名、生成的注册与分发、`HandlerContext`、执行器都共用），区分的理由是四件事：**信任边界**（客户端是不可信输入，不能触达内部方法）、**身份**（客户端命令要玩家 id）、**错误可见性**（`kUpstream` 等不能泄漏给客户端）、**推送**（服务端到客户端的单向 `Send` 目标是客户端连接）。
 
 ```
 audience = INTERNAL      // 默认：只给内部服务调用，客户端不可达
@@ -585,10 +605,104 @@ audience = CLIENT_PUSH   // 服务端推给客户端：只生成发送端存根�
 
 - **用 service 级，不用方法级**：service 是承载和评审的单位，不会在一个内部 service 里意外暴露某个方法；GameserverNew 的 `kind` 也是 service 级。要让客户端调某个内部能力，写一个薄的 `CLIENT` service 去显式调内部那个，这一层还能放客户端专有的校验。
 - **强制点三处**：①网关用生成的白名单，只转发 `CLIENT` service 的消息号（GameserverNew 的网关也只转发路由表里登记过的 `cmdID`，其余回 `ERR_NO_ROUTE`）；②后端对带"客户端来源"flag 的信封，只允许命中 `CLIENT` service 的消息号，其余回 `kNoHandler`（不暴露方法存在），这个 flag 只有网关会设，客户端协议不是我们的信封，客户端设不了；③网关出口把框架错误（< 1000）统一映射成通用客户端错误码，业务错误透传。
-- **`CLIENT` 的消息号必须显式 `(msg_id)`**（生成器没写就报错）：客户端是已发布的二进制，id 要稳定，改名不能让它变。`INTERNAL` 默认哈希。
-- **身份**：`request().client_role()` 只对客户端来源有值。**实体键必须来自已认证的会话，不能取自客户端消息体**，否则客户端能直接寻址别的玩家的 actor。GameserverNew 的网关也是从会话里取角色 id（header 的 `ClientRoleID`）。
+- **`CLIENT` 的消息号必须显式 `(msg_id)`**（生成器没写就报错）：客户端是已发布的二进制，id 要稳定，改名不能让它变。第一版所有 service 都手写，见上。
+- **身份**：`request().client_role()` 只对客户端来源有值。**实体键必须来自已认证的会话，不能取自客户端消息体**，否则客户端能直接寻址别的玩家的 actor。GameserverNew 的网关也是从会话里取角色 id（header 的 `ClientRoleID`）。所以 **`CLIENT` service 的请求消息里不许标 `route_key`**（生成器报错，用户确认）：actor 的键由网关从会话取出、写进信封的 `route_key`（**提议**），不来自消息体。
+- **网关路由表**（用户：后续在 gatesvr 做）：`cmd_id` → 后端服务类型，再经 `Locator` 定位到该类型服务的具体节点（§14）。上面强制点①的白名单就是这张表的一部分。表从哪来（由 proto 里的服务类型生成，还是配置）没定，见 §19 第 34 项。
 - **客户端协议自己的请求关联**（cmd 加客户端 `seq`）由网关翻译，不进内部 `Correlation`：GameserverNew 的 `forwardToBackend` 把客户端 `SeqID` 留在闭包里，用 `RspCmdID` 回给客户端。
 - **推送**：`Target::Client(role)` 要经 Agent 路由到持有该会话的网关；"会话到网关"的映射没设计（§19）。
+
+### 用法示例（草图）
+
+**不是定稿**：类型化存根的形状、`Result<T>`、`ObjectResolver`、`EntityManager`、`mainLoop().registrar()` 这些名字和形状都还没定（§19 第 24、36 到 42 项），写出来是为了看流程。
+
+proto：
+
+```proto
+service ScenePlayerService {
+  option (breeze.audience)     = INTERNAL;
+  option (breeze.service_type) = "scenesvr";
+  option (breeze.object_type)  = "player";                  // 生成器拼成 scenesvr.player
+  rpc GetInfo(GetInfoReq) returns (GetInfoRsp)              { option (breeze.msg_id) = 2001; }
+  rpc Kick   (KickReq)    returns (google.protobuf.Empty)   { option (breeze.msg_id) = 2002; }  // 单向
+}
+message GetInfoReq { uint64 player_id = 1 [(breeze.route_key) = true]; }
+message KickReq    { uint64 player_id = 1 [(breeze.route_key) = true]; string reason = 2; }
+message GetInfoRsp { string name = 1; uint32 level = 2; }
+```
+
+生成的（节选）：
+
+```cpp
+class ScenePlayerService {                       // 对象要实现的接口
+public:
+    virtual void GetInfo(HandlerContext&, const GetInfoReq&, ReplyHandle<GetInfoRsp>) = 0;
+    virtual void Kick   (HandlerContext&, const KickReq&) = 0;       // 单向：无 ReplyHandle
+    static constexpr ObjectType kObjectType = "scenesvr.player";
+};
+Status RegisterScenePlayerService(IMethodRegistrar&, ObjectResolver<ScenePlayerService>);
+
+class ScenePlayerClient {                        // 调用方用的存根，对象 id 取自请求里标了 route_key 的字段
+public:
+    static CallHandle GetInfo(HandlerContext&, GetInfoReq, std::move_only_function<void(Result<GetInfoRsp>&&)>);
+    static void       Kick   (HandlerContext&, KickReq);
+};
+```
+
+接收方 A，玩家是 actor：
+
+```cpp
+class Player : public IActor, public ScenePlayerService {
+    void OnActivate(ActorContext&, ActivationHandle h) override { /* 异步加载 */ h.Complete(Status{}); }
+    void OnDeactivate(ActorContext&, DeactivationReason, DeactivationHandle h) override { /* 存盘 */ h.Complete(Status{}); }
+    void GetInfo(HandlerContext&, const GetInfoReq&, ReplyHandle<GetInfoRsp> reply) override {
+        GetInfoRsp rsp;  rsp.set_name(name_);  rsp.set_level(level_);
+        reply.Complete(Status{}, rsp);
+    }
+    void Kick(HandlerContext&, const KickReq& req) override { /* ... */ }
+};
+
+Status PlayerModule::Init() {
+    auto reg = app().actors()->Register(ActorKind{ .name = "player",
+                    .create = [](Key k) { return std::make_unique<Player>(k); } });
+    return RegisterScenePlayerService(reg, {});   // actor 的实例由 ActorSystem 找，不用解析器
+}
+// 对象的登记与注销由 ActorSystem 在激活和回收时自动做
+```
+
+接收方 B，主循环里的业务模块（持有 `EntityManager`，同一个模块可以再持有 `EntityManager<Scene>`、`EntityManager<Boss>`，§14）：
+
+```cpp
+class Player : public ScenePlayerService { /* 实现 GetInfo / Kick，可以和 A 共用业务代码 */ };
+
+class PlayerModule : public Module {                          // 业务模块：登录流程、广播、二级索引、遍历 tick
+    EntityManager<Player> players_{ ScenePlayerService::kObjectType, EntityConfig<Player>{ /* 钩子等 */ } };
+public:
+    Status Init() override {
+        return RegisterScenePlayerService(app().mainLoop().registrar(),
+                                          players_.Resolver<ScenePlayerService>());   // 解析不到：框架回 kNoSuchObject
+    }
+    void OnEnter(ObjectId id, PlayerState s) {                // 玩家带着状态进入
+        players_.Adopt(id, std::make_unique<Player>(std::move(s)),
+                       [id](Status) { /* 登记完成，才通知客户端成功 */ });   // 本地立即可用，对外可见要等登记完成
+    }
+    void OnLeave(ObjectId id) { players_.Remove(id); }        // 本地先摘除，再异步注销
+    void Tick()               { players_.ForEach([](Player& p) { p.Tick(); }); }   // 同步遍历：选主循环模型的理由
+};
+```
+
+调用方（比如邮件服里的一个处理函数）：
+
+```cpp
+GetInfoReq req;  req.set_player_id(pid);
+ScenePlayerClient::GetInfo(ctx, req, [this, pid](Result<GetInfoRsp>&& r) {
+    if (r.status.code == kNoSuchObject) { /* 玩家不在线 */ return; }
+    if (!r.ok())                        { /* kTimeout / kUnavailable / 业务错误 */ return; }
+    Use(r.value());                      // 已解码成 GetInfoRsp
+});
+ScenePlayerClient::Kick(ctx, KickReq{ /* player_id, reason */ });   // 单向：不等应答，没有回调
+```
+
+调用方不写 kind、不写节点，不管对方是 actor 还是主循环。底下的过程：存根取 `player_id`，用 `scenesvr.player` 加 id 去 `Locator` 查节点（先本地缓存，再注册中心）→ 发到对端 → 对端 `Dispatcher` 按消息号找到登记者（actor：分片入队；主循环：入队后调解析器）→ 对端答 `kNoSuchObject` 时调用方作废缓存、重查一次、重发（§14）。
 
 ### 回调还是协程
 
@@ -718,10 +832,10 @@ S1 的线程循环怎么写有两个选择（复用 `EventLoop` 的唤醒与定�
 ## 10. 多线程下的规则（S1 起）
 
 - **业务单线程是默认约定。** 打开分片会打破它：模块不是线程安全的。
-- **actor 里不能直接碰模块**（所以上下文不给 `App` 引用）。要用主循环上的模块，发 `PostToMain`，结果以消息回来。
+- **actor 里不能直接碰模块**（所以上下文不给 `App` 引用）。要用主循环上的模块，对它登记的 rpc 发统一的 `Call`（位置透明，和调别的服务同一个入口，§8）；**没有 `PostToMain`**（用户选定）：只能本地的闭包投递不符合"本地远程统一调用"。
 - **actor 之间只用异步消息，不能同步等**（会死锁）。请求的回调作为消息投回调用方的邮箱。
 - **消息不可变或移交所有权**：`SharedBuffer` 是引用计数的不可变块，天然合适。
-- **本地消息统一用字节**（**提议**）：同进程 actor 之间发消息也用 `SharedBuffer`，换来位置透明（将来 actor 换进程不改业务代码），代价是本地多一次编码解码。玩家和房间在同进程里高频互发时这可能是热路径，**有数据再加同进程的类型化快路径**。
+- **本地消息统一用字节**（**提议**）：同进程 actor 之间发消息也用 `SharedBuffer`，换来位置透明（将来 actor 换进程不改业务代码），代价是本地多一次编码解码。**有数据再加同进程的类型化快路径**。
 - **共享的可变对象要排查**：例如 `VarType` 的 const 方法也会写缓存，不能多线程读同一个对象；`MessageStats` 一线程一实例。同一个 actor 内部使用没问题。
 - **可以在工作线程里用的**：`Now`（全是原子量）、日志（已在 IO 线程上使用）、`SharedBuffer`。
 
@@ -774,18 +888,115 @@ S1 的线程循环怎么写有两个选择（复用 `EventLoop` 的唤醒与定�
 
 ### 寻址三级
 
-`Call` 的目标是 `Actor(kind, key)`、`Pool(kind)`（§3）或 `Service(service_type, 路由方式)`：
+`Call` 的目标是 `Object(对象类型, id)`、`Pool(对象类型)`（§3）或 `Service(service_type, 路由方式)`（业务一般不手写，由生成的存根按 IDL 填）：
 
 - **`Service(service_type, 路由)`**：微服务这一层。Agent 路由已经支持：信封的 `service_type` 配合 `Direct` / `Any` / `Hash` / `Broadcast`（`envelope.h`、`route_table.h`），含义是"某类服务的某个实例"。Agent 本身就是 sidecar。
-- **`Actor(kind, key)`**：实体这一层。先由 `Locator` 查位置得到节点，再发 `Direct`，信封填 `dst = 节点`、`route_key = 实体键`，到目标进程后进 `Dispatcher`。
-- **`Pool(kind)`**：actor 池（§3）。选择器挑出一个成员后等价于 `Actor(kind, 选出的键)`，同样先过 `Locator`。
+- **`Object(对象类型, id)`**：对象这一层。对象可以在 actor 里，也可以由主循环模块的 `EntityManager` 管理，调用方不关心。先由 `Locator` 查位置得到节点（见下），再发 `Direct`，信封填 `dst = 节点`、`route_key = 对象 id`，到目标进程后进 `Dispatcher`，按消息号找到登记者。
+- **`Pool(对象类型)`**：actor 池（§3）。选择器挑出一个成员后等价于 `Object(对象类型, 选出的键)`，同样先过 `Locator`。
 - 接收方不区分来源：消息到了目标进程，进同一个 `Dispatcher`、同一套处理函数和 RPC 应答路径，不管调用方是本进程的 actor、本机另一个进程还是别的机器。
 
 ### `Locator` 接缝（**提议**）
 
-- `ActorSystem` 里留一个 `IActorLocator` 接口，返回"本地 / 远端节点 / 未知"。S0、S1 恒答"本地"。非本地时 `Submit` 返回明确错误，这也是"不存在的实例有明确终态"的一种。
-- `ActorContext::Send` / `Call` 位置透明，业务代码里不出现节点号。
+- 接口是 `ILocator`（不再只属于 `ActorSystem`），按（对象类型，id）解析，返回"本地 / 远端节点 / 未知"。没接注册中心之前（现状）和"仅本进程"的对象类型恒答"本地"。答远端时由 `Locator` 引导走信封，答未知时回 `kNoSuchObject`，这也是"不存在的实例有明确终态"的一种。
+- `HandlerContext::Send` / `Call` 位置透明，业务代码里不出现节点号，也不出现 kind。
 - **跨进程的显式分配**由独立的服务（规划里的 `matchsvr`、`onlinesvr`、`routesvr` 等，我按名字推测职责，目录现在是空的）按负载挑进程。框架只导出 §12 的按 kind 指标。
+
+### 对象寻址：对象类型、登记与 `Locator`（方向**已定**，细节**提议**）
+
+**已定**（用户选定，2026-11-05）：
+
+- **调用方只给对象 id，不写 kind、不写节点。** 对象不管在 actor 里还是在主循环模块的 `EntityManager` 里，调用方式一样。
+- **注册键是（服务类型，对象类型，id）**，如 `scenesvr.player.12345`：同一个玩家 id 在 `scenesvr` 和 `mailsvr` 里是两种对象，键不同，不冲突，也不会拿 id 发给错误的类型。服务类型与对象类型在 IDL 的 service 级声明（§8），生成的存根带出来，业务代码里看不见。
+- **三个概念分开**：
+
+| 概念 | 属于 | 用来做什么 |
+|---|---|---|
+| `ActorKind` | `ActorSystem` 内部 | 生命周期配置（工厂、激活策略）加执行配置（分片组、邮箱和车道上限、tick）。**主循环模型没有它**，只有其中的生命周期配置 `EntityConfig`（见下） |
+| 对象类型（`scenesvr.player`） | IDL 声明；注册中心的键 | 存根、`Locator`、登记 |
+| 对象 id | 信封的 `route_key` | 路由；主循环模型里经 `EntityManager` 的解析器查 |
+
+- **登记**：对象创建时登记、销毁时注销，用同一个通用接口。actor 由 `ActorSystem` 在激活和回收时自动调；主循环模型由框架的 `EntityManager` 在 `Adopt` / `Activate` / `Remove` 时自动调，业务不直接调（见下面的 `EntityManager` 小节）。
+- **位置解析**：进程里的 `Locator`（AppRouter）按键查本地缓存，未命中再查注册中心，结果写缓存，后面直接取缓存。
+
+**提议**（细节，见 §19 第 36 到 42 项）：
+
+- **`Register` 是异步的**（RPC 一律异步，第 11 条）：`Register(object_type, id, on_done)`，完成回调之前别人找不到它，比如登录流程等登记完成再通知客户端成功。返回一个只能移动的 RAII 句柄（`ObjectRegistration`），析构即 `Unregister`；`EntityManager` 内部持有它，业务一般不直接碰，只有绕开 `EntityManager` 直接调 `Register` 的特殊场景才自己持有。忘了注销的后果：调用方被路由过来后收到"不存在"，作废缓存重查，但注册表里的旧项还在，下次又查到。
+- **顺序**：对象 `Active` 之后才登记（`ActorSystem` 倾向在 `Active` 登记；`Activating` 阶段邮箱已在收消息，也可以更早）。注销：`EntityManager::Remove` 先从本地表摘除，之后解析器返回空、调用方收到 `kNoSuchObject`，再异步注销；注销只影响注册表整洁，不影响安全，所以业务不用自己记"先注销再销毁"。
+- **定位策略按对象类型**：声明为"仅本进程"的（主循环单例、MMO 场景内部）不碰注册中心，`Locator` 恒答本地；其余走注册中心。原因是每次 `Call` 多一次缓存读，同节点 actor 互调也一样，开销**没测过**（§9 的前提之一是 IO 线程不碰全局地址表）。
+- **缓存失效与重发**：对端答 `kNoSuchObject`（明确没处理）→ 作废缓存、重查一次、按新位置重发；`kUnavailable`（进程宕机等）也作废缓存。**重发只针对"明确未处理"，最多一次，属于定位，不算自动重试**（附录里"不做"的重试指超时后不知道有没有处理的情形）。
+- **防暴露**：注册中心只管"能不能被找到"，不管"能不能被打到"：远端知道节点地址也能直接发信封。接收侧仍要按对象类型检查是否允许远端访问，和 `audience` 同一类机制。
+- **没有对象 id 的服务**（进程内的数据库模块、`ListScenes` 这类）不是对象，仍是 `Service` 目标；"本进程主循环里的 service 怎么寻址"（显式 `Local`、`Locator` 扩展到 Service 目标、service 级"仅本进程"标记，三种）没定。
+
+**接收方两种模型的差异**（调用方不需要关心地址，但要知道行为不同）：
+
+- **解析器**（**提议**）：主循环登记时不绑模块，而传 `ObjectResolver`（对象 id → 实现指针，在主循环线程上调）。thunk 执行时先解析，返回空就由框架回 `kNoSuchObject`（单向则计数），不调处理函数。这样"对象不存在"由框架保证，不靠处理函数自觉；actor 的实例由 Shard 本地表查出，两边 thunk 形状一致。一个主循环模块可以登记多个服务，各自一个解析器（玩家、场景、boss）。解析器通常由 `EntityManager::Resolver<Iface>()` 给出，业务不手写。
+- **同一个服务里的方法要寻址不同类型的对象**：拆成多个服务，或定义共同的对象类型（如 `scenesvr.entity`，玩家和 boss 共用一个 id 空间）。`object_type` 是服务级，不做方法级覆盖。
+- 差异表：
+
+| | actor | 主循环 |
+|---|---|---|
+| 串行粒度 | 每对象串行，对象之间并行 | 所有对象串行在一个线程，一个慢处理拖住全体 |
+| 背压 | 每实例邮箱上限加每车道上限 | 只有全局队列和字节预算，没有"单对象邮箱满" |
+| 生命周期 | 有激活失败、正在停用等终态，空闲回收，显式创建 | 用 `EntityManager::Activate` 时与 actor 相同；只用 `Adopt` 时没有激活状态（**提议**） |
+| 回调安全 | 发起实例被回收则丢弃回调（§8 回调契约第 3 条） | **没有代次，回调仍会执行，捕获的对象指针可能已悬空** |
+
+回调安全的落点（**提议**，没细想）：`EntityManager` 在对象加入时统一发代次，解析器返回（指针，代次）；发起调用时记下对象 id 和代次，回调前复核，对不上就丢弃，和 actor 丢弃回调一致。§19 第 39 项。
+
+**与已定第 9 条的关系**：第 9 条是不做"全集群唯一激活的分布式目录"。查找表和唯一性保证是两回事：只记录"谁创建、在哪"、创建由分配方显式保证唯一，不违背；加 create-if-absent 或租约防双重激活，靠近第 9 条说的；Orleans 式强一致目录（视图号、宕机后重建）就是。注册中心做到哪一级见 §19 第 36 项。
+
+**别家**（读了各家文档，网页抓取摘要，没通读）：Orleans 的目录以 grain id 为键指向 silo，每个 silo 本地缓存查询结果，缓存缺失或失效才远程读，v9 起是强一致目录；Akka Cluster Sharding 的 `ShardCoordinator` 记的是 shard 级位置；Dapr 对（actor type，id）做哈希，placement 服务算出的分区表存在每个 sidecar 本地，没有对象级注册。我们的方案是对象级目录加本地缓存，和 Orleans 最接近；对象级登记的好处是能显式放置（§14 前面选了显式分配），代价是每个对象创建要写一次注册中心。
+
+### `EntityManager`：主循环模型的实体管理（命名与方向**已定**，其余**提议**）
+
+**已定**（用户选定，2026-11-05）：主循环模型的实体不让业务自己维护 `map` 加手工登记，而由框架提供的 `EntityManager<T>` 统一管理，对象的登记与注销在它的接口里自动联动。**命名**：框架组件叫 `EntityManager`；业务那一层叫 `XxxModule`（`PlayerModule`、`SceneModule`），不再叫"管理器"。
+
+| 层 | 名字 | 管什么 |
+|---|---|---|
+| 框架组件 | `EntityManager<T>`（模块的成员变量） | 实例表、`Adopt` / `Activate` / `Remove`、登记与注销、解析器、代次、激活窗口暂存、遍历 |
+| 业务模块 | `PlayerModule` 等 | 登录流程、踢人、广播、限额、二级索引、`Tick` 里遍历、决定何时激活 |
+
+`EntityManager` 只替代业务模块里通用的那部分，不替代模块本身。一个模块可以持有多个（玩家、场景、boss 各一个，一个 `EntityManager` 管一种对象类型）。actor 模型**同样需要**业务层来决定何时 `Activate`、维护在线集合、踢人、广播、限额；`ActorSystem` 只管实例的生命周期（§6），不管这些业务策略（此前这里写"不需要"是错的，用户指出，2026-11-06）。这一层放在哪、怎么和 `ActorSystem` 联动，见 §19 第 43 项。
+
+**接口草图（不是定稿）**：
+
+```cpp
+template <class T>
+struct EntityConfig {                              // 生命周期配置，不含执行配置；ActorKind = EntityConfig + 执行配置
+    std::move_only_function<std::unique_ptr<T>(ObjectId)> create;     // Activate 用
+    ActivationPolicy activation = ActivationPolicy::kExplicit;       // 默认显式，同 §6
+    std::chrono::milliseconds idle_timeout{0};                       // 0 = 不回收
+    std::size_t pending_limit = 64;                                  // 激活窗口内每个对象最多暂存几条
+    std::move_only_function<void(T&)> on_added, on_removed;          // 业务同步二级索引
+};
+
+template <class T>
+class EntityManager {                              // 只能在主循环线程用（Debug 断言）
+public:
+    EntityManager(ObjectType, EntityConfig<T>);    // 对象类型取自 IDL 生成的 kObjectType
+    void   Adopt(ObjectId, std::unique_ptr<T>, OnRegistered = {});   // 对象在别处已构造好（如玩家带状态进入），直接 Active
+    void   Activate(ObjectId, OnActivated);        // 工厂创建，OnActivate 异步加载，完成后 Active
+    void   Deactivate(ObjectId, OnDeactivated);    // 异步存盘，完成后摘除
+    void   Remove(ObjectId);                       // 不存盘，直接摘除
+    T*     Find(ObjectId);
+    void   ForEach(std::function<void(T&)>);       // 同步遍历：选主循环模型的理由
+    std::size_t size() const;
+    template <class Iface> ObjectResolver<Iface> Resolver();         // 交给 RegisterXxxService
+};
+```
+
+要点：
+- **登记联动**：`Adopt` / `Activate` 完成后自动 `Register(object_type, id)`（异步：完成回调之前对外找不到，本地立即可用；各完成回调在登记完成后才调），`Deactivate` / `Remove` 自动 `Unregister`。`ObjectRegistration` 由它内部持有。
+- **`Remove` 的语义**：先本地摘除，之后解析器返回空。遍历期间调用 `Remove` 延迟到遍历结束再摘除，否则迭代器失效。
+- **激活窗口**：解析器结果有三种：找到 / 不存在 / 激活中。激活中的消息暂存在 `EntityManager` 里（只存这个窗口，有界，超限回 `kOverloaded`），激活完成后补投，激活失败则逐条回 `kActivationFailed`，和 §6 一致。主循环模型没有邮箱，所以要自己带这个暂存，但它不是通用邮箱。
+- **钩子而非继承**：业务模块用 `on_added` / `on_removed` 同步二级索引（如按名字查），避免继承把生命周期和业务混在一起。
+- **同一对象类型实现多个服务接口**（如 `Player` 同时实现 `PlayerService` 和 `PlayerAdminService`）：`Resolver<Iface>()` 内部向基类转换。
+- **不需要系统级的 kind**：`EntityManager` 是模块的成员变量，不登记进某个 System、不冻结、不参与"消息号 → 执行器"的路由，只需要 `EntityConfig`。前面说"主循环模型没有 kind"对寻址成立，对生命周期配置要补上这一点。
+- **与 `ActorSystem` 共用生命周期层**（**提议**）：§6 的状态、激活失败、显式 / 按需创建、回收都与邮箱无关，只做一份：Shard 的本地表用它，再叠加每实例邮箱、轮转、tick；主循环模块直接用它。`ActorSystem` 还没有代码，现在这样设计没有迁移成本。**不要在 `EntityManager` 里另写一套。**
+- **警戒线**：`EntityManager` 不加每实体邮箱、公平轮转这类 actor 才有的东西；真需要，就把这类对象做成 actor kind 放在 S0（一个 Shard 跑在主循环线程上）。
+- **选哪个**：需要激活、但不需要实体之间同步直接访问：actor kind（S0）；需要同步直接访问（比如场景里遍历玩家）：`EntityManager`。这个交集有多常见，没法判断。
+- **按需激活与唯一性**：两个节点同时对同一个 id 按需激活会双重激活。默认只做显式 `Activate`（同 §6）；按需激活只给"仅本进程"的对象类型，或等 §19 第 36 项定了唯一性保证再放开。
+- **分阶段**：第一版只做 `Adopt` / `Remove` / `Find` / `ForEach` / `Resolver` 与登记联动；`Activate` / `Deactivate` / 激活窗口暂存是同一组件的第二个入口，等有真实需求（主循环里的实体要按需异步加载），或实现 `ActorSystem` 的生命周期层时一起做。
+- **线程**：只能在主循环线程使用，Debug 断言（仓库对队列的线程角色同样断言）。
 
 ### 不做
 
@@ -822,8 +1033,6 @@ S1 的线程循环怎么写有两个选择（复用 `EventLoop` 的唤醒与定�
 | `EventLoop` | **不直接用**，S2 时评估能否抽取它的唤醒和定时器部分 | 它是网络内部类型，带 epoll 和连接表；Shard 不需要这些 |
 | `MpscQueue` / `SpscQueue` / `SharedBuffer` / `TimerWheel` / `Now` / `MurmurHash64A` | **沿用** | 契约都满足（每个生产者内部有序、定时器单线程使用、`Now` 是原子量、哈希结果稳定）。`TryDequeueBulk` 里的峰值采样问题已修（见 §9「入口层与直接投递（实测）」），`PeakApprox` 现在是近似下界 |
 | 信封与 Agent 路由（`dst`、`route_key`、`msg_id`、`remaining_ms`、`Direct` 路由） | **沿用，`seq` 改成 `Correlation`**（提议，§8） | 其余够用。还没上线，信封直接改、不考虑兼容；如果选了"信封加显式 kind 字段"也直接改 |
-| `Actor模型与RPC设计.md` | **不继承** | 实验性，偏 Go |
-
 ## 16. 未覆盖的需求（**提议**：明确列出，不在两种执行方式里解决）
 
 执行模型这一层，两种加 actor 池和 `Offload` 是够的，这个判断依据是读过的几个框架里"无状态并行"都是普通 actor 加选择器（§3），不是对真实负载的统计。Orleans 还有进程级的 `SystemTarget`，我只确认了名字和 `IsSystemTarget()` 的处理。**"覆盖了多少"给不出百分比。** 下面是两种之外的需求：
@@ -879,6 +1088,31 @@ S1 的线程循环怎么写有两个选择（复用 `EventLoop` 的唤醒与定�
 
 **借鉴的**：`Submit` 不得内联执行的契约（来自 `EventEngine::Run`）、新执行模型的实现清单（来自 `EventEngine` 的 README，§4）、库产生的码和应用的码分清（`doc/statuscodes.md`，我们用数值分区）。**不借鉴的**：三套风格并存且规则各不相同（它自己在 `SetServerApiType` 里要为"把方法覆盖成另一种类型"打日志，说明这是个坑）。**可能要补的**：拦截器（中间件）钩子，追踪、指标、鉴权会用到（§19）；取消传播，收益对游戏服不大，先不做。
 
+### 请求体在哪一步解码、解码失败怎么办（对照别家，**已定**）
+
+2026-11-05 读了各项目 GitHub 上 master / main 分支的源码（只看这一个问题，没通读，没测性能）。表里"没查到"的格子是这次抓取的文件里没有，不是不存在：
+
+| 框架 | 在哪一步解码 | 解码失败 |
+|---|---|---|
+| gRPC Go（`rpc_util.go` 的 `recv`、`server.go` 的 `wrapUnaryHandler`） | 处理这条 RPC 的流程里，由生成的 handler 调 `RecvMsg` 时触发 | 回 `codes.Internal`，"failed to unmarshal the received message" |
+| gRPC C++（`method_handler.h`） | 框架驱动的 `Deserialize` 回调，不在 `RunHandler` 里；跑在哪个线程头文件里没有 | 状态非 OK 就不调业务，经 `ServerSendStatus` 回给调用方；具体状态码没查到 |
+| brpc（`baidu_rpc_protocol.cpp` 的 `ProcessRpcRequest`） | 同一个函数里同步解析，解析完才调业务方法（业务方法可以再转线程池） | `SetFailed(EREQUEST, "Fail to parse request=…")`，回错误应答 |
+| Akka Artery（`Codecs.scala`） | 远程流里单独的 `Deserializer` 阶段，**在投递到 actor 邮箱之前** | 记 error 日志、丢弃；不进 dead letters，不隔离连接；不通知发送方 |
+| protoactor-go（`endpoint_reader.go`） | 收包的 goroutine，**在 `Root.Send` 之前** | 记日志后 `return err`，**整条接收流被终止**；不通知发送方 |
+| skynet（`skynet.lua`） | 目标服务自己的线程上、恢复处理协程之前（`p.unpack`） | `unpack` 本身抛错时，"给调用方回 `PTYPE_ERROR`"那段不会执行（只有处理函数抛错才回），没有错误应答 |
+
+**能看出的**：
+- **两派。** actor 框架（Akka、protoactor）在入口解码，邮箱里是类型化对象，失败时它们丢弃或断流、不通知发送方（这是它们的选择，不是入口解码必然如此：我们的信封带请求类型，入口也可以直接回错误）；RPC 框架（gRPC、brpc）解码失败回错误应答，gRPC Go 用 `Internal`，brpc 用专门的 `EREQUEST`。
+- **做 RPC 的没有静默丢请求的。** skynet 是反例，调用方拿不到错误。
+- **protoactor 的"断整条流"代价最大**：一条坏消息连累同一连接上所有消息。
+
+**已定**（用户 2026-11-05 选定执行时解码，按下面四条）：
+1. **解码放在 thunk 里、处理函数执行时**（执行器线程，不在 IO 线程）。理由：IO 线程只做定长解析（§4）；邮箱里存字节，和 §10 的"本地消息统一用字节"一致；邮箱满、实例不存在、已过期这些拒绝都发生在解码之前，过载时不白花 CPU（Akka、protoactor 的入口解码做不到这点，坏消息和好消息一样先花解码的代价）。代价：坏消息先占一个邮箱额度；解码耗时算进该实例的回合，大消息会拖慢同 Shard 的别的实例，所以载荷大小要在入口限制。
+   **入口解码的好处（反方）**：解码的 CPU 落在多个 IO 线程上，不占串行的 Shard 线程（S0 时就是主循环）；解不开的坏消息不进邮箱；入口可以直接回错误。它的代价：邮箱要存类型化对象（每种消息一个类型的队列，或 `unique_ptr<Message>` 加堆分配与虚析构），和 §10 的"本地消息统一用字节"冲突；被邮箱拒绝的消息也先花了解码；同进程调用没有 IO 线程，"入口"变成发起方线程。**哪边更划算没测过**，要等有真实消息和负载再比。
+2. **终态**：请求回框架错误码"解码失败"（1..999 段，码值见 §19 第 12 项），单向消息计数加限频日志；日志只记 `msg_id`、来源、长度，不记载荷（不可信输入）；计数按 `msg_id` 分，不按实例。回错误由 thunk 直接发，处理函数没被调用。
+3. **不做"断整条连接"。** 是否对"同一来源连续解码失败"踢连接，留给网关：`CLIENT` 来源本来就不可信；`INTERNAL` 来源的解码失败是 bug，应当报警。
+4. proto3 没有 `required`，解码失败只来自线格式损坏；字段取值是否合法是业务校验，不算框架的解码失败。
+
 ## 18. 验证计划与落地路线
 
 | 阶段 | 内容 | 要证伪 / 验证什么 |
@@ -912,17 +1146,27 @@ S1 的线程循环怎么写有两个选择（复用 `EventLoop` 的唤醒与定�
 21. **回调契约**（§8）：至多一次、发起实例回收后不调、`Cancel` 之后不调，是否都接受。
 22. **编排辅助的语义**（§8）：`Join` 要不要快速失败；聚合层是否自带 deadline；多个错误怎么汇总。
 23. **启动就绪等待的形状**（§15）：等待期间泵主循环；超时默认值；失败是否中止启动；与第 1 项同属 App 层，要不要一起暂缓。
-24. **接口定义与生成器**（§8）：方向已定（一份生成加运行期登记器，命名规则 `_Req` / `_Rsp` / `_Send`），生成器何时做、生成什么（强类型存根、注册函数、网关白名单）、`thunk` 的 `impl` 参数的具体形状待定。
+24. **接口定义与生成器**（§8）：方向已定（一份生成加运行期登记器；gRPC schema 写法，`rpc` 签名决定 `Call` / `Send`，`Empty` 是单向，`stream` 报错）。待定：生成器何时做、生成什么（强类型存根、注册函数、网关白名单）；`thunk` 的 `impl` 参数的具体形状；命名后缀是否留作 lint。**已定**：单向方法只生成 `Send`、处理函数没有 `ReplyHandle`；处理函数执行时解码，请求回"解码失败"，单向计数加限频日志，不断连接（§17 对照了 gRPC、brpc、Akka、protoactor、skynet；§7 终态表已加一行）。
 25. **`Target` 的具体写法**（§8）：草图不是定稿。
 26. **`Status` 的形状**（§8，提议）：只有码、没有消息串是否够用（细节放 `body`）；`MapUpstream` 对业务错误是否一律透传；`deadline_reserve` 的默认值（要实测）。
 27. **入口车道的细节**（§7、§9）：每条车道的默认上限和配置位置；Shard 线程轮转各车道时每轮每条取多少（公平策略）；kind 很多时车道数（分片数 × kind 数）的开销。直接投递的重新评估要等有实测瓶颈（§9 记了对比数据）。
 28. **拦截器（中间件）钩子**（§17）：追踪、指标、鉴权要不要在 `Dispatcher` 层加。GameserverNew 的 `core/dispatcher` 有 `Middleware`，gRPC 有 interceptors，我们现在没有。
 29. **"会话到网关"的映射与推送路由**（§8）：`Target::Client(role)` 怎么找到持有该会话的网关。
-30. **`msg_id` 的细节**（§8）：冲突检查的范围（所有 proto 一起）；是否提交一份生成的 id 清单文件，让改名导致的 id 变化在评审里可见；`ResolveMethod(name)` 何时做。
+30. **`msg_id` 的细节**（§8）：第一版手写，冲突检查范围是所有 proto 一起（已定）；手写要不要按服务划号段、避免多人改同一区间冲突；是否提交一份生成的 id 清单文件，让改名或改号在评审里可见；何时加"没写就取哈希"的自动分配；`ResolveMethod(name)` 何时做。
 31. **`HandlerContext` 与 `audience` 的细节**（§8）：`RequestInfo` 里放什么；`CLIENT` service 的处理函数是否都带 `client_role`；`CLIENT_PUSH` 的发送端存根形状。
 32. **主循环 RPC 超时的精度**（§4）：沿用 tick 粒度（约 33 ms），还是改成 `wait_until(min(下次 tick, 时间轮最近到期))`。
 33. **峰值采样间隔**（§9）：`kPeakSampleEvery` 现为 1024；积压有界（每车道 ≤ 4096）时间隔 64 也与不采样持平，只有无界积压才慢（见 §9 的隔离实验），不必再放大；要不要让间隔随上次采到的深度变大；`queue_peak` 是下界是否够用。
+34. **网关路由表**（§8，用户：后续在 gatesvr 做）：`cmd_id` → 后端服务类型 → `Locator` → 节点；表由 proto 里的服务类型生成还是单独配置；与第 29 项（会话到网关的映射）互为反向，一起设计。
+35. **消息的编解码运行时**（§8）：**已定**用 libprotobuf（用户选定）。要做：给 C++ 的 `vcpkg.json` 加 protobuf（现在没有；Go 侧 `go.mod` 已有 `google.golang.org/protobuf`）；生成器除了 RPC 存根，还要调 `protoc --cpp_out` 生成消息类。待查：本机 `protoc` 是 3.21.12，要和 vcpkg 里的 libprotobuf 对上版本（生成代码会校验版本，不一致编译就报错，**没在本仓库试过**）；`ParseFromArray` 可以直接读 `SharedBuffer` 的连续内存，但 `string` / `bytes` 字段默认会拷进消息对象，这点**没测过**，是否要紧要等有真实消息。
+36. **注册中心与唯一性保证**（§14）：实现用 etcd，还是规划里的 `onlinesvr` 这类服务；保证做到哪一级——只做"谁创建、在哪"的查找表（创建方显式保证唯一，不违背第 9 条）/ create-if-absent 加租约 / Orleans 式强一致（第 9 条说不做）。玩家被两个进程同时持有会写坏数据，所以要选；进程宕机的清理靠租约。写入量（登录登出风暴）与可用性（宕机时已缓存的可用、新查询失败）都**没测过**。仓库里 etcd 只有配置 schema，没有客户端代码。
+37. **缓存失效与重发的规则**（§14）：最多重发几次、重发是否沿用原 `Correlation`、与 `kUnavailable` 的关系、缓存的过期与容量。
+38. **定位策略与热路径**（§14）：按对象类型声明"仅本进程 / 走注册中心"，写在 IDL 还是登记时；缓存的并发读结构与每次 `Call` 的开销（**没测过**）；进程内把对象类型名 intern 成小整数。
+39. **主循环模型的解析器与回调安全**（§14，提议）：解析器的形状（返回接口指针、业务类实现生成的接口，还是业务模块自己实现接口）；回调前再解析、代次由谁提供；统一的 `kNoSuchObject` 是否强制所有处理函数使用（缓存失效依赖它）。
+40. **`Register` 的细节**（§14）：异步加 RAII 句柄是否接受；`ActorSystem` 在 `Activating` 还是 `Active` 登记；重复登记同一 id 的结果（取决于第 36 项）；对象类型名改名的兼容（灰度期间新旧版本互相找不到对方的对象，和 `msg_id` 同理）。
+41. **没有对象 id 的本地服务寻址**（§14）：显式 `Target::Local()`、`Locator` 扩展到 Service 目标、service 级"仅本进程"标记，三选一；接收侧按对象类型 / 服务检查能否被远端访问。另有：主循环模块在非处理函数（`Tick`、定时器）里发调用时 `ctx` 从哪来；应答体解码失败的终态（§7 只定了请求体）。
+42. **`EntityManager` 的细节**（§14）：与 `ActorSystem` 共用生命周期层的拆分何时做（提议 `ActorSystem` 实现时一起）；`Activate` 是否进第一版（提议第一版只做 `Adopt` / `Remove` / `Find` / `ForEach` / `Resolver`）；钩子还是继承（倾向钩子）；遍历期间 `Remove` 的延迟摘除；激活窗口暂存的上限与超限处理；`idle_timeout` 是否第一版就有；按需激活只给"仅本进程"的对象类型，要等第 36 项；`Adopt` / `Activate` 的完成回调是否都在登记完成后调。
+43. **actor 的业务管理层**（§6、§14）：`ActorSystem` 不提供枚举，业务层要自己维护"有哪些实例"的视图，所以需要 `ActorSystem` 的生命周期事件通知（激活完成、回收、`Fail`，带 kind 和 key，类似 Akka 的 `watchWith` 带上 id，否则管理者的表无法清理）；这一层放在主循环业务模块里，还是独立的服务进程（规划里的 `onlinesvr` / `matchsvr`）；集群级的"全局唯一管理者"要等第 36 项定了唯一性保证，在那之前用部署上的单实例进程，不用运行时级的单例 actor；`Activate` 的签名与调用方（§6 末尾已列）。
 
 ## 附：不做的事
 
-在线迁移、自动重平衡、全集群唯一激活的分布式目录、监督树与父子关系、工作窃取、无界邮箱、自动重试（重试是调用方的策略，不是机制）。
+在线迁移、自动重平衡、全集群唯一激活的分布式目录、监督树与父子关系、工作窃取、无界邮箱、自动重试（重试是调用方的策略，不是机制；"对象不存在"后按新位置重发一次属于定位，不算重试，§14）。

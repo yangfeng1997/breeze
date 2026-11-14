@@ -11,7 +11,7 @@
   `Field(...)` / `EnumTraits`），本身不含解析逻辑；合并、严格解析、行号错误、`${ENV:}` 展开、拼写检查都在运行时库里。
 - 配置按**键名**（proto 字段名）读取，字段编号只为满足 proto 语法，改动无影响。
 - 只用 proto 的 **schema 能力**，不用它的序列化：配置不是 protobuf 二进制，也不生成 `*.pb.*`。
-  与 `docs/Actor模型与RPC设计.md` 里的 RPC proto 互不相干，option 编号段不重叠（见 `options.proto` 头注释）。
+  与将来的 RPC IDL（`docs/Actor与线程模型设计.md` §8，生成器还没做）互不相干，option 编号段不重叠（见 `options.proto` 头注释）。
 
 ## 依赖：protoc
 
