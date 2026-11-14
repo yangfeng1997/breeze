@@ -14,7 +14,12 @@
       "name": "debug",
       "inherits": "base",
       "binaryDir": "${sourceDir}/../../build/cpp",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "VCPKG_INSTALLED_DIR": "$env{HOME}/.cache/breeze/vcpkg_installed_apicheck",
+        "VCPKG_MANIFEST_FEATURES": "lua-apicheck",
+        "BREEZE_FASTLUA_APICHECK": "ON"
+      }
     },
     {
       "name": "release",

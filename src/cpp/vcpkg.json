@@ -6,8 +6,22 @@
     "cli11",
     "concurrentqueue",
     "kcp",
+    "lua",
     "readerwriterqueue",
     "spdlog",
     "yaml-cpp"
-  ]
+  ],
+  "features": {
+    "lua-apicheck": {
+      "description": "Build Lua with LUA_USE_APICHECK + LUAI_ASSERT for fastlua tests",
+      "dependencies": [
+        {
+          "name": "lua",
+          "features": [
+            "apicheck"
+          ]
+        }
+      ]
+    }
+  }
 }
