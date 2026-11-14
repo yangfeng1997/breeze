@@ -3,6 +3,7 @@
 // 值类型：
 //   TableView / FunctionView  栈上的视图，只在当前 C 函数内有效，不占 registry。
 //   Ref / Table / Function     registry 引用，绑定主线程；lua_close 之后析构是空操作。
+//                              不可拷贝；需要第二份独立引用时用 Clone()（新建 registry 槽，owner 线程）。
 //
 // Control 是引用计数块：StateData 的 __gc 在 lua_close 时把 state 置空，
 // 所以 lua_close 之后再析构 Ref 不会碰已经释放的 lua_State。
@@ -129,6 +130,11 @@ public:
 
     bool Valid() const noexcept { return control_ != nullptr && State() != nullptr; }
 
+    // 显式复制：为同一个 Lua 值新建一个 registry 槽，两个 Ref 的生命周期互相独立。
+    // 必须在 owner 线程调用（和 Push 一样要访问 VM）；空引用返回空，state 已关闭是用法错误。
+    // 不要用 Clone 做热路径缓存：只读场景用 const Ref& / TableView / FunctionView。
+    Ref Clone() const { return CloneAs<Ref>(); }
+
     int Push() const {
         lua_State* L = State();
         FASTLUA_CHECK(L != nullptr, "fastlua: Ref used after its LuaState was closed");
@@ -150,6 +156,22 @@ public:
 protected:
     lua_State* State() const noexcept {
         return control_ != nullptr ? control_->state.load(std::memory_order_acquire) : nullptr;
+    }
+
+    template <class Self>
+    Self CloneAs() const {
+        if (control_ == nullptr) {
+            return Self{};
+        }
+        lua_State* L = State();
+        FASTLUA_CHECK(L != nullptr, "fastlua: Ref::Clone after its LuaState was closed");
+        if (ref_ == LUA_NOREF || ref_ == LUA_REFNIL) {
+            return Self{};
+        }
+        Push();
+        Self out = Self::FromStack(L, -1);
+        lua_pop(L, 1);
+        return out;
     }
 
     void Reset() noexcept {
@@ -178,6 +200,9 @@ protected:
 class Table : public Ref {
 public:
     Table() noexcept = default;
+
+    // 独立引用：与基类 Clone 一样新建 registry 槽，只在 owner 线程调用。
+    Table Clone() const { return this->template CloneAs<Table>(); }
 
     static Table FromStack(lua_State* L, int index) {
         FASTLUA_CHECK(lua_istable(L, index), "fastlua: Table::FromStack expects a table");
@@ -252,6 +277,9 @@ public:
 class Function : public Ref {
 public:
     Function() noexcept = default;
+
+    // 独立引用：与基类 Clone 一样新建 registry 槽，只在 owner 线程调用。
+    Function Clone() const { return this->template CloneAs<Function>(); }
 
     static Function FromStack(lua_State* L, int index) {
         FASTLUA_CHECK(lua_isfunction(L, index), "fastlua: Function::FromStack expects a function");

@@ -130,6 +130,23 @@ int main() {
     CHECK(plus_one.Ok());
     CHECK(plus_one.Value() == 42);
 
+    // 显式 Clone：新建独立 registry 槽，原引用析构后 clone 仍然有效。
+    Function double_copy = double_fn.Clone();
+    CHECK(double_copy.Valid());
+    CHECK(double_copy.Call<int>(5).Value() == 10);
+    double_fn = Function{};
+    CHECK(double_copy.Call<int>(6).Value() == 12);
+
+    Table bench_copy = bench.Clone();
+    bench_copy.Set("from_clone", 9);
+    auto from_clone = bench.Get<int>("from_clone");
+    CHECK(from_clone.Ok());
+    CHECK(from_clone.Value() == 9);
+
+    // 空引用 Clone 返回空，不碰 VM。
+    CHECK(!Table{}.Clone().Valid());
+    CHECK(!Function{}.Clone().Valid());
+
     // lua_close 之后仍存活的 Ref 析构必须安全（StateData 的 __gc 已经把 state 置空）。
     Function outlives;
     {

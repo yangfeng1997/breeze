@@ -61,7 +61,7 @@ sol2 / LuaBridge3：前者上游不支持 5.5（`compat-5.3.h` 的 `#error`、`L
   - 所有权：`Policy::kOwned`（默认，`__gc` delete）、`Policy::kBorrowed`（C++ 管，`__gc` 不做事）；`ObjHeader::flags` 决定是否 delete。
   - `AllowFields` 把未知字段存到 uservalue 表（`lua_newuserdatauv` 的 uservalue 数在创建时按类决定）；`DotCall` 只对显式开启的类在方法访问时包装一个闭包，供 quanta 点号脚本迁移。
   - 构造函数：`Ctor<Args...>` 设置类表的 `__call`；参数从索引 2 开始，`new T(args...)`，失败转 `ErrorSlot`。
-- **引用（`ref.h`）**：`Ref` / `Table` / `Function` 是 registry 引用，move-only；`Control` 引用计数块，`StateData` 的 `__gc` 在 `lua_close` 时把 `state` 置空，所以 `lua_close` 之后析构 `Ref` 是空操作。**线程规则见下，库不实现跨线程引用释放队列。**
+- **引用（`ref.h`）**：`Ref` / `Table` / `Function` 是 registry 引用，move-only，需要第二份独立引用时用显式 `Clone()`；`Control` 引用计数块，`StateData` 的 `__gc` 在 `lua_close` 时把 `state` 置空，所以 `lua_close` 之后析构 `Ref` 是空操作。**线程规则见下，库不实现跨线程引用释放队列。**
 - **线程规则（必须遵守）**：
   - 一个 `LuaState` 只属于一个线程；`Ref` / `Table` / `Function` 必须在该线程创建、使用、析构。
   - 异步 worker / IO / DB 线程只传 ID、令牌或序列化数据，不传 `Ref`；需要 Lua 回调时把 ID 投回属主线程，再查表取 `Ref`。
@@ -123,7 +123,7 @@ sol2 / LuaBridge3：前者上游不支持 5.5（`compat-5.3.h` 的 `#error`、`L
 **已定的 API 策略（保持，不是遗漏）**
 
 - `Result::Value()` 失败 abort；核心不依赖 C++ 异常，可在 `-fno-exceptions` 下编译。
-- `Ref` / `Table` / `Function` move-only，**v1 不提供拷贝**：拷贝必须 `lua_pushvalue` + `luaL_ref` 新槽，只能在 owner 线程做；一旦类型可拷贝，`std::function` / 容器在 worker 线程的隐式复制会无声破坏线程规则。需要独立引用时显式 `Push()` 后 `FromStack`；短期使用优先 `TableView` / `FunctionView` / `CallGlobal`。
+- `Ref` / `Table` / `Function` move-only，**不提供隐式拷贝，需要时用显式 `Clone()`**：拷贝必须 `lua_pushvalue` + `luaL_ref` 新槽，只能在 owner 线程做；一旦类型可拷贝，`std::function` / 容器在 worker 线程的隐式复制会无声破坏线程规则。`Clone()` 的语义见下。
 - 点号 / 冒号按类显式选择，不做自动识别（启发式有歧义）。
 
 这三项在其它绑定库里的对应情况（避免把“我们的选择”误说成“行业的做法”）：
@@ -131,14 +131,32 @@ sol2 / LuaBridge3：前者上游不支持 5.5（`compat-5.3.h` 的 `#error`、`L
 | 项 | sol2 | LuaBridge3 | luakit | fastlua |
 |---|---|---|---|---|
 | 不抛异常、返回错误 | 没有 `Result<T>`；提供 `SOL_NO_EXCEPTIONS`，错误走 abort / panic | 有 `Result` / `TypeResult`（`std::error_code`）；`value()` 不检查，`throw_on_error()` 仅在启用异常时抛 | 没有，返回 `bool` 或 `luaL_error` | `Result<T>`；`Value()` 失败 abort；核心可在 `-fno-exceptions` 下编译 |
-| `Ref` 可拷贝 | 可拷贝（复制出新的 registry 槽） | 可拷贝 | 可拷贝（复制出新的 registry 槽） | **move-only，刻意偏离** |
+| `Ref` 可拷贝 | 可拷贝（复制出新的 registry 槽） | 可拷贝 | 可拷贝（复制出新的 registry 槽） | **不允许隐式拷贝；显式 `Clone()` 新建独立槽** |
 | 二进制 codec | 无（`sol::bytecode` 只是加载 Lua chunk，不是对象编解码） | 无 | 有 `lua_codec.h` / `lua_buff.h` / `lua_slice.h` | 无，独立包 |
 
 结论：**无异常构建是行业常见需求**，sol2 / LuaBridge3 都支持；`Result` 也不是我们独有（LuaBridge3 有，只是 `value()` 不检查）。**`Ref` move-only 是 fastlua 自己的 API 选择，不是行业惯例**——主流三家都可拷贝。**二进制 codec 与 sol2 / LuaBridge3 一致（不做），与 luakit 不同**（luakit 绑定和序列化是一体的）。
 
-**关于 `Ref` 是否要支持拷贝**：v1 明确**不加隐式拷贝**。核心理由不是“别的库不做”（它们都做），而是拷贝要访问 VM、只能在 owner 线程执行；一旦可拷贝，`std::function`、容器在 worker 线程的隐式复制会绕过线程检查。现在已有显式替代：`Push()` 后 `FromStack` 即可得到独立引用。若后续出现明确需求（例如必须放进 `std::function`），优先加**显式** `Clone()`（仍要求 owner 线程），而不是恢复拷贝构造/拷贝赋值。
+**需要拷贝时的设计：显式 `Clone()`，独立 registry 槽**
 
-单线程工程里也基本用不到拷贝：常见的回调落地方式是“按名字调用”（`CallGlobal` / luakit 的 `object_call`）、“按 ID 分发”（定时器、网络回调在 Lua 表里查），或每个 C++ 对象只存一份（移动进去）。luakit 虽然可拷贝，但 quanta 的 C++ 扩展并没有把 `reference` 存成成员，也印证了这一点。真需要两份独立引用时，`Push()` + `FromStack` 成本只有一次 `luaL_ref`，足以覆盖。
+- **语义**：`Clone()` 对同一个 Lua 值执行 `lua_pushvalue` + `luaL_ref`，得到新的 registry 引用。两个句柄各自 unref、生命周期独立；底层 Lua 对象仍是同一个（改表字段两边都可见）。这和 sol2 / LuaBridge3 / luakit 的拷贝语义一致，也不引入共享槽的引用计数。
+- **API**：`Ref::Clone()`、`Table::Clone()`、`Function::Clone()` 返回同类型；没有拷贝构造/拷贝赋值。不用 `explicit` 拷贝构造是因为拷贝赋值无法 explicit，且容器 / `std::function` 仍会隐式复制，线程规则会被绕过。
+- **规则**：
+  - 只能在 owner 线程调用（访问 VM，和 `Push` 一样）；
+  - 空引用返回空引用；state 已关闭是用法错误（`FASTLUA_CHECK`）；
+  - 每次 `Clone()` 占一个 registry 槽，热路径不要用；循环里只在循环外 clone 一次。
+- **典型用法**：
+
+```cpp
+Function cb = lua.GetFunction("on_tick").Value();
+Function saved = cb.Clone();                       // 独立生命周期
+auto shared = std::make_shared<Function>(cb.Clone());
+std::function<void(int)> f = [shared](int x) { shared->Call<void>(x); };
+```
+
+- **什么时候不该 Clone**：函数参数用 `const Ref&`；同线程短期访问用 `TableView` / `FunctionView`；跨线程 / 异步只传 ID；同一对象只存一份，其他持有者用指针或引用。
+- **为什么不做共享槽**：共享槽需要每个槽的引用计数（额外堆块或原子操作），析构仍必须在 owner 线程；收益只是省一次 `luaL_ref`，不值得。
+
+单线程工程里也基本用不到拷贝：常见的回调落地方式是“按名字调用”（`CallGlobal` / luakit 的 `object_call`）、“按 ID 分发”（定时器、网络回调在 Lua 表里查），或每个 C++ 对象只存一份（移动进去）。luakit 虽然可拷贝，但 quanta 的 C++ 扩展并没有把 `reference` 存成成员，也印证了这一点。真需要两份独立引用时，一次 `Clone()` 即可覆盖。
 
 ### 没做的
 
@@ -194,7 +212,7 @@ Linux Release（clang 23）实测：noop 缓存 18.6（`CallFast` 14.5）、add 
 ## 未决项
 
 - `LUA_USE_APICHECK` overlay 端口的 feature 机制在其它 vcpkg 版本上是否稳定（当前用 2026.09.26 vcpkg + 5.5.1 port）。
-- `Ref` 是否要支持拷贝（现在 move-only；luakit 的脚本习惯不需要）。
+- `Ref` 拷贝已定：不做隐式拷贝，提供显式 `Clone()`（独立 registry 槽、owner 线程）。
 - 无：跨线程 `Ref` 析构已定为“记录并泄漏 + 文档约束”，不做队列。
 - `TableView` 批量读取 API（当前逐字段 55ns，可进一步合并成一次 C 调用）。
 - 是否提供 C++26 `std::expected` 互转（现在只有 `Result`）。
