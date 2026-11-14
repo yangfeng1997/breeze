@@ -147,6 +147,21 @@ int main() {
     CHECK(!Table{}.Clone().Valid());
     CHECK(!Function{}.Clone().Valid());
 
+    // 返回值类型不匹配必须是 kType，不能静默变成 0 / false / 空串。
+    Function double_again = lua.GetFunction("double").Value();
+    auto wrong_bool = double_again.Call<bool>(1);
+    CHECK(!wrong_bool.Ok());
+    CHECK(wrong_bool.GetError().code == ErrorCode::kType);
+    auto fast_wrong = double_again.CallFast<bool>(1);
+    CHECK(!fast_wrong.Ok());
+    CHECK(fast_wrong.GetError().code == ErrorCode::kType);
+    auto wrong_global = lua.Call<bool>("double", 1);
+    CHECK(!wrong_global.Ok());
+    CHECK(wrong_global.GetError().code == ErrorCode::kType);
+    auto missing_tuple = lua.Call<std::tuple<int, int>>("double", 1);
+    CHECK(!missing_tuple.Ok());
+    CHECK(missing_tuple.GetError().code == ErrorCode::kType);
+
     // lua_close 之后仍存活的 Ref 析构必须安全（StateData 的 __gc 已经把 state 置空）。
     Function outlives;
     {

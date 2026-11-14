@@ -53,6 +53,9 @@ sol2 / LuaBridge3：前者上游不支持 5.5（`compat-5.3.h` 的 `#error`、`L
 - **`Stack<T>`**：一个 customization point。内置整数（范围/可表示性检查）、浮点、bool、enum、`std::string`、`std::string_view`、`const char*`、`optional`、`vector`、`map`、`tuple`/`pair`（仅返回值多值）、对象指针/引用、`TableView` 栈视图。
 - **两段式 trampoline**（`trampoline.h`）：`Invoke` 里检查参数、构造临时对象、调用用户函数、压返回值；它 normal return 之后，`Trampoline`（只有 `ErrorSlot` 等平凡局部变量）再调用 `RaiseError` → `luaL_typeerror` / `luaL_error`。这样就算 Lua 按 C 编译、`lua_error` 是 longjmp，也不会跳过任何析构。
 - **`Result<T>`**：`Ok()` / `Value()` / `ValueOr()` / `GetError()` / `NotFound()`；错误码含 kNotFound / kRuntime / kSyntax / kMemory / kType / kStack / kBudget / kCancelled / kTimeout 等。缺函数是 `kNotFound`，不是异常。
+  - `Value()` 是“已经 `Ok()` 之后”的访问器；在错误上调用属于编程错误，经 `FASTLUA_CHECK`（可接 fatal handler）记录后 abort。需要恢复就用 `Ok()` / `ValueOr()` / `GetError()`。
+  - C++→Lua 的**返回值**也走 `Stack<T>::Check`：类型不匹配返回 `kType`，不会静默变成 0 / false / 空串。
+  - “不抛异常”不等于所有 Lua 错误都可恢复：`lua_pushlstring`、`luaL_ref`、表插入等可能分配的操作在 OOM 时会 `longjmp` 到 `lua_atpanic`（fastlua 的 handler 记录后 abort），这类内存错误按致命处理，不承诺跨 C++ 栈恢复。
 - **调用**：`CallGlobal`（按名字，晚绑定，热更友好）、`CallPushed`（函数已在栈上）、`Function::Call`（缓存引用，带 traceback）与 `Function::CallFast`（不挂 traceback）。每次调用一次 `lua_checkstack`，`lua_pcall` 后 `lua_settop` 恢复。
 - **类（`class.h` / `class.cpp`）**：
   - userdata 布局 `[ObjHeader][外部对象指针]`；`ObjHeader` 带 cookie、ClassInfo、对象指针、所有权标志。
