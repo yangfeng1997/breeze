@@ -138,7 +138,7 @@ public:
     int Push() const {
         lua_State* L = State();
         FASTLUA_CHECK(L != nullptr, "fastlua: Ref used after its LuaState was closed");
-        lua_rawgeti(L, LUA_REGISTRYINDEX, ref_);
+        PushTo(L);
         return lua_gettop(L);
     }
 
@@ -157,6 +157,9 @@ protected:
     lua_State* State() const noexcept {
         return control_ != nullptr ? control_->state.load(std::memory_order_acquire) : nullptr;
     }
+
+    // 调用方已经拿到 L 时用它，避免重复的原子 load 与 CHECK。
+    void PushTo(lua_State* L) const noexcept { lua_rawgeti(L, LUA_REGISTRYINDEX, ref_); }
 
     template <class Self>
     Self CloneAs() const {
@@ -294,8 +297,7 @@ public:
         if (L == nullptr) {
             return Error{ErrorCode::kRuntime, "fastlua: Function used after its LuaState was closed"};
         }
-        Push();
-        return CallPushed<R>(L, lua_gettop(L), std::forward<Args>(args)...);
+        return CallRef<R>(L, ref_, std::forward<Args>(args)...);
     }
 
     // 热路径：不挂 traceback。错误仍然由 pcall 捕获并返回 Result。
@@ -305,8 +307,16 @@ public:
         if (L == nullptr) {
             return Error{ErrorCode::kRuntime, "fastlua: Function used after its LuaState was closed"};
         }
-        Push();
-        return CallPushedFast<R>(L, lua_gettop(L), std::forward<Args>(args)...);
+        return CallRefFast<R>(L, ref_, std::forward<Args>(args)...);
+    }
+
+    // 逃生门：lua_call，不捕获错误。只有确认 Lua 函数不会报错时才用；
+    // 报错会 longjmp，跳过当前 C++ 栈上的析构。返回值类型不匹配直接 Fatal。
+    template <class R, class... Args>
+    R CallUnprotected(Args&&... args) const {
+        lua_State* L = State();
+        FASTLUA_CHECK(L != nullptr, "fastlua: Function used after its LuaState was closed");
+        return CallRefUnprotected<R>(L, ref_, std::forward<Args>(args)...);
     }
 };
 

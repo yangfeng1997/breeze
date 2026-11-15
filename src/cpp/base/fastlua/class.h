@@ -175,6 +175,7 @@ concept HasLowerCloseMethod = requires(T& value) { value.close(); };
 
 template <class T>
 bool BuildToString(lua_State* L, ErrorSlot& err) {
+    (void)err;  // -fno-exceptions 时没有 catch 分支
 #if defined(__cpp_exceptions)
     try {
 #endif
@@ -206,6 +207,7 @@ bool BuildToString(lua_State* L, ErrorSlot& err) {
 
 template <class T>
 bool BuildEquality(lua_State* L, ErrorSlot& err) {
+    (void)err;  // -fno-exceptions 时没有 catch 分支
 #if defined(__cpp_exceptions)
     try {
 #endif

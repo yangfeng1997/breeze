@@ -186,6 +186,12 @@ int main() {
     CHECK(!missing_tuple.Ok());
     CHECK(missing_tuple.GetError().code == ErrorCode::kType);
 
+    // 无保护的逃生门：函数确定不报错时用；参数/返回值仍然经过 Stack 转换。
+    CHECK(double_again.CallUnprotected<int>(9) == 18);
+    CHECK(lua.CallUnprotected<int>("double", 10) == 20);
+    CHECK(lua.RunScript("function noop() end").Ok());
+    lua.CallUnprotected<void>("noop");
+
     // lua_close 之后仍存活的 Ref 析构必须安全（StateData 的 __gc 已经把 state 置空）。
     Function outlives;
     {

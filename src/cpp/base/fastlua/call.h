@@ -70,6 +70,35 @@ inline std::optional<Error> CheckTupleReturns(lua_State* L, int first, std::inde
     return std::nullopt;
 }
 
+// 不保护调用后的读返回值：类型不匹配是致命错误（Fatal），没有 Result 可返回。
+template <class R>
+R ReadResultsUnprotected(lua_State* L, int first_result, int restore) {
+    using D = std::remove_cvref_t<R>;
+    if constexpr (std::is_void_v<D>) {
+        lua_settop(L, restore);
+        return;
+    } else if constexpr (is_tuple_like_v<D>) {
+        if (auto error = CheckTupleReturns<D>(L, first_result, std::make_index_sequence<std::tuple_size_v<D>>{})) {
+            const std::string message = std::move(error->message);
+            lua_settop(L, restore);
+            Fatal(message);
+        }
+        D value = ReadTuple<D>(L, first_result, std::make_index_sequence<std::tuple_size_v<D>>{});
+        lua_settop(L, restore);
+        return value;
+    } else {
+        if (!Stack<D>::Check(L, first_result)) {
+            const Error error = ReturnTypeError<D>(L, first_result);
+            const std::string message = error.message;
+            lua_settop(L, restore);
+            Fatal(message);
+        }
+        D value = Stack<D>::Get(L, first_result);
+        lua_settop(L, restore);
+        return value;
+    }
+}
+
 // pcall 成功后读返回值。first_result 是第一个返回值的栈下标（pcall 已把结果数调整到
 // ReturnCount<R>），restore 是调用前的栈顶（结果与错误处理函数都会被清掉）。
 // 返回值类型不匹配是 kType，不能静默变成 0 / false / 空串。
@@ -137,6 +166,84 @@ Result<R> CallPushedFast(lua_State* L, int func_index, Args&&... args) {
         return Error{status == LUA_ERRMEM ? ErrorCode::kMemory : ErrorCode::kRuntime, std::move(message)};
     }
     return ReadResults<R>(L, base, base - 1);
+}
+
+// registry 引用版本：先压 msgh，再压函数，省掉 CallPushed 的 lua_insert。
+template <class R, class... Args>
+Result<R> CallRef(lua_State* L, int registry_ref, Args&&... args) {
+    const int base = lua_gettop(L);
+    if (!lua_checkstack(L, static_cast<int>(sizeof...(Args)) + 4)) {
+        lua_settop(L, base);
+        return Error{ErrorCode::kStack, "fastlua: Lua stack overflow while pushing arguments"};
+    }
+    lua_pushcfunction(L, &MessageHandler);  // base + 1
+    lua_rawgeti(L, LUA_REGISTRYINDEX, registry_ref);  // base + 2
+
+    PushArgs(L, std::forward<Args>(args)...);
+    const int status = lua_pcall(L, static_cast<int>(sizeof...(Args)), ReturnCount<R>(), base + 1);
+    if (status != LUA_OK) {
+        std::string message = TakeError(L, base);
+        return Error{status == LUA_ERRMEM ? ErrorCode::kMemory : ErrorCode::kRuntime, std::move(message)};
+    }
+    return ReadResults<R>(L, base + 2, base);
+}
+
+template <class R, class... Args>
+Result<R> CallRefFast(lua_State* L, int registry_ref, Args&&... args) {
+    const int base = lua_gettop(L);
+    if (!lua_checkstack(L, static_cast<int>(sizeof...(Args)) + 3)) {
+        lua_settop(L, base);
+        return Error{ErrorCode::kStack, "fastlua: Lua stack overflow while pushing arguments"};
+    }
+    lua_rawgeti(L, LUA_REGISTRYINDEX, registry_ref);  // base + 1
+
+    PushArgs(L, std::forward<Args>(args)...);
+    const int status = lua_pcall(L, static_cast<int>(sizeof...(Args)), ReturnCount<R>(), 0);
+    if (status != LUA_OK) {
+        std::string message = TakeError(L, base);
+        return Error{status == LUA_ERRMEM ? ErrorCode::kMemory : ErrorCode::kRuntime, std::move(message)};
+    }
+    if constexpr (std::is_void_v<std::remove_cvref_t<R>>) {
+        // lua_call(nresults = 0) 已经把函数和参数弹掉，栈顶就是 base。
+        return Ok();
+    } else {
+        return ReadResults<R>(L, base + 1, base);
+    }
+}
+
+// 无保护调用：lua_call，不捕获错误。Lua 抛错会 longjmp 穿过当前 C++ 栈；
+// 只有确认被调函数不会报错时才用（或由外层 Lua pcall 接住，但中间不能有非平凡析构）。
+template <class R, class... Args>
+R CallRefUnprotected(lua_State* L, int registry_ref, Args&&... args) {
+    const int base = lua_gettop(L);
+    FASTLUA_CHECK(lua_checkstack(L, static_cast<int>(sizeof...(Args)) + 2),
+                  "fastlua: Lua stack overflow while pushing arguments");
+    lua_rawgeti(L, LUA_REGISTRYINDEX, registry_ref);
+    PushArgs(L, std::forward<Args>(args)...);
+    lua_call(L, static_cast<int>(sizeof...(Args)), ReturnCount<R>());
+    if constexpr (std::is_void_v<std::remove_cvref_t<R>>) {
+        return;
+    } else {
+        return ReadResultsUnprotected<R>(L, base + 1, base);
+    }
+}
+
+template <class R, class... Args>
+R CallGlobalUnprotected(lua_State* L, std::string_view name, Args&&... args) {
+    const int base = lua_gettop(L);
+    FASTLUA_CHECK(lua_checkstack(L, static_cast<int>(sizeof...(Args)) + 2),
+                  "fastlua: Lua stack overflow while pushing arguments");
+    const std::string key(name);
+    lua_getglobal(L, key.c_str());
+    FASTLUA_CHECK(lua_isfunction(L, -1), "fastlua: global '{}' is not a function", key);
+    PushArgs(L, std::forward<Args>(args)...);
+    lua_call(L, static_cast<int>(sizeof...(Args)), ReturnCount<R>());
+    if constexpr (std::is_void_v<std::remove_cvref_t<R>>) {
+        lua_settop(L, base);
+        return;
+    } else {
+        return ReadResultsUnprotected<R>(L, base + 1, base);
+    }
 }
 
 inline std::string TakeError(lua_State* L, int base) {

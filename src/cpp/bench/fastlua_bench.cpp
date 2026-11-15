@@ -157,10 +157,28 @@ int main() {
         }
     });
 
+    RunCase("cpp2lua_noop_unprotected", kIterations, [&](int64_t n) {
+        for (int64_t i = 0; i < n; ++i) {
+            noop.CallUnprotected<void>();
+        }
+    });
+
+    RunCase("cpp2lua_add_unprotected", kIterations, [&](int64_t n) {
+        for (int64_t i = 0; i < n; ++i) {
+            g_sink += add.CallUnprotected<int>(1, 2);
+        }
+    });
+
     RunCase("cpp2lua_add_by_name", kIterations, [&](int64_t n) {
         for (int64_t i = 0; i < n; ++i) {
             auto result = lua.Call<int>("lua_add", 1, 2);
             g_sink += result.Value();
+        }
+    });
+
+    RunCase("cpp2lua_add_by_name_unprotected", kIterations, [&](int64_t n) {
+        for (int64_t i = 0; i < n; ++i) {
+            g_sink += lua.CallUnprotected<int>("lua_add", 1, 2);
         }
     });
 

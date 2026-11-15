@@ -56,9 +56,20 @@ sol2 / LuaBridge3：前者上游不支持 5.5（`compat-5.3.h` 的 `#error`、`L
   - `Value()` 是“已经 `Ok()` 之后”的访问器；在错误上调用属于编程错误，经 `FASTLUA_CHECK`（可接 fatal handler）记录后 abort。需要恢复就用 `Ok()` / `ValueOr()` / `GetError()`。
   - C++→Lua 的**返回值**也走 `Stack<T>::Check`：类型不匹配返回 `kType`，不会静默变成 0 / false / 空串。
   - “不抛异常”不等于所有 Lua 错误都可恢复：`lua_pushlstring`、`luaL_ref`、表插入等可能分配的操作在 OOM 时会 `longjmp` 到 `lua_atpanic`（fastlua 的 handler 记录后 abort），这类内存错误按致命处理，不承诺跨 C++ 栈恢复。
-- **调用**：`CallGlobal`（按名字，晚绑定，热更友好）、`CallPushed`（函数已在栈上）、`Function::Call`（缓存引用，带 traceback）与 `Function::CallFast`（不挂 traceback）。每次调用一次 `lua_checkstack`，`lua_pcall` 后 `lua_settop` 恢复。
+- **调用**：`CallGlobal`（按名字，晚绑定，热更友好）、`CallPushed`（函数已在栈上）、`Function::Call`（缓存引用，带 traceback）与 `Function::CallFast`（不挂 traceback）。`Function::Call` 走 `CallRef`：先压 msgh 再压函数，省掉 `lua_insert`；每次调用一次 `lua_checkstack`，`lua_pcall` 后 `lua_settop` 恢复。`CallFast` 的 void 返回不需要 `settop`。
+  - **逃生门**：`Function::CallUnprotected` / `LuaStateView::CallUnprotected` 返回裸 `R`（不是 `Result`），走 `lua_call`，不捕获 Lua 错误，用于确认不会报错的热路径。**报错会 longjmp 跳过当前 C++ 栈的析构**；返回值类型不匹配直接 `Fatal`。默认 API 仍然是 pcall。
 - **类（`class.h` / `class.cpp`）**：
   - userdata 布局 `[ObjHeader]`（共享所有权时在 header 后**内联** `shared_ptr<void>`，不再单独 `new`）；`ObjHeader` 带 cookie、ClassInfo、对象指针、所有权标志、持有块与释放函数。
+  - `ObjHeader` 当前 48B：cookie 8 + cls 8 + obj 8 + flags/pad 8 + holder 8 + destroy_holder 8。内存敏感时可以去掉 `destroy_holder`，用 `kObjShared` 标记调用固定的释放函数，降到 40B（百万实体省 8MB）。这是 header 自身大小，不含 Lua userdata 的 GC 头、metatable 指针和分配器对齐，实际每对象还要再加约 30~50B。
+  - 和 sol2 的 userdata 内存对比（Lua 5.5，按 `lua_Alloc` 请求字节数，不含对象本身和 malloc 对齐）：
+
+    | 方式 | sol2 | fastlua |
+    |---|---:|---:|
+    | borrowed / 裸指针 | 64（Udata + 1 uservalue）+ 8（T*）= **72B** | 32（Udata 无 uservalue）+ 48（ObjHeader）= **80B** |
+    | shared_ptr | 64 + 8（T*）+ 8（dtor）+ 8（tag）+ 16（shared_ptr）= **104B** | 32 + 48 + 16（内联 shared_ptr）= **96B** |
+    | 按值（T） | 64 + sizeof(T)（对象内联） | 32 + 48（对象在 C++ 堆上 `new`，不计入 Lua） |
+
+    sol2 的裸指针 usertype 最省（8B payload），但它固定申请 1 个 uservalue（+32B）；fastlua 默认 0 个 uservalue，但 ObjHeader 是 48B。两者在 shared_ptr 上接近，fastlua 反而少 8B。`AllowFields` 的类会多 1 个 uservalue（+32B）。
   - 类型身份 `kTypeTag<T>` 地址；`GetObjectAs<T>` 先比类型，再沿 `ancestors` 应用注册时生成的 `up` 转换。
   - 每类一个 metatable；纯方法类的 `__index` 直接是方法表，属性类用 C `__index` 查 getters 表（lightuserdata `PropDesc*`，直接调用 getter/setter，无嵌套 Lua 调用）。
   - 所有权：`Policy::kOwned`（默认，`__gc` delete）、`Policy::kBorrowed`（C++ 管，`__gc` 不做事）；`ObjHeader::flags` 决定是否 delete。
@@ -215,7 +226,7 @@ std::function<void(int)> f = [shared](int x) { shared->Call<void>(x); };
 
 测试（与源码同目录，`CHECK` 失败 abort，不引测试框架）：
 
-- `fastlua_core_test`：全局读写、C++ 函数/lambda、多返回值、脚本错误、optional/vector/array/span/unordered_map、Table/Function、`Clone()`、返回值类型检查、`lua_close` 后 `Ref`、可调用对象 GC、C++ 异常转 Lua 错误。
+- `fastlua_core_test`：全局读写、C++ 函数/lambda、多返回值、脚本错误、optional/vector/array/span/unordered_map、Table/Function、`Clone()`、返回值类型检查、`CallUnprotected` / `CallGlobalUnprotected`、`lua_close` 后 `Ref`、可调用对象 GC、C++ 异常转 Lua 错误。
 - `fastlua_check_test`：`ENSURE` 每个调用点只记一次；`CHECK` 在 fork 子进程里 abort。
 - `fastlua_class_test`：构造、方法、属性、继承（属性/方法 cast）、AllowFields、DotCall、所有权/GC、枚举、自动元方法（`__tostring` / `__eq` / `__lt` / `__close`，含继承）、`shared_ptr` 生命周期。
 - `fastlua_sandbox_test`：内存上限（`AllocStats.failures`）、指令预算（`while true do end` 被中断）、库白名单。
@@ -236,18 +247,40 @@ Windows 上单独用 `build/fastlua_dev` 的临时 CMake（MinGW g++ 16 + quanta
 
 实测（Windows，MinGW g++ 16，Release，ns/op；竞品数据来自 `breeze/build/lua_bench` 的临时对比基准）：
 
-| 场景 | 裸 C API | fastlua | sol2-solpp | LuaBridge3 | luakit |
+| 场景 | 裸 C API | fastlua Call | fastlua CallFast | fastlua CallUnprotected | sol2 unsafe | sol2 safe | LuaBridge3 | luakit |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| C++→Lua noop（缓存） | 10.5 | 14.5 | 12.7 | **8.8** | 9.2 | 16.8 | 19.4 | 43.9 |
+| C++→Lua add（缓存） | 15.6 | 19.5 | 19.5 | **14.9** | 14.3 | 24.1 | 27.6 | 50.5 |
+| C++→Lua 按名字 | — | 28.8 | — | 23.2 | — | — | — | — |
+| Lua→C++ add | 14.9 | 17.5 | — | — | 19.8 | 18.6 | 22.9 | 15.0 |
+| Lua→C++ 读表 4 字段 | 45.6 | 68.4 | — | — | 103.8 | 105.8 | 268.6 | 49.8 |
+| 热路径分配 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 / 10 万次调用 |
+
+其中 sol2 的三列模式：
+
+- **unsafe**：`SOL_SAFE_FUNCTION_OBJECTS` 关闭（Release 默认），`sol::function` = `unsafe_function`，走 `lua_call`；
+- **safe**：编译时 `-DSOL_SAFE_FUNCTION_OBJECTS=1`，`sol::function` = `protected_function`，走 `lua_pcall`。
+
+Linux Release（clang 23）实测：
+
+| 场景 | fastlua Call | CallFast | CallUnprotected | sol2 unsafe | sol2 safe |
 |---|---:|---:|---:|---:|---:|
-| C++→Lua noop（缓存） | 10.5 | 17.2（fast 14.0） | 9.2 | 19.4 | 43.9 |
-| C++→Lua add（缓存） | 15.6 | 19.6（fast 16.6） | 15.5 | 27.6 | 50.5 |
-| C++→Lua 按名字 | — | 25.5 | — | — | — |
-| Lua→C++ add | 14.9 | 17.0 | 20.2 | 22.9 | 15.0 |
-| Lua→C++ 读表 4 字段 | 45.6 | 55.2 | 103.8 | 268.6 | 49.8 |
-| 热路径分配 | 0 | 0 / 10 万次调用 | 0 | 0 | 0 |
+| C++→Lua noop（缓存） | 14.8 | 12.0 | 7.7 | 10.2 | 19.3 |
+| C++→Lua add（缓存） | 19.2 | 18.7 | 14.1 | 15.2 | 25.4 |
+| C++→Lua 按名字 | 27.5 | — | 22.1 | — | — |
+| Lua→C++ add | 15.8 | — | — | 18.4 | 19.4 |
+| Lua→C++ 读表 4 字段 | 56.0 | — | — | 91.9 | 95.1 |
 
-读表 4 字段从 74ns 降到 55ns：热路径改用 `TableView::TryGetField`（`lua_getfield` + `bool`，不构造 `Result`），已经接近裸 API 的 45.6ns。
+这轮 C++→Lua 优化（`Function` 只取一次 state、`Call` 先压 msgh 免 `lua_insert`、`CallFast` void 跳过 `settop`）把受保护的缓存 noop 从 Windows 17.2 / Linux 18.6 降到 **14.5 / 14.8**；`CallFast` **12.7 / 12.0**；`CallUnprotected` **8.8 / 7.7**。
 
-Linux Release（clang 23）实测：noop 缓存 18.6（`CallFast` 14.5）、add 缓存 23.2（`CallFast` 20.0）、按名字 26.5、table get 16.7、Lua→C++ add 17.2、读表 4 字段 55.2ns（`TryGetField`）；热路径 0 分配 / 10 万次调用。
+**sol2 的 unsafe 列不是同一口径**：sol2-solpp 在 Release 下 `SOL_SAFE_FUNCTION_OBJECTS` 默认关闭，`sol::function` 等于 `unsafe_function`，内部走 `lua_call`（`unsafe_function.hpp:43`），不捕获错误。打开 `SOL_SAFE_FUNCTION_OBJECTS=1` 后重新实测：
+
+- Windows：noop **16.8**、add **24.1**（fastlua `Call` 14.5 / 19.5，`CallFast` 12.7 / 19.5）；
+- Linux：noop **19.3**、add **25.4**（fastlua `Call` 14.8 / 19.2，`CallFast` 12.0 / 18.7）。
+
+**同为受保护调用时，fastlua 比 sol2 safe 快 2~6ns**；sol2 unsafe 仍然最快（9.2 / 10.2），但它不捕获错误。fastlua 的同口径逃生门 `CallUnprotected` 是 8.8 / 7.7，和 sol2 unsafe 持平或略快。默认 fastlua 仍然是 pcall。
+
+读表 4 字段在 Linux 从 74ns 降到 56ns：热路径改用 `TableView::TryGetField`（`lua_getfield` + `bool`，不构造 `Result`），已经接近裸 API 的 40.5ns（Linux）/ 45.6ns（Windows）。
 
 对照组：同样的 handler 用 `SetRawFunction` 绑裸 `lua_CFunction` 时，Lua→C++ add 13.9（Windows）/ 12.8（Linux）、读表 4 字段 44.1 / 43.4ns——已经与 luakit 的 15.0 / 49.8 持平或更快。luakit 在基准里赢的两项，是因为它的 handler 本来就是裸 `lua_CFunction`；fastlua 通用绑定多出的 ~4ns / ~20ns 是 ErrorSlot、参数检查、tuple 与 noinline trampoline 的安全成本，不是运行时差异。
 

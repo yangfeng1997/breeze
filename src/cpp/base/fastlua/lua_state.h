@@ -149,6 +149,12 @@ public:
         return CallGlobal<R>(L_, name, std::forward<Args>(args)...);
     }
 
+    // 逃生门：不捕获 Lua 错误，语义同 Function::CallUnprotected。
+    template <class R, class... Args>
+    R CallUnprotected(std::string_view name, Args&&... args) const {
+        return CallGlobalUnprotected<R>(L_, name, std::forward<Args>(args)...);
+    }
+
     // 定义在 class.h（建类器需要 ClassInfo 完整类型）。
     template <class T>
     ClassBuilder<T> Class(std::string_view name);
