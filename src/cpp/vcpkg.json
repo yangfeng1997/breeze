@@ -13,7 +13,7 @@
   ],
   "features": {
     "lua-apicheck": {
-      "description": "Build Lua with LUA_USE_APICHECK + LUAI_ASSERT for fastlua tests",
+      "description": "Build Lua with LUA_USE_APICHECK + LUAI_ASSERT for breeze::lua_binding tests",
       "dependencies": [
         {
           "name": "lua",

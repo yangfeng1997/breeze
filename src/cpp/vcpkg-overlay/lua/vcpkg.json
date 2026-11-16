@@ -16,7 +16,7 @@
   ],
   "features": {
     "apicheck": {
-      "description": "Enable LUA_USE_APICHECK + LUAI_ASSERT (C API misuse checks) for fastlua tests"
+      "description": "Enable LUA_USE_APICHECK + LUAI_ASSERT (C API misuse checks) for breeze::lua_binding tests"
     },
     "cpp": {
       "description": "Builds Lua for C++ linkage"

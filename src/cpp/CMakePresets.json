@@ -18,7 +18,7 @@
         "CMAKE_BUILD_TYPE": "Debug",
         "VCPKG_INSTALLED_DIR": "$env{HOME}/.cache/breeze/vcpkg_installed_apicheck",
         "VCPKG_MANIFEST_FEATURES": "lua-apicheck",
-        "BREEZE_FASTLUA_APICHECK": "ON"
+        "BREEZE_LUA_APICHECK": "ON"
       }
     },
     {

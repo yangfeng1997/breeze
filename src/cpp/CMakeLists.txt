@@ -36,7 +36,7 @@ find_package(spdlog CONFIG REQUIRED)
 find_package(yaml-cpp CONFIG REQUIRED)
 # vcpkg 的 lua 端口经 wrapper 暴露成标准 FindLua 变量（LUA_INCLUDE_DIR / LUA_LIBRARIES）。
 # 不用 find_package(Lua 5.5)：Lua 5.5 的 LUA_VERSION_MAJOR 是 LUAI_TOSTR(...)，FindLua 解析不了；
-# 版本约束由 base/fastlua/config.h 的 static_assert(LUA_VERSION_NUM >= 505) 负责。
+# 版本约束由 base/lua_binding/config.h 的 static_assert(LUA_VERSION_NUM >= 505) 负责。
 find_package(Lua REQUIRED)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)  # configgen 是 Python 脚本
 
@@ -77,7 +77,7 @@ set(CONTAINER_DIR base/container)
 set(EVENT_DIR base/event)
 set(HASH_DIR base/hash)
 set(TIME_RECORD_DIR base/time_record)
-set(FASTLUA_DIR base/fastlua)
+set(BREEZE_LUA_BINDING_DIR base/lua_binding)
 set(METRICS_DIR base/metrics)
 set(VARTYPE_DIR base/vartype)
 set(URI_DIR base/uri)
@@ -252,54 +252,54 @@ endif()
 
 # Lua 5.5 绑定库：小型编译库 + 头文件模板。自带断言/日志，不依赖 breeze_assert，
 # 因此不受 BREEZE_BUILD_NET 限制；只依赖 vcpkg 的 lua 和标准库。
-add_library(breeze_fastlua
-  ${FASTLUA_DIR}/check.cpp
-  ${FASTLUA_DIR}/error.cpp
-  ${FASTLUA_DIR}/lua_state.cpp
-  ${FASTLUA_DIR}/class.cpp
-  ${FASTLUA_DIR}/sandbox.cpp)
-target_include_directories(breeze_fastlua PUBLIC ${LUA_INCLUDE_DIR})
-target_link_libraries(breeze_fastlua PUBLIC ${LUA_LIBRARIES})
-target_compile_features(breeze_fastlua PUBLIC cxx_std_26)  # 公开头要求 C++26，与仓库全局标准一致
-target_compile_options(breeze_fastlua PRIVATE -Wall -Wextra)
+add_library(breeze_lua_binding
+  ${BREEZE_LUA_BINDING_DIR}/check.cpp
+  ${BREEZE_LUA_BINDING_DIR}/error.cpp
+  ${BREEZE_LUA_BINDING_DIR}/lua_state.cpp
+  ${BREEZE_LUA_BINDING_DIR}/class.cpp
+  ${BREEZE_LUA_BINDING_DIR}/sandbox.cpp)
+target_include_directories(breeze_lua_binding PUBLIC ${LUA_INCLUDE_DIR})
+target_link_libraries(breeze_lua_binding PUBLIC ${LUA_LIBRARIES})
+target_compile_features(breeze_lua_binding PUBLIC cxx_std_26)  # 公开头要求 C++26，与仓库全局标准一致
+target_compile_options(breeze_lua_binding PRIVATE -Wall -Wextra)
 
 # 可选扩展：table / string / os 工具。
-add_library(breeze_fastlua_ext
-  ${FASTLUA_DIR}/ext/ext.cpp
-  ${FASTLUA_DIR}/ext/table_ext.cpp
-  ${FASTLUA_DIR}/ext/string_ext.cpp
-  ${FASTLUA_DIR}/ext/os_ext.cpp)
-target_link_libraries(breeze_fastlua_ext PUBLIC breeze_fastlua)
-target_compile_options(breeze_fastlua_ext PRIVATE -Wall -Wextra)
+add_library(breeze_lua_binding_ext
+  ${BREEZE_LUA_BINDING_DIR}/ext/ext.cpp
+  ${BREEZE_LUA_BINDING_DIR}/ext/table_ext.cpp
+  ${BREEZE_LUA_BINDING_DIR}/ext/string_ext.cpp
+  ${BREEZE_LUA_BINDING_DIR}/ext/os_ext.cpp)
+target_link_libraries(breeze_lua_binding_ext PUBLIC breeze_lua_binding)
+target_compile_options(breeze_lua_binding_ext PRIVATE -Wall -Wextra)
 
 # 测试与 breeze 其余库一致：本地 CHECK + add_test，不引测试框架。
-foreach(_t fastlua_core_test fastlua_check_test fastlua_class_test fastlua_sandbox_test
-          fastlua_coroutine_test fastlua_compat_test)
-  add_executable(${_t} ${FASTLUA_DIR}/${_t}.cpp)
-  target_link_libraries(${_t} PRIVATE breeze_fastlua)
+foreach(_t lua_core_test lua_check_test lua_class_test lua_sandbox_test
+          lua_coroutine_test)
+  add_executable(${_t} ${BREEZE_LUA_BINDING_DIR}/${_t}.cpp)
+  target_link_libraries(${_t} PRIVATE breeze_lua_binding)
   target_compile_options(${_t} PRIVATE -Wall -Wextra)
   add_test(NAME ${_t} COMMAND ${_t})
 endforeach()
 
 # 同一份测试源码在 -fno-exceptions 下再编一遍：守住“核心不依赖异常”。
-add_executable(fastlua_core_noexc_test ${FASTLUA_DIR}/fastlua_core_test.cpp)
-target_link_libraries(fastlua_core_noexc_test PRIVATE breeze_fastlua)
-target_compile_options(fastlua_core_noexc_test PRIVATE -Wall -Wextra -fno-exceptions)
-add_test(NAME fastlua_core_noexc_test COMMAND fastlua_core_noexc_test)
+add_executable(lua_core_noexc_test ${BREEZE_LUA_BINDING_DIR}/lua_core_test.cpp)
+target_link_libraries(lua_core_noexc_test PRIVATE breeze_lua_binding)
+target_compile_options(lua_core_noexc_test PRIVATE -Wall -Wextra -fno-exceptions)
+add_test(NAME lua_core_noexc_test COMMAND lua_core_noexc_test)
 
-add_executable(fastlua_ext_test ${FASTLUA_DIR}/fastlua_ext_test.cpp)
-target_link_libraries(fastlua_ext_test PRIVATE breeze_fastlua_ext)
-target_compile_options(fastlua_ext_test PRIVATE -Wall -Wextra)
-add_test(NAME fastlua_ext_test COMMAND fastlua_ext_test)
+add_executable(lua_ext_test ${BREEZE_LUA_BINDING_DIR}/lua_ext_test.cpp)
+target_link_libraries(lua_ext_test PRIVATE breeze_lua_binding_ext)
+target_compile_options(lua_ext_test PRIVATE -Wall -Wextra)
+add_test(NAME lua_ext_test COMMAND lua_ext_test)
 
 # 测试构建链接的是带 LUA_USE_APICHECK 的 Lua（debug/asan 预设经 vcpkg overlay 打开）。
 # 自检程序故意误用 C API，WILL_FAIL 期待它 abort，以此证明开关真的生效。
-option(BREEZE_FASTLUA_APICHECK "fastlua tests link a LUA_USE_APICHECK build" OFF)
-if(BREEZE_FASTLUA_APICHECK)
-  add_executable(fastlua_apicheck_selftest ${FASTLUA_DIR}/fastlua_apicheck_selftest.cpp)
-  target_link_libraries(fastlua_apicheck_selftest PRIVATE breeze_fastlua)
-  target_compile_options(fastlua_apicheck_selftest PRIVATE -Wall -Wextra)
-  add_test(NAME fastlua_apicheck_selftest COMMAND fastlua_apicheck_selftest)
+option(BREEZE_LUA_APICHECK "breeze::lua_binding tests link a LUA_USE_APICHECK build" OFF)
+if(BREEZE_LUA_APICHECK)
+  add_executable(lua_apicheck_selftest ${BREEZE_LUA_BINDING_DIR}/lua_apicheck_selftest.cpp)
+  target_link_libraries(lua_apicheck_selftest PRIVATE breeze_lua_binding)
+  target_compile_options(lua_apicheck_selftest PRIVATE -Wall -Wextra)
+  add_test(NAME lua_apicheck_selftest COMMAND lua_apicheck_selftest)
 endif()
 
 if(BREEZE_BUILD_NET)
@@ -764,11 +764,11 @@ endif()
 
 # 容器 bench：-DBREEZE_BUILD_CONTAINER_BENCH=ON 才构建（不联网）。用 Release 预设跑：cmake --preset release -DBREEZE_BUILD_CONTAINER_BENCH=ON
 option(BREEZE_BUILD_CONTAINER_BENCH "构建 container_bench（FlatHashMap / LinkedHashMap 对比 std::unordered_map，用到 glibc 的 mallinfo2）" OFF)
-option(BREEZE_BUILD_FASTLUA_BENCH "构建 fastlua 基准（不依赖网络库）" OFF)
-if(BREEZE_BUILD_FASTLUA_BENCH)
-  add_executable(fastlua_bench bench/fastlua_bench.cpp)
-  target_link_libraries(fastlua_bench PRIVATE breeze_fastlua breeze_fastlua_ext)
-  target_compile_options(fastlua_bench PRIVATE -Wall -Wextra)
+option(BREEZE_BUILD_LUA_BINDING_BENCH "构建 breeze::lua_binding 基准（不依赖网络库）" OFF)
+if(BREEZE_BUILD_LUA_BINDING_BENCH)
+  add_executable(lua_binding_bench bench/lua_binding_bench.cpp)
+  target_link_libraries(lua_binding_bench PRIVATE breeze_lua_binding breeze_lua_binding_ext)
+  target_compile_options(lua_binding_bench PRIVATE -Wall -Wextra)
 endif()
 
 if(BREEZE_BUILD_CONTAINER_BENCH AND BREEZE_BUILD_NET)
