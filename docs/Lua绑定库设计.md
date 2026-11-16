@@ -8,6 +8,8 @@ C++26 下可用的 `std::expected`、`std::move_only_function`、`std::to_underl
 
 本文记录**为什么是这个样子**。API 的细节与约束写在头文件注释里，本文不重复。
 
+> 本文只讲**绑定层**。主线程 `LuaModule`、worker 线程、目录约定、任务协议和文件级热更属于框架层，见 [Lua脚本框架设计.md](Lua脚本框架设计.md)。
+
 **范围约束**：不属于 Lua 绑定库的职责——跨线程 `Reference` 析构队列、协程超时定时器、sandbox/coroutine 的 hook 复用器、C++ 栈采集、二进制 codec（`luabuf` / `slice` / `encode` / `decode` / `serialize`）——**一律不做**，需求由框架 / 运行时 / 诊断库或独立包承担；详见 §3“职责边界”。
 
 **状态**：debug、release、`-fno-exceptions`、C++26 构建、以及带 `LUA_USE_APICHECK` 的 Lua 下测试通过；**asan + ubsan 与 tsan 预设下 8 个 breeze::lua_binding 测试全部通过**（修掉了一处 `StateData` 桶数组泄漏）。release 基准在 Windows（MinGW g++ 16）与 Linux（clang 23）上跑过。Lua 的 apicheck 只在 debug/asan/tsan 预设里通过 vcpkg overlay 打开。
