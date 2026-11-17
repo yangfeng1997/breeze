@@ -13,11 +13,11 @@
 
 ### 1.1 目标
 
-- 每个进程有一个主线程 `LuaState`，由 `LuaModule` 管理；
-- 服务可以按需创建 `AsyncWorkerModule`，worker 线程里各有一个独立 `LuaState`；
+- 每个进程有一个主线程 `LuaRuntime`（`LuaState` + `LuaLoader`），由 `LuaModule` 持有；
+- 服务可以按需创建 `AsyncWorkerModule`，worker 线程里各有一个独立的 `LuaRuntime`（独立 `LuaState` + `LuaLoader`）；
 - 主线程和 worker 的 Lua 代码、C++ 绑定、生命周期、热更完全隔离；
 - Lua 业务代码按服务和 worker 类型分目录组织；
-- 文件级热更、失败回滚、C++ 引用刷新有明确归属；
+- 文件级热更、C++ 引用刷新有明确归属；
 - **进程是 shard、部署、故障、资源的基本单位**；不引入进程内多 Shard 模型。
 
 ### 1.2 非目标
@@ -33,7 +33,9 @@
 ```text
 业务服务 C++ / Lua
         ↑
-LuaModule / AsyncWorkerModule      ← 本文（框架层）
+LuaModule / AsyncWorkerModule      ← 应用模块（框架层）
+        ↑
+LuaRuntime / LuaLoader             ← 每线程运行环境与模块加载（框架层）
         ↑
 base/lua_binding                   ← 绑定库
         ↑
@@ -48,18 +50,19 @@ Lua 5.5.1
 App / Service
   │
   ├─ LuaModule (IModule)                       主线程
-  │    ├─ LuaState                             一个主线程 state
-  │    ├─ LuaModuleLoader                      主线程模块缓存/热更
+  │    ├─ LuaRuntime                           一个主线程运行环境
+  │    │    ├─ LuaState                        一个主线程 state
+  │    │    └─ LuaLoader                       主线程模块缓存/热更
   │    └─ on_start / on_tick / on_stop
   │
   └─ AsyncWorkerModule (IModule, 可选)
        ├─ WorkerGroup "ai"    (threads = 4)
-       │    ├─ worker 0: LuaState + loader
-       │    ├─ worker 1: LuaState + loader
+       │    ├─ worker 0: LuaRuntime (LuaState + LuaLoader)
+       │    ├─ worker 1: LuaRuntime (LuaState + LuaLoader)
        │    └─ ...
        └─ WorkerGroup "path"  (threads = 2)
-            ├─ worker 0: LuaState + loader
-            └─ worker 1: LuaState + loader
+            ├─ worker 0: LuaRuntime (LuaState + LuaLoader)
+            └─ worker 1: LuaRuntime (LuaState + LuaLoader)
 ```
 
 ### 2.1 两条硬规则
@@ -67,15 +70,57 @@ App / Service
 1. **一个 OS 线程只能拥有并使用一个 `LuaState`**；state 在该线程创建、使用、销毁。
 2. **主线程 state 和 worker state 不共享任何 Lua 对象**：不传 `Reference` / `LuaTable` / `LuaFunction`，只传任务 ID、函数名、序列化数据。
 
-### 2.2 为什么 worker 不用 `LuaModule`
+### 2.2 `LuaModule`、`LuaRuntime`、`LuaLoader` 的分工
 
-`LuaModule` 是 `IModule`，是应用模块，具有进程级生命周期和单例语义。worker 线程需要的是“一个线程里的 Lua 运行时”，不是新的应用模块。
+| 类型 | 层级 | 职责 |
+|---|---|---|
+| `LuaModule` | 应用模块（`IModule`） | 主线程生命周期的 `Init/Start/Stop/Shutdown`，持有主线程 `LuaRuntime` |
+| `LuaRuntime` | 普通对象（非 `IModule`） | 一个线程里的 Lua 运行环境：`LuaState` + `LuaLoader` + bindings + Start/Stop/Reload/Call |
+| `LuaLoader` | 普通对象（非 `IModule`） | 该 state 的模块加载/缓存/依赖/热更 |
 
-因此：
+`LuaModule` 是应用模块，具有进程级生命周期和单例语义；worker 线程需要的是“一个线程里的 Lua 运行时”，不是新的应用模块。因此：
 
-- `LuaModule` 只给主线程用；
-- worker 线程直接持有 `LuaState`（可加一个轻量 `WorkerLuaContext` 辅助结构，但不是 `IModule`）；
-- `AsyncWorkerModule` 是线程池/队列的管理者，不嵌套 `LuaModule`。
+- 主线程：`LuaModule` 持有一个 `LuaRuntime`；
+- worker 线程：每个线程在内部创建一个 `LuaRuntime`；
+- `AsyncWorkerModule` 是线程池/队列的管理者，不嵌套 `LuaModule`，也不共享 `LuaRuntime`。
+
+### 2.2.1 为什么引入 `LuaRuntime`
+
+主线程和每个 worker 都是同一个固定配对：
+
+```text
+LuaState + LuaLoader
+```
+
+而且都要重复做：
+
+- 配 `package.path`；
+- 创建 state；
+- 创建 loader；
+- 注册该线程的 C++ bindings；
+- 加载 root；
+- `Call` / `Get` 转发；
+- reload。
+
+把这一组收进一个**很薄的** `LuaRuntime`，比在每个 worker 线程里手写两三个局部变量更不容易出错：
+
+```text
+LuaRuntime
+  ├─ LuaState       先构造，后析构
+  ├─ LuaLoader      后构造，先析构
+  └─ bindings
+```
+
+必须守住的边界：
+
+- `LuaRuntime` **不是** `IModule`；
+- 不管应用模块的 `Init/Start/Stop/Shutdown`；
+- 不管 worker 线程池、job 队列、任务路由；
+- 不做多 Shard；
+- 不跨线程共享；
+- 不负责类实例迁移，只调用 loader 的 reload / `__reload` 钩子。
+
+`LuaModule` 是应用模块；`LuaRuntime` 是一个线程里的 Lua 运行环境；`LuaLoader` 是这个 runtime 的模块缓存/热更器。三层各管一件事，不互相越界。
 
 ### 2.3 明确不做单进程多 Shard（架构决策）
 
@@ -242,25 +287,26 @@ require("server.scenesvr.worker.ai.main")
 class LuaModule : public IModule {
 public:
     bool Init() override;       // 保存配置；不加载脚本
-    bool Start() override;      // 注册绑定、加载 main.lua
-    void Stop() override;       // 调用 on_stop、关闭 state
+    bool Start() override;      // runtime_.Start()：绑定、path、main.lua
+    void Stop() override;       // 调用 on_stop、runtime_.Stop()
     void Shutdown() override;   // 释放资源
 
 private:
-    LuaState lua_;
-    std::string main_script_;
+    LuaRuntime runtime_;        // 主线程 state + loader + bindings
 };
 ```
 
 建议：
 
 - `Init` 只做配置和依赖检查；
-- `Start` 顺序必须是：
-  1. `lua_.AddPath(...)`；
-  2. 注册主线程 C++ 绑定；
-  3. `lua_.RunFile(main_script_)`；
-  4. 调用入口（可选 `on_start`）；
-- `Stop` 先调用 Lua 的 `on_stop`，再关闭 state；
+- `Start` 顺序由 `LuaRuntime::Start()` 统一完成：
+  1. 创建/配置 `LuaState`；
+  2. `AddPath(...)`；
+  3. 注册主线程 C++ bindings；
+  4. 创建 `LuaLoader`；
+  5. 加载 `main.lua`；
+  6. 调用入口（可选 `on_start`）；
+- `Stop` 先调用 Lua 的 `on_stop`，再 `runtime_.Stop()`；
 - `Start` 失败要让模块启动失败，不能半启动。
 
 ### 4.2 `AsyncWorkerModule`（worker）
@@ -274,16 +320,19 @@ public:
     void Shutdown() override;   // 释放队列/配置
 
 private:
+    struct Worker {
+        JobQueue queue;          // 每个 worker 自己的队列，不共享
+        std::jthread thread;
+    };
+
     struct WorkerGroup {
         std::string name;
-        int threads;
         std::string script;
         BindingProfile bindings;
-        JobQueue queue;
+        std::vector<Worker> workers;
     };
 
     std::vector<WorkerGroup> groups_;
-    std::vector<std::jthread> threads_;
     std::atomic<bool> stopping_{false};
 };
 ```
@@ -291,28 +340,50 @@ private:
 worker 线程入口：
 
 ```cpp
-void AsyncWorkerModule::WorkerMain(WorkerGroup& group) {
-    // 1. 在本线程创建 state
-    LuaState lua;
-    lua.AddPath("src/lua/?.lua;src/lua/?/init.lua");
+void AsyncWorkerModule::WorkerMain(WorkerGroup& group, Worker& worker) {
+    // 1. 在本线程创建 LuaRuntime（内部创建 LuaState + LuaLoader）
+    LuaRuntime runtime({
+        .name = group.name,
+        .root = group.script,
+        .package_path = "src/lua/?.lua;src/lua/?/init.lua",
+        .register_bindings = [&](LuaStateView lua) {
+            group.bindings.Apply(lua);
+        },
+    });
 
-    // 2. 注册该 group 的 C++ 绑定
-    group.bindings.Apply(lua);
-
-    // 3. 加载该 group 的 worker root
-    auto r = lua.RunFile(group.script);
-    if (!r.Ok()) {
-        MarkWorkerFailed(group);
+    // 2. runtime 负责 path、绑定、loader、加载 worker root
+    if (!runtime.Start()) {
+        MarkWorkerFailed(worker);
         return;
     }
 
-    // 4. 处理任务
+    // 3. 处理任务
     while (!stopping_) {
-        auto job = group.queue.Pop();
+        auto job = worker.queue.Pop();
         if (!job) break;
-        lua.Call<void>("on_job", job->id, job->payload);
+
+        if (job->kind == JobKind::Reload) {
+            if (!runtime.Reload().Ok()) {
+                LogReloadError(group.name);
+            }
+            continue;
+        }
+
+        runtime.Call<void>("on_job", job->id, job->payload);
     }
-}   // LuaState 在这里析构，lua_close 在本线程
+}   // loader、state 在这里依次析构，lua_close 在本线程
+```
+
+热更广播：
+
+```cpp
+void AsyncWorkerModule::BroadcastReload() {
+    for (auto& group : groups_) {
+        for (auto& worker : group.workers) {
+            worker.queue.Push(Job{JobKind::Reload});
+        }
+    }
+}
 ```
 
 ### 4.3 启动/停止顺序
@@ -371,17 +442,17 @@ function on_stop()
 end
 ```
 
-`LuaModule` 负责：
+`LuaModule` 通过 `LuaRuntime` 负责：
 
 ```cpp
-lua_.RunFile(main_script_);
-lua_.Call<void>("on_start");
+runtime_.Start();                 // 内部 RunFile(main_script_)
+runtime_.Call<void>("on_start");
 ```
 
 帧循环：
 
 ```cpp
-lua_.Call<void>("on_tick", dt);
+runtime_.Call<void>("on_tick", dt);
 ```
 
 ### 5.2 入口用名字调用
@@ -431,8 +502,9 @@ workers.Configure({
 
 含义：
 
-- 每个 group 有自己的线程/队列/state；
-- 每个线程加载该 group 的 `script`；
+- 每个 group 是一条配置/绑定边界；
+- 每个 worker 有自己的线程 + 队列 + `LuaRuntime`/`LuaState`，**不共享队列**；
+- 每个 worker 加载该 group 的 `script`；
 - 不同 group 可以用不同 C++ 绑定和沙箱；
 - 一个 group 的故障不阻塞另一个 group。
 
@@ -460,12 +532,15 @@ worker 只暴露少量入口，例如：
 
 ```text
 main → worker:
-  { job_id, group, func, payload }
+  { kind, job_id, group, func, payload }
+
+kind = normal | reload
 
 worker → main:
   { job_id, ok, result }
 ```
 
+- `kind=reload` 是热更控制任务；worker 在 job 边界执行，不调用 Lua `on_job`；
 - `func` 是 worker root 里的函数名，例如 `"on_job"`；
 - `payload` 是字符串/字节/可序列化数据；
 - 不传 `LuaFunction` / `LuaTable` / `Reference`；
@@ -489,14 +564,19 @@ end
 
 ### 6.4 任务路由
 
-- **无状态 worker**：任意线程取任务；
-- **有状态 worker**：按 key 路由到固定线程，例如：
+- 每个 worker 一个队列，提交时必须选一个 `worker.queue`；
+- **无状态 worker**：任意 worker 都可以；
+- **有状态 worker**：按 key 路由到固定 worker，例如：
 
 ```text
-worker_index = hash(player_id) % group.threads
+worker_index = hash(player_id) % group.workers.size()
+worker = group.workers[worker_index]
+worker.queue.Push(job)
 ```
 
 否则同一个玩家的任务可能落到不同 state，`local cache` 不一致。
+
+热更同理：`BroadcastReload()` 必须给**每个** worker 队列各投递一个 `ReloadJob`，不能只往一个共享队列塞一个。
 
 ### 6.5 简化方案：一个 root 按 kind 分发
 
@@ -514,7 +594,7 @@ function on_job(id, kind, payload)
 end
 ```
 
-优点是简单；缺点是所有类型共享队列和绑定。
+优点是简单；缺点是所有类型共享同一组 worker 和绑定（队列仍按 worker 分开），类型之间没有隔离。
 
 ### 6.6 每 worker 不同配置（可选）
 
@@ -570,7 +650,11 @@ struct BindingProfile {
 热更在框架层，不在绑定库：
 
 - `LuaState` / `CallGlobal` / `LuaFunction` 由绑定库提供；
-- mtime、依赖图、安全点、回滚、实例迁移由 `LuaModuleLoader` 提供。
+- `LuaRuntime` 持有一个 state + 一个 loader，暴露 `Start/Stop/Reload/Call`；
+- mtime、依赖图、安全点、实例迁移由 `LuaLoader` 提供；
+- `LuaRuntime::Reload()` 只是把调用转给它的 `LuaLoader`。
+
+> 命名说明：本文的 `LuaLoader` 是**每个 `lua_State` 一个的模块加载/缓存/热更器**，不创建/拥有 state，也不提供 `Call` / `GetGlobal`；它和 nfshmx 的 `NFILuaLoader`（LuaContext + load/call 封装）不是同一个东西。`NFILuaLoader` 那一层对应本文的 `LuaRuntime`（state + load/call + bindings）。
 
 ### 8.2 模块约定
 
@@ -583,14 +667,13 @@ struct BindingProfile {
 ### 8.3 Loader 职责
 
 ```text
-LuaModuleLoader
+LuaLoader
   ├─ 记录 name -> { path, mtime, value, deps }
   ├─ import(name) / require 接管
   ├─ 扫描 mtime 变化
   ├─ 依赖图 + 拓扑顺序
-  ├─ 先加载/执行，再原子提交
-  ├─ 失败保留旧版本
-  └─ 提交后调用 __reload / 重绑入口
+  ├─ 按顺序 load/execute
+  └─ 失败记录错误，不中断 worker 循环
 ```
 
 ### 8.4 安全点
@@ -606,18 +689,23 @@ LuaModuleLoader
 tick:
   on_tick(dt)
   如果到达检查周期:
-    loader.reload()
+    runtime_.Reload()               // 内部委托 LuaLoader
   如果 root 入口变了:
     重新 CallGlobal("on_tick", ...)  // 按名字，自动用新函数
 ```
 
 ### 8.6 worker reload
 
-- 每个 worker state 有自己的 loader；
-- 可以逐 worker reload，也可以暂停整个 group、全部 reload、再恢复；
-- 有状态 worker 需要 `__reload` 或重启 worker；
+采用 nfshmx/quanta 的轻量方式：
+
+- 每个 worker `LuaRuntime` 有自己的 `LuaLoader`；
+- `AsyncWorkerModule::BroadcastReload()` 给**每个 worker 自己的队列**投递一个 `ReloadJob`；
+- worker 在 job 边界执行 `runtime.Reload()`，不调用 Lua 业务函数；
+- **不暂停 group、不等 in-flight、不做 barrier、不做回滚**；
+- reload 失败只记录错误，worker 继续用当前已加载的代码处理后续 job；
 - 主线程和 worker 版本允许短暂不一致，但 job 协议要稳定；
-- 大版本/协议变更：停 group → reload → 重启，而不是在线逐个迁移。
+- 有状态 worker 需要 `__reload` 或重启 worker；
+- 大版本/协议变更：停 group → 重启 worker/进程，而不是在线逐个迁移。
 
 ### 8.7 C++ 引用
 
@@ -640,8 +728,9 @@ tick:
 
 ### 9.2 线程
 
-- `LuaState` 在 owner 线程创建/使用/销毁；
-- 不在主线程创建 worker state 后 move 过去；
+- `LuaRuntime` 必须在 owner 线程创建/使用/销毁；它内部持有 `LuaState` + `LuaLoader`；
+- 不在主线程创建 worker `LuaRuntime` 后 move/交给 worker 线程；
+- `LuaLoader` 与它所属的 `LuaState` 同生命周期；
 - 不跨线程传 `Reference` / `LuaTable` / `LuaFunction`；
 - 只传 ID、函数名、序列化数据；
 - worker 和主线程共享的 C++ 服务必须线程安全或只读。
@@ -679,7 +768,7 @@ tick:
 | `LuaModule`         | `NFCLuaThreadModule`（主脚本）     | 主服务 Lua           |
 | `AsyncWorkerModule` | `NFCLuaThreadModule` + actor pool  | `lworker::scheduler` |
 | `WorkerGroup`       | work/tcp/loop actor 类型           | 命名 worker          |
-| worker `LuaState`   | `NFCLuaScriptComponent` 的 context | `worker::m_lua`      |
+| worker `LuaRuntime` | `NFCLuaScriptComponent` 的 context | `worker::m_lua`      |
 
 ---
 
@@ -730,15 +819,18 @@ C++ 只负责把配置转成 `WorkerGroupSpec`。
 
 ## 13. 测试计划
 
+- `LuaRuntime` 构造/析构顺序（`LuaLoader` 先于 `LuaState` 析构）；
 - `LuaModule` 启动/停止/重复 Start 失败；
 - 主线程 root 加载失败时模块启动失败；
-- 每个 worker 线程的 `LuaState` 不同（脚本里打印/记录 state 地址）；
+- 每个 worker 线程的 `LuaRuntime`/`LuaState` 不同（脚本里打印/记录 state 地址）；
+- worker 之间、主线程与 worker 之间的 `LuaLoader` 缓存互不影响；
 - 主线程和 worker 不共享全局变量；
 - worker group 路由正确（有状态按 key 路由）；
 - 队列满时的背压/拒绝；
-- worker 加载失败回滚；
+- worker 加载失败记录错误，不阻塞其他 worker；
 - worker job 错误返回主线程，不影响其他 worker；
-- 主线程 reload、worker reload、失败保留旧版本；
+- 主线程 reload、worker reload；reload 失败只记录错误，worker 继续处理 job；
+- 每个 worker 的队列独立，`ReloadJob` 能到达每个 worker；
 - 停止顺序：worker join 后再关主 state；
 - asan/tsan 下无跨线程引用。
 
@@ -768,10 +860,12 @@ C++ 只负责把配置转成 `WorkerGroupSpec`。
 
 ```text
 src/cpp/.../lua_module.h/.cpp          LuaModule（IModule，主线程）
+src/cpp/.../lua_runtime.h/.cpp         LuaRuntime（state + loader + bindings）
+src/cpp/.../lua_loader.h/.cpp          LuaLoader（C++ 实现；也可用 Lua 实现）
 src/cpp/.../async_worker_module.h/.cpp AsyncWorkerModule（IModule，worker pool）
 src/cpp/.../binding_profile.h          main/worker/sandbox 绑定集合
 src/cpp/.../worker_group.h             WorkerGroupSpec/队列/路由
-src/lua/framework/loader.lua           文件级 reload
+src/lua/framework/loader.lua           LuaLoader 的 Lua 实现（二选一）
 src/lua/server/<service>/main.lua      主线程 root
 src/lua/server/<service>/worker/<type>/main.lua
 ```
