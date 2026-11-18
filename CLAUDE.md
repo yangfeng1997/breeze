@@ -36,6 +36,7 @@
   `base/container` 是 `FlatHashMap` / `FlatHashSet`（Swiss table）与 `LinkedHashMap` / `LinkedHashSet`（保持插入顺序，可当 LRU），
   **插入可能让迭代器 / 引用失效、元素的移动构造必须 noexcept、`at()` 找不到键就 abort**，见 [docs/基础容器库.md](docs/基础容器库.md)；
   这几个库的 **tsan 同样没在本机跑过**，容器 bench 默认不构建：`cmake --preset release -DBREEZE_BUILD_CONTAINER_BENCH=ON`；
+  `base/lua_pb`（库 `breeze_lua_pb`）是 Lua 侧的 protobuf 编解码：**只支持 proto3 与 Lua 5.5.1**，三层 `wire.h`（varint/zigzag/定长 + 带上界 Reader + 可回填长度 Writer）/ `schema`（自带 wire reader 读 `FileDescriptorSet`，不链 libprotobuf）/ `codec`（Lua table ↔ wire）；**Schema 编译后不可变、可跨线程只读共享，每个 `lua_State` 一个 `Codec`；`Codec` 必须先于它绑定的 `lua_State` 关闭而析构**；热路径只用 raw API，核心无 C++ 异常（`std::expected`，`-fno-exceptions` 下测试通过）；编码用 `lua_next` + per-state 指针哈希 + 位图、按字段号序输出；**描述符走方案 b：构建期 `proto/*.proto` 经 `breeze_proto_descriptor` 产出 `run/proto/*.pb`，运行期由框架读一次交给 `Schema::Load`，库不碰文件系统**；已知限制：uint64 ≥ 2^63 回绕成 `lua_Integer`、repeated 空洞检测是尽力而为（Lua `#` 未定义）、嵌套上限 100（与 protobuf C++ / upb 一致）。绑定层已接上：`OpenPb` 注册 `require("pb")` 的 `pb.encode` / `pb.decode`（Codec 放 userdata、`__gc` 里析构，所以不用宿主排生命周期），**失败抛 Lua 错误**——生产路径请用 C++ API 拿 `std::expected`，别走 Lua 表面；七个用例（wire / schema / noexc / codec / hostile / binding / binding_noexc）在 `-DLUA_USE_APICHECK` 的 Lua 上也全过，**asan / tsan 已在本机 WSL 复核过**（WSL2 Ubuntu 22.04 + PPA 的 g++-14 `-std=c++26`：asan+ubsan 五个用例全干净、tsan 的多线程用例无竞争报告；但**仓库预设（vcpkg + clang）在本机仍跑不了**，因为 WSL 里没有 vcpkg、系统 clang 只有 14）；基准 `bench/lua_pb_bench.cpp`（`-DBREEZE_BUILD_LUA_PB_BENCH=ON`，要用 release 预设），与 starwing lua-protobuf 的并排数字、建表预分配的校准结论、以及 `lua_pushexternalstring` 为什么不做，都在 §21。见 [docs/Lua_pb库设计.md](docs/Lua_pb库设计.md)；
   `base/shm`（仅 Linux）是 Sidecar 同机通道的底座：封印过的 memfd 里两条单向 SPSC 字节环 + eventfd（`ShmChannel` / `RingProducer` / `RingConsumer`），记录 64 字节对齐、环做镜像映射，**对端写的每个字节都当不可信输入**（接手校验必须对"对端还活着"安全，`RingStateValid` 有推导）；唤醒靠睡眠标志加 `seq_cst` 栅栏（Dekker），**测试里不要绑核**（亲和性会被新线程继承，锁步用例会慢到卡死）；**tsan 同样没在本机跑过，ARM 也没跑过**（x86 看不出 release / acquire 写错）；性能只有一版单连接的对比压测（`bench/agent_bench.cpp`，`-DBREEZE_BUILD_AGENT_BENCH=ON`，跑法 `bench/run_agent.sh`；另有 `bench/ring_bench.cpp`（`bench/run_ring.sh`）比共享内存环与进程内队列、`bench/wake_bench.cpp`（`bench/run_wake.sh`）比唤醒机制，结果与局限见设计文档 §10「实测」）；**睡前自旋没有实现**（临时副本里的实验：单条在途往返 23.7 → 0.3 µs，但每个自旋的 IO 线程占满一个核，取舍见设计文档 §10 / §13）；环控制块的 `consumer_stats.empty_wakeups` 统计"读到旧计数、白醒一次"；握手与服务端 / 客户端在 `base/net/shm/`（库 `breeze_net_shm`，UDS 传 fd 的封装 `stream/internal/fd_passing` 在 `breeze_net` 里）：`ShmChannelServer`（Agent，收 `EventLoopGroup&`，回调里只管在预算内搬空 Tx 环，`WokeUp` / `PrepareToSleep` / 让出由库做；全部通道在 accept 所在的一个 loop 上）与 `ShmChannelClient`（App，`Connect` 是阻塞的，只在启动时调）；**保留 / 恢复（App 重启）、Reattach（Agent 重启）、控制消息 `PrepareRestart` / `Bye` 已实现**（UDS 断开进 `Detached`，默认保留 30 秒，遗言照常排空；业务回调里的映射要以 `ShmServerChannel::id()` 为键，不要只用 busid）；**握手时协商传输方式也实现了**（`UdsOnly` / `ShmPreferred` 给不了就退化 / `ShmRequired`，仅 UDS 时那条 UDS 交给 `StreamConnection` 当数据通道，两种传输共用通道名与配额；App 侧开关 `net.agent_shm_enabled`）；`base/net/agent/`（库 `breeze_net_agent`）有信封 `EnvelopeHead`（64 字节，前 48 字节是路由区，相对剩余毫秒）、`AgentRouter`（Agent 的路由转发，**单线程，`io_threads` 必须是 1**）、`AgentServer`、`AgentClient`（非阻塞，共享内存做成 `ShmConnection`，**Agent 掉线连接不关、后台 Reattach**）；`NetModule::AddAgentClient` / `AddAgentServer` / `AddIoServer` / `AddIoClient` 已接入（**`NetModule::Shutdown` 必须在调 `App::Run` 的线程上调**）；控制面（路由表真实来源）、多 loop 的 Agent、`framework/app` 的自检线程还没做；**测试里处理器必须比 EventLoopGroup 活得久**（group 析构还会回调它，asan 看不见、debug 下偶发崩溃）；握手对 App 与 Agent 双方都不信（fd 数量与种类、布局互相核对），**这一层的测试必须也在 asan 下跑**（在回调栈里销毁自己、越界写槽位、析构后残留的任务，release 下测不出来）；设计与验证状态见 [docs/共享内存IPC设计.md](docs/共享内存IPC设计.md) §11 / §12；
   `base/net` 是 Reactor 网络库（仅 Linux）：`Endpoint` / `SharedBuffer` / `Buffer` / `IFrameCodec` 等基础件，
   `EventLoop` / `IConnection` / `ConnectionHandle` / `EventLoopGroup` / `TcpServer` / `UdsServer` / `TcpClient` / `UdsClient`（基类 `StreamServer` / `StreamClient`，含重连）已完整，
@@ -51,6 +52,9 @@
 - `src/*/gen/<类别>/` — 生成代码输出目录，不进版本库；一类生成物一个子目录（现有 `config/`，策划表等以后各占一个）。
   C++ 从 `src/cpp` 起算：`#include "gen/config/common_config.h"`。`python3 scripts/configure.py` 一次生成全部
   并配置 cmake；C++ 构建在 schema 变动时也会自动重生成自己那份
+- `proto/` — IDL 源文件（手写 `.proto`，RPC 服务与消息定义），**只放源，不放生成物**；配置 schema 仍在 `config/schema/`。
+  构建期经 CMake 函数 `breeze_proto_descriptor` 用 protoc 产出 `run/proto/*.pb`（`FileDescriptorSet`，`/run/` 不进版本库），
+  运行期由框架读一次交给 `base/lua_pb`；protoc 按 `-DBREEZE_PROTOC` > PATH 查找，目录为空则不建目标。生成器（`tools/protoc-gen-svcstub`）还没开工
 - `config/schema` — 配置 schema（`*.proto`，自定义 option 在 `options.proto`），配置结构的事实源；
   配置数据本身仍是 YAML：`config/common.yaml`（全量，带本机开发默认值，单独可读）+ `config/env/{dev,test,prod}.yaml`
   （后者覆盖前者；env 文件只能覆盖 schema 里标了 `env_value` 的字段，且要全部写出，`cluster.env` 必须与文件名一致；
@@ -61,12 +65,18 @@
   用法与 schema 格式见 [tools/configgen/CLAUDE.md](tools/configgen/CLAUDE.md)。目前有 `common.proto`
   （cluster / etcd / redis / mongo，另引用 `net.proto` 的 `net` 段：网络库，字段全有生产默认值，段本身非 required）；
   生成器自带样例在 `tools/configgen/testdata/schema/`
-- `docs/` — 设计文档。C++ 侧 actor 与线程模型的设计基线是
-  [docs/Actor与线程模型设计.md](docs/Actor与线程模型设计.md)：做 actor 层前先读它（**设计阶段，没有代码**：两种执行方式（主循环直接执行 / 有状态 actor；无状态并行用 actor 池加 `Offload`，**不设 worker 执行方式**）、`Dispatcher` 加两个执行器、网络消息与 RPC 的配合（IDL 用 gRPC 的 schema 写法、自研生成器出统一接口，消息体用 libprotobuf；调用方只给对象 id，对象类型由 IDL 带出、`Locator` 加注册中心解析位置，actor 与主循环里的对象调用方式一样，主循环里的实体由框架的 `EntityManager` 管理并自动登记；客户端命令与内部 RPC 用 service 级 `audience` 区分）、进程间拓扑；已定与未决项见其 §0 / §19；**设计不受现有半成品代码约束**，沿用 / 改 / 重写见其 §15）。
+- `docs/` — 设计文档。C++ 侧主循环与 RPC 的设计基线是
+  [docs/Actor与线程模型设计.md](docs/Actor与线程模型设计.md)（文件名保留历史路径，内容已重写）：**设计阶段，没有代码**；只有 main loop 直接执行，**不做 Actor / ActorSystem / 进程内多 Shard / 在线迁移**；`Dispatcher` 把网络消息投 main loop，阻塞/计算走 `ThreadPool` + `Offload`；RPC 一律异步（`CallHandle` / `ReplyHandle`），IDL 用 gRPC schema 写法 + 自研生成器 + libprotobuf，客户端命令与内部 RPC 用 service 级 `audience` 区分；main loop 实体由 `EntityManager` 管理并自动登记；扩容靠多进程/微服务。旧的 Actor/Shard 设计在 [docs/Actor与线程模型设计-废弃.md](docs/Actor与线程模型设计-废弃.md)，**仅历史备份，不要参考**。
   C++ 网络库（`base/queue` / `base/net` / `framework/net`）的设计基线是
   [docs/网络库设计.md](docs/网络库设计.md)：动网络库前先读它；
   Sidecar 的同机共享内存通道（`memfd` + 两条 SPSC 环 + `eventfd`；**`base/shm`、握手与传输协商、保留与 Reattach、控制消息、信封与 Agent 路由转发、`AgentClient`、`NetModule` 接入已实现，控制面、多 loop 的 Agent、`framework/app` 的自检线程尚未实现**）见
-  [docs/共享内存IPC设计.md](docs/共享内存IPC设计.md)
+  [docs/共享内存IPC设计.md](docs/共享内存IPC设计.md)；
+  App ↔ Agent 的通道设计（控制面/数据面拆分、`ShmAgentChannel` 主线程零拷贝、`UdsAgentChannel` IO 线程 + `MainLoopInbox`、**握手时确定 transport、不做运行中降级**）见
+  [docs/Agent通道设计.md](docs/Agent通道设计.md)；
+  RPC/IDL 的运行时分层与 C++/Lua 混合 codec（`RpcModule` 管 RPC 语义、`MessageModule` 管消息号/派发、payload 按 service/method 选 C++ protobuf 或 `base/lua_pb`）见
+  [docs/RPC与IDL设计.md](docs/RPC与IDL设计.md)；
+  Lua 侧的 protobuf 编解码库 `base/lua_pb`（自研，**只支持 proto3 与 Lua 5.5.1**；三层 `wire`/`schema`/`codec`；Schema 不可变可跨线程只读共享、每 LuaState 一个 `Codec`；编码遍历 = `lua_next` + per-state 指针哈希 + 位图、按字段号序输出；核心无 C++ 异常；**描述符走方案 b：构建期 `proto/*.proto` → `run/proto/*.pb`，运行期由框架读一次交给 `Schema::Load`，库不碰文件系统**）见
+  [docs/Lua_pb库设计.md](docs/Lua_pb库设计.md)
 - `scripts/` — `configure.py`（生成代码 + 配置 cmake，只用标准库）与 Windows 环境脚本（**目录名拼写如此，勿"修正"**）
 - `build/`、`run/` — 构建产物，不进版本库
 

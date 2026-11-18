@@ -7,6 +7,8 @@
 - **绑定库**：一个线程里的 `lua_State`、`Reference`、类型转换、类绑定、`Result`；
 - **脚本框架**：应用模块生命周期、主线程脚本、worker 线程、任务队列、目录约定、热更策略。
 
+RPC、IDL 生成物、C++/Lua 混合 codec（Lua 侧依赖 protobuf 库）见 [RPC与IDL设计.md](RPC与IDL设计.md)：codec 不在绑定库、也不在脚本框架，属独立库与 RPC 运行时。
+
 ---
 
 ## 1. 目标与边界

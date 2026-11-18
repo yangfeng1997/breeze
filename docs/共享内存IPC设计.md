@@ -3,6 +3,8 @@
 **状态**（2026-11-01）：**已实现并有测试**：`base/shm`（数据结构）、握手 / UDS 传 fd、**握手时协商传输方式（共享内存 / 仅 UDS / 共享内存优先、给不了就退化）**、保留与恢复（App 重启）、Reattach（Agent 重启）、控制消息（`PrepareRestart` / `Bye`）、`ShmChannelServer` / `ShmChannelClient`（阻塞）、**信封与 Agent 的路由转发（`AgentRouter`）**、**App 一侧的非阻塞客户端 `AgentClient`（共享内存也表现成一条 `IConnection`）**、**`NetModule` 的接入（`AddAgentServer` / `AddAgentClient`）与配置（`net.agent_*`）**，见 §11 / §12。**还没有**：`framework/app` 里的自检线程（§6.4）、控制面（路由表的真实来源、Node 的登记）、Agent 之间链路的自动建立、多 loop 的 Agent、`Probe` / `Abort`（§6.6，暂缓）。**性能只有一版单连接的对比压测**（§10「实测」：WSL2、单连接、单 IO 线程）：其余的性能数字仍是目标，不是结果。**tsan 没有在本机跑过**（§12）。
 读之前先看 [网络库设计.md](网络库设计.md)：本通道复用它的 UDS、`EventLoop`、`IConnection` 体系，但**不走** `IConnection`（共享内存里没有字节流）。
 
+App 侧控制面/数据面的通道设计（`AgentControl`、`ShmAgentChannel` 主线程零拷贝、`UdsAgentChannel` IO 线程 + `MainLoopInbox`、**transport 在握手时确定、不做运行中降级**）见 [Agent通道设计.md](Agent通道设计.md)。
+
 ## 0. 结论速查
 
 用户已定的几点（2026-10-31）：

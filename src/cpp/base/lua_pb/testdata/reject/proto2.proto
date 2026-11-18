@@ -1,0 +1,11 @@
+// 只用来验证"没有 proto3 文件时加载失败"（kUnsupportedSyntax）。
+// 本库只支持 proto3：proto2 的 required、group、extension 都不做。
+syntax = "proto2";
+
+package lua_pb_reject;
+
+message Legacy
+{
+    required int32 a = 1;
+    optional string b = 2;
+}

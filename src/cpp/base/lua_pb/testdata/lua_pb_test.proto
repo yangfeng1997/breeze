@@ -1,0 +1,85 @@
+// base/lua_pb 的测试 schema（proto3）。构建期由 CMake 编成 FileDescriptorSet 供测试加载。
+// 覆盖：全部标量类型、嵌套、repeated（packed 与不 packed）、map（标量与消息 value）、
+// oneof、proto3 optional、enum、递归消息、超长字段名（>40 字节，走指针哈希的内容比较回退）。
+syntax = "proto3";
+
+package lua_pb_test;
+
+enum Color
+{
+    COLOR_UNSPECIFIED = 0;
+    COLOR_RED = 1;
+    COLOR_BLUE = 2;
+}
+
+message Inner
+{
+    int32 v = 1;
+    string tag = 2;
+}
+
+message Scalars
+{
+    int32 i32 = 1;
+    int64 i64 = 2;
+    uint32 u32 = 3;
+    uint64 u64 = 4;
+    sint32 s32 = 5;
+    sint64 s64 = 6;
+    fixed32 fx32 = 7;
+    fixed64 fx64 = 8;
+    sfixed32 sfx32 = 9;
+    sfixed64 sfx64 = 10;
+    float fl = 11;
+    double db = 12;
+    bool ok = 13;
+    string name = 14;
+    bytes blob = 15;
+    Color color = 16;
+    string field_with_a_really_long_name_exceeding_forty_bytes = 17;
+}
+
+message Nested
+{
+    Inner inner = 1;
+    repeated Inner inners = 2;
+}
+
+message Repeated
+{
+    repeated int32 nums = 1;
+    repeated string names = 2;
+    repeated Inner items = 3;
+    repeated bool flags = 4;
+}
+
+message Maps
+{
+    map<string, int32> counts = 1;
+    map<int32, Inner> objs = 2;
+    map<int64, string> labels = 3;
+}
+
+message Oneofs
+{
+    oneof choice
+    {
+        int32 a = 1;
+        string b = 2;
+        Inner c = 3;
+    }
+    int32 outside = 4;
+}
+
+message Optionals
+{
+    optional int32 maybe = 1;
+    optional string maybe_str = 2;
+    optional Color maybe_color = 3;
+}
+
+message Deep
+{
+    Inner i = 1;
+    Deep next = 2;
+}

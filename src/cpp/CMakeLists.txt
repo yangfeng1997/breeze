@@ -78,6 +78,7 @@ set(EVENT_DIR base/event)
 set(HASH_DIR base/hash)
 set(TIME_RECORD_DIR base/time_record)
 set(BREEZE_LUA_BINDING_DIR base/lua_binding)
+set(BREEZE_LUA_PB_DIR base/lua_pb)
 set(METRICS_DIR base/metrics)
 set(VARTYPE_DIR base/vartype)
 set(URI_DIR base/uri)
@@ -146,6 +147,79 @@ function(breeze_config_schema target)
     target_include_directories(${target} INTERFACE ${include_root})
   endif()
   target_link_libraries(${target} INTERFACE breeze_config)
+endfunction()
+
+# breeze_proto_descriptor(<target> [PROTO_DIR <dir>] [OUT_DIR <dir>] [NAME <file>] [INCLUDE <dir>...])
+# 把 IDL 源（proto/*.proto）用 protoc 编成 FileDescriptorSet，供 base/lua_pb 启动时加载，
+# 设计见 docs/Lua_pb库设计.md「描述符交付」。默认输入 <仓库根>/proto，输出 <仓库根>/run/proto/descriptor.pb
+# （/run/ 已被 .gitignore 忽略，生成物不进版本库）。
+# protoc 按 -DBREEZE_PROTOC=<路径> > PATH 上的 protoc / protoc.exe 查找；目录里没有 .proto 时不建目标。
+# 目标不进 ALL：由使用方 add_dependencies 挂上去（现在还没有消费者）。
+function(breeze_proto_descriptor target)
+  cmake_parse_arguments(A "" "PROTO_DIR;OUT_DIR;NAME" "INCLUDE" ${ARGN})
+  set(proto_dir ${A_PROTO_DIR})
+  if(NOT proto_dir)
+    set(proto_dir ${CMAKE_SOURCE_DIR}/../../proto)
+  endif()
+  set(out_dir ${A_OUT_DIR})
+  if(NOT out_dir)
+    set(out_dir ${CMAKE_SOURCE_DIR}/../../run/proto)
+  endif()
+  set(out_name ${A_NAME})
+  if(NOT out_name)
+    set(out_name descriptor.pb)
+  endif()
+
+  file(GLOB schemas CONFIGURE_DEPENDS ${proto_dir}/*.proto)
+  if(NOT schemas)
+    message(STATUS "breeze_proto_descriptor: ${proto_dir} 下没有 .proto，跳过 ${target}")
+    return()
+  endif()
+
+  if(BREEZE_PROTOC)
+    set(protoc_exe ${BREEZE_PROTOC})
+  else()
+    find_program(protoc_exe NAMES protoc protoc.exe)
+  endif()
+  if(NOT protoc_exe)
+    message(STATUS "breeze_proto_descriptor: 找不到 protoc（-DBREEZE_PROTOC=<路径> 可指定），跳过 ${target}")
+    return()
+  endif()
+
+  # proto3 optional 从 protoc 3.15 起默认允许；更老的版本要显式打开（Ubuntu 22.04 的 apt protoc 是 3.12）。
+  execute_process(COMMAND ${protoc_exe} --version OUTPUT_VARIABLE _protoc_version
+                  OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  string(REGEX MATCH "([0-9]+)\.([0-9]+)" _protoc_match "${_protoc_version}")
+  set(protoc_optional_flag)
+  if(CMAKE_MATCH_1 AND (CMAKE_MATCH_1 LESS 3 OR (CMAKE_MATCH_1 EQUAL 3 AND CMAKE_MATCH_2 LESS 15)))
+    set(protoc_optional_flag --experimental_allow_proto3_optional)
+    message(STATUS "breeze_proto_descriptor: protoc ${_protoc_version} 较老，加 ${protoc_optional_flag}")
+  endif()
+
+  set(out_file ${out_dir}/${out_name})
+  file(MAKE_DIRECTORY ${out_dir})
+  # 一律用相对 proto_dir 的路径，并在 proto_dir 下执行 protoc：
+  # Windows 的 protoc 用 ANSI 解析 argv，绝对路径里的非 ASCII（本仓库在“源代码”目录下）会变成乱码。
+  # quanta 的 proto/build.bat 也是靠"切到 proto 目录 + 相对文件名"规避同一个问题。
+  file(RELATIVE_PATH rel_out ${proto_dir} ${out_file})
+  set(inc_args -I .)
+  foreach(inc ${A_INCLUDE})
+    file(RELATIVE_PATH rel_inc ${proto_dir} ${inc})
+    list(APPEND inc_args -I ${rel_inc})
+  endforeach()
+  set(rel_srcs)
+  foreach(s ${schemas})
+    file(RELATIVE_PATH rel_src ${proto_dir} ${s})
+    list(APPEND rel_srcs ${rel_src})
+  endforeach()
+  add_custom_command(OUTPUT ${out_file}
+    COMMAND ${protoc_exe} ${protoc_optional_flag} --descriptor_set_out=${rel_out} --include_imports
+            ${inc_args} ${rel_srcs}
+    DEPENDS ${schemas}
+    WORKING_DIRECTORY ${proto_dir}
+    COMMENT "protoc: ${proto_dir} -> ${out_file}"
+    VERBATIM)
+  add_custom_target(${target} DEPENDS ${out_file})
 endfunction()
 
 # yaml-cpp 同理只 PRIVATE：config.h 不含它。
@@ -271,6 +345,86 @@ add_library(breeze_lua_binding_ext
   ${BREEZE_LUA_BINDING_DIR}/ext/os_ext.cpp)
 target_link_libraries(breeze_lua_binding_ext PUBLIC breeze_lua_binding)
 target_compile_options(breeze_lua_binding_ext PRIVATE -Wall -Wextra)
+
+# Lua 侧的 protobuf 编解码（base/lua_pb）：只支持 proto3 与 Lua 5.5.1，编解码核心不依赖 Lua，
+# 绑定（codec / require("pb")）在 P3 接上。设计见 docs/Lua_pb库设计.md。
+# 描述符由构建期 protoc 产出（breeze_proto_descriptor），库本身不读文件系统。
+add_library(breeze_lua_pb ${BREEZE_LUA_PB_DIR}/schema.cpp ${BREEZE_LUA_PB_DIR}/codec.cpp ${BREEZE_LUA_PB_DIR}/lua_pb.cpp)
+target_link_libraries(breeze_lua_pb PUBLIC breeze_lua_binding)
+target_compile_options(breeze_lua_pb PRIVATE -Wall -Wextra)
+
+# 测试用的三份描述符：主 schema、第二个文件（测拼接与去重）、只有 proto2 的（测拒绝）。
+set(LUA_PB_TEST_PB_DIR ${CMAKE_CURRENT_BINARY_DIR}/lua_pb_proto)
+breeze_proto_descriptor(lua_pb_test_descriptor
+  PROTO_DIR ${BREEZE_LUA_PB_DIR}/testdata OUT_DIR ${LUA_PB_TEST_PB_DIR} NAME lua_pb_test.pb)
+breeze_proto_descriptor(lua_pb_extra_descriptor
+  PROTO_DIR ${BREEZE_LUA_PB_DIR}/testdata/extra OUT_DIR ${LUA_PB_TEST_PB_DIR} NAME lua_pb_extra.pb)
+breeze_proto_descriptor(lua_pb_reject_descriptor
+  PROTO_DIR ${BREEZE_LUA_PB_DIR}/testdata/reject OUT_DIR ${LUA_PB_TEST_PB_DIR} NAME lua_pb_reject.pb)
+
+add_executable(lua_pb_wire_test ${BREEZE_LUA_PB_DIR}/lua_pb_wire_test.cpp)
+target_link_libraries(lua_pb_wire_test PRIVATE breeze_lua_pb)
+target_compile_options(lua_pb_wire_test PRIVATE -Wall -Wextra)
+add_test(NAME lua_pb_wire_test COMMAND lua_pb_wire_test)
+
+# 没有 protoc 时不建描述符目标，schema 测试也一并跳过（wire 测试不受影响）。
+if(TARGET lua_pb_test_descriptor)
+  add_executable(lua_pb_schema_test ${BREEZE_LUA_PB_DIR}/lua_pb_schema_test.cpp)
+  target_link_libraries(lua_pb_schema_test PRIVATE breeze_lua_pb)
+  target_compile_options(lua_pb_schema_test PRIVATE -Wall -Wextra)
+  target_compile_definitions(lua_pb_schema_test PRIVATE
+    LUA_PB_TEST_DESCRIPTOR="${LUA_PB_TEST_PB_DIR}/lua_pb_test.pb"
+    LUA_PB_TEST_EXTRA_DESCRIPTOR="${LUA_PB_TEST_PB_DIR}/lua_pb_extra.pb"
+    LUA_PB_TEST_REJECT_DESCRIPTOR="${LUA_PB_TEST_PB_DIR}/lua_pb_reject.pb")
+  add_dependencies(lua_pb_schema_test lua_pb_test_descriptor lua_pb_extra_descriptor lua_pb_reject_descriptor)
+  add_test(NAME lua_pb_schema_test COMMAND lua_pb_schema_test)
+
+  # 同一份源码在 -fno-exceptions 下再编一遍：守住"核心不依赖异常"。
+  add_executable(lua_pb_noexc_test ${BREEZE_LUA_PB_DIR}/lua_pb_schema_test.cpp)
+  target_link_libraries(lua_pb_noexc_test PRIVATE breeze_lua_pb)
+  target_compile_options(lua_pb_noexc_test PRIVATE -Wall -Wextra -fno-exceptions)
+  target_compile_definitions(lua_pb_noexc_test PRIVATE
+    LUA_PB_TEST_DESCRIPTOR="${LUA_PB_TEST_PB_DIR}/lua_pb_test.pb"
+    LUA_PB_TEST_EXTRA_DESCRIPTOR="${LUA_PB_TEST_PB_DIR}/lua_pb_extra.pb"
+    LUA_PB_TEST_REJECT_DESCRIPTOR="${LUA_PB_TEST_PB_DIR}/lua_pb_reject.pb")
+  add_dependencies(lua_pb_noexc_test lua_pb_test_descriptor lua_pb_extra_descriptor lua_pb_reject_descriptor)
+  add_test(NAME lua_pb_noexc_test COMMAND lua_pb_noexc_test)
+
+  # codec：真的起 lua_State（Lua 由 breeze_lua_binding 带进来）
+  foreach(_t lua_pb_codec_test lua_pb_hostile_test)
+    add_executable(${_t} ${BREEZE_LUA_PB_DIR}/${_t}.cpp)
+    target_link_libraries(${_t} PRIVATE breeze_lua_pb)
+    target_compile_options(${_t} PRIVATE -Wall -Wextra)
+    target_compile_definitions(${_t} PRIVATE
+      LUA_PB_TEST_DESCRIPTOR="${LUA_PB_TEST_PB_DIR}/lua_pb_test.pb")
+    add_dependencies(${_t} lua_pb_test_descriptor)
+    add_test(NAME ${_t} COMMAND ${_t})
+  endforeach()
+
+  # 绑定层：require("pb") + pb.encode / pb.decode。
+  # 测试里的多线程冒烟（各线程自己的 lua_State，共享 Schema）默认开启；tsan 预设下会顺带查数据竞争。
+  function(lua_pb_configure_binding_test t)
+    target_link_libraries(${t} PRIVATE breeze_lua_pb Threads::Threads)
+    target_compile_definitions(${t} PRIVATE LUA_PB_TEST_ENABLE_THREADS)
+  endfunction()
+
+  add_executable(lua_pb_binding_test ${BREEZE_LUA_PB_DIR}/lua_pb_binding_test.cpp)
+  lua_pb_configure_binding_test(lua_pb_binding_test)
+  target_compile_options(lua_pb_binding_test PRIVATE -Wall -Wextra)
+  target_compile_definitions(lua_pb_binding_test PRIVATE
+    LUA_PB_TEST_DESCRIPTOR="${LUA_PB_TEST_PB_DIR}/lua_pb_test.pb")
+  add_dependencies(lua_pb_binding_test lua_pb_test_descriptor)
+  add_test(NAME lua_pb_binding_test COMMAND lua_pb_binding_test)
+
+  # 同一份绑定测试在 -fno-exceptions 下再编一遍：绑定层同样不许依赖异常。
+  add_executable(lua_pb_binding_noexc_test ${BREEZE_LUA_PB_DIR}/lua_pb_binding_test.cpp)
+  lua_pb_configure_binding_test(lua_pb_binding_noexc_test)
+  target_compile_options(lua_pb_binding_noexc_test PRIVATE -Wall -Wextra -fno-exceptions)
+  target_compile_definitions(lua_pb_binding_noexc_test PRIVATE
+    LUA_PB_TEST_DESCRIPTOR="${LUA_PB_TEST_PB_DIR}/lua_pb_test.pb")
+  add_dependencies(lua_pb_binding_noexc_test lua_pb_test_descriptor)
+  add_test(NAME lua_pb_binding_noexc_test COMMAND lua_pb_binding_noexc_test)
+endif()
 
 # 测试与 breeze 其余库一致：本地 CHECK + add_test，不引测试框架。
 foreach(_t lua_core_test lua_check_test lua_class_test lua_sandbox_test
@@ -769,6 +923,18 @@ if(BREEZE_BUILD_LUA_BINDING_BENCH)
   add_executable(lua_binding_bench bench/lua_binding_bench.cpp)
   target_link_libraries(lua_binding_bench PRIVATE breeze_lua_binding breeze_lua_binding_ext)
   target_compile_options(lua_binding_bench PRIVATE -Wall -Wextra)
+endif()
+
+# lua_pb 基准：编解码三个量级（标量 / 嵌套+repeated / 16KB bytes）。
+# 要用 lua_pb 那一段生成出来的测试描述符，所以描述符目标不存在时不建（没 protoc 就没有）。
+option(BREEZE_BUILD_LUA_PB_BENCH "构建 breeze::lua_pb 基准（需要 protoc 生成测试描述符）" OFF)
+if(BREEZE_BUILD_LUA_PB_BENCH AND TARGET lua_pb_test_descriptor)
+  add_executable(lua_pb_bench bench/lua_pb_bench.cpp)
+  target_link_libraries(lua_pb_bench PRIVATE breeze_lua_pb)
+  target_compile_options(lua_pb_bench PRIVATE -Wall -Wextra)
+  target_compile_definitions(lua_pb_bench PRIVATE
+    LUA_PB_BENCH_DESCRIPTOR="${LUA_PB_TEST_PB_DIR}/lua_pb_test.pb")
+  add_dependencies(lua_pb_bench lua_pb_test_descriptor)
 endif()
 
 if(BREEZE_BUILD_CONTAINER_BENCH AND BREEZE_BUILD_NET)
