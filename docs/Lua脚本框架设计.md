@@ -72,11 +72,12 @@ App / Service
 
 ### 2.2 `LuaModule`、`LuaRuntime`、`LuaLoader` 的分工
 
-| 类型 | 层级 | 职责 |
-|---|---|---|
-| `LuaModule` | 应用模块（`IModule`） | 主线程生命周期的 `Init/Start/Stop/Shutdown`，持有主线程 `LuaRuntime` |
+
+| 类型         | 层级                     | 职责                                                                                    |
+| -------------- | -------------------------- | ----------------------------------------------------------------------------------------- |
+| `LuaModule`  | 应用模块（`IModule`）    | 主线程生命周期的 `Init/Start/Stop/Shutdown`，持有主线程 `LuaRuntime`                    |
 | `LuaRuntime` | 普通对象（非 `IModule`） | 一个线程里的 Lua 运行环境：`LuaState` + `LuaLoader` + bindings + Start/Stop/Reload/Call |
-| `LuaLoader` | 普通对象（非 `IModule`） | 该 state 的模块加载/缓存/依赖/热更 |
+| `LuaLoader`  | 普通对象（非 `IModule`） | 该 state 的模块加载/缓存/热更                                                          |
 
 `LuaModule` 是应用模块，具有进程级生命周期和单例语义；worker 线程需要的是“一个线程里的 Lua 运行时”，不是新的应用模块。因此：
 
@@ -651,7 +652,7 @@ struct BindingProfile {
 
 - `LuaState` / `CallGlobal` / `LuaFunction` 由绑定库提供；
 - `LuaRuntime` 持有一个 state + 一个 loader，暴露 `Start/Stop/Reload/Call`；
-- mtime、依赖图、安全点、实例迁移由 `LuaLoader` 提供；
+- mtime、安全点、实例迁移由 `LuaLoader` 提供；
 - `LuaRuntime::Reload()` 只是把调用转给它的 `LuaLoader`。
 
 > 命名说明：本文的 `LuaLoader` 是**每个 `lua_State` 一个的模块加载/缓存/热更器**，不创建/拥有 state，也不提供 `Call` / `GetGlobal`；它和 nfshmx 的 `NFILuaLoader`（LuaContext + load/call 封装）不是同一个东西。`NFILuaLoader` 那一层对应本文的 `LuaRuntime`（state + load/call + bindings）。
@@ -668,13 +669,23 @@ struct BindingProfile {
 
 ```text
 LuaLoader
-  ├─ 记录 name -> { path, mtime, value, deps }
+  ├─ 记录 name -> { path, mtime, value }
   ├─ import(name) / require 接管
   ├─ 扫描 mtime 变化
-  ├─ 依赖图 + 拓扑顺序
-  ├─ 按顺序 load/execute
-  └─ 失败记录错误，不中断 worker 循环
+  ├─ 预加载所有变化文件（loadfile，抓语法错误）
+  ├─ 逐个执行（pcall，抓运行时错误）
+  ├─ 失败文件不更新 mtime；记录错误，继续处理其他文件
+  └─ 结束后通知 __reload / on_reload
 ```
+
+**明确不做**：
+
+- 不建依赖图，不做拓扑排序；
+- 不做“全部成功再提交”的原子切换；
+- 不做 reload 失败回滚；
+- 不暂停 worker group、不等 in-flight、不做 barrier。
+
+理由：Lua 模块执行有副作用（注册全局、改类、创建对象、启动定时器），真正的原子/回滚做不到；nfshmx/quanta 也都是逐文件 reload，失败记录后继续。v1 只做“预加载抓语法错误 + 逐文件执行”，不做更重的保证。
 
 ### 8.4 安全点
 
@@ -707,12 +718,96 @@ tick:
 - 有状态 worker 需要 `__reload` 或重启 worker；
 - 大版本/协议变更：停 group → 重启 worker/进程，而不是在线逐个迁移。
 
-### 8.7 C++ 引用
+### 8.7 失败语义
+
+单个模块失败分两类：
+
+**语法错误 / loadfile 失败**
+
+- 在“预加载所有变化文件”阶段发现；
+- 本次 reload 中止，不执行任何变化文件；
+- 旧代码继续运行；
+- 记录文件、错误、行号。
+
+**运行时错误**
+
+- 该文件可能已经执行了一部分，无法回滚；
+- 记录错误，不更新该文件的 mtime；
+- 继续处理其他变化文件（和 nfshmx/quanta 一致）；
+- 进程本身不会崩，前提是执行走 `lua_pcall` / `Result`。
+
+**不会崩进程的前提**
+
+- `LuaLoader` 执行模块必须用 `luaL_loadfilex` + `lua_pcall`（或 Lua 侧 `loadfile` + `pcall`）；
+- **禁止**用 `lua_call` / `CallUnprotected` 执行模块；
+- OOM 等无保护 longjmp 仍会进 panic → abort，这是按内存错误致命处理。
+
+单文件失败后进程会处于“部分新、部分旧”的混合状态，这是文件级 reload 的固有代价；关键模块失败时告警，必要时低峰重启进程。
+
+### 8.8 C++ 引用
 
 - 主线程 C++ 缓存的 `LuaFunction` 不会自动更新；
 - 热更后重新 `GetFunction`，或入口改成按名字调用；
 - worker 的 `LuaFunction` 只存在于 worker state，不跨线程；
 - 热更不影响 C++ 类绑定/布局；C++ 变更走重启。
+
+### 8.9 控制面、版本与结果（v1）
+
+#### 触发
+
+- **主入口：控制面命令**（GM / RPC / HTTP），带版本号；
+- **可选：`SIGUSR1`**，只设置一个原子标志，由主线程在安全点处理；
+- 不在信号 handler 里调 Lua；
+- 不做文件 watcher；
+- 同一时间只允许一个 reload，重复请求合并/忽略。
+
+#### 文件完整性
+
+- 部署侧必须保证文件完整后再发 reload 命令；
+- 推荐写临时文件 + 原子 `rename`，或切版本目录 + 版本标记；
+- reload 命令可带版本/哈希；进程可校验，不匹配则拒绝。
+
+#### root 不热更
+
+- `main.lua` / worker `main.lua` 由 `LuaRuntime::Start()` 加载，不由 `LuaLoader` 跟踪；
+- root 保持薄，只做 require/入口定义；
+- root 变化 → 重启进程；
+- 只 reload root 引用的业务模块。
+
+#### ReloadReport
+
+```text
+ReloadReport {
+  version;
+  state;          // main / worker-group/worker
+  changed_files;
+  failed_files;   // 文件 + error
+  duration_ms;
+}
+```
+
+- 主线程和每个 worker 各产生一份；
+- worker 通过完成队列回主线程；
+- 主线程汇总日志/指标；
+- 不做自动回滚，失败靠告警 + 修文件/重启。
+
+#### 不直接引入 nfshmx 的 Hotfix/hotfix.lua
+
+v1 **不直接复制/引入**这个库：
+
+- 源文件没有明确许可证，只有作者标注；
+- 它面向 Lua 5.2/5.3 编写，未在 Lua 5.5 验证；
+- 它会深度遍历 `_G`、`debug.getregistry()`、函数 upvalue 和 metatable，和 C++ userdata/类绑定混用风险高；
+- 需要 `debug` 库，沙箱/worker 不一定开；
+- 它解决的是“函数/表原地 patch”，和我们的 `LuaLoader` 文件级 reload 是两套模型。
+
+如果以后确实需要实例迁移，优先：
+
+1. 设计我们自己的、范围受限的 LuaHotfix（只 patch Lua 表/函数，不碰 C++ metatable）；
+2. 或建立类系统 `__reload` 契约；
+3. 类结构变化仍然走重启。
+
+**v1 范围**：只做文件级 reload；函数级 hotfix、`__reload` 实例迁移都留到 Lua 业务层真正需要时再定。热更只影响框架层的 `LuaRuntime/LuaLoader`，不改 `base/lua_binding`，也不影响 C++ 业务对象/类绑定。
 
 ---
 
@@ -829,8 +924,14 @@ C++ 只负责把配置转成 `WorkerGroupSpec`。
 - 队列满时的背压/拒绝；
 - worker 加载失败记录错误，不阻塞其他 worker；
 - worker job 错误返回主线程，不影响其他 worker；
-- 主线程 reload、worker reload；reload 失败只记录错误，worker 继续处理 job；
+- 主线程 reload、worker reload；
+- 语法错误在预加载阶段中止，不执行任何变化文件；
+- 单文件运行时错误不崩进程，失败文件 mtime 不更新，其他文件继续处理；
+- `LuaLoader` 执行模块只走 pcall/Result，不使用 `CallUnprotected`；
 - 每个 worker 的队列独立，`ReloadJob` 能到达每个 worker；
+- root 不参与 reload；root 变化走重启；
+- reload 命令单飞：重复请求合并/忽略；
+- 主线程/worker 各自产生 `ReloadReport`，worker 结果能回主线程；
 - 停止顺序：worker join 后再关主 state；
 - asan/tsan 下无跨线程引用。
 
@@ -841,6 +942,11 @@ C++ 只负责把配置转成 `WorkerGroupSpec`。
 ### 14.1 明确不做
 
 - **单进程多 Shard**（明确架构决策，见 §2.3；扩容靠多进程/多服务实例）；
+- **热更依赖图 / 拓扑排序**（见 §8.3；nfshmx/quanta 也不做）；
+- **热更原子提交**（见 §8.3；Lua 执行有副作用，做不到真正原子）；
+- **热更失败回滚**（见 §8.3；靠修文件/重启进程，不做进程内 undo）；
+- **暂停 worker group / 等 in-flight / cross-worker barrier**（见 §8.6；reload 只作为每个 worker 队列里的控制任务）；
+- **直接引入 nfshmx 的 `Hotfix/hotfix.lua`**（见 §8.9；许可证/ Lua 5.5 / 深度遍历风险；需要时另做受限实现）；
 - C++ 原生热更；
 - worker 动态扩缩容（先固定线程数）；
 - 绑定库内的模块加载/热更；
@@ -852,7 +958,8 @@ C++ 只负责把配置转成 `WorkerGroupSpec`。
 - per-worker 脚本/env（quanta 命名 worker 风格）；
 - 更细的 binding profile/权限；
 - worker 任务优先级/隔离；
-- loader 的依赖图与实例迁移完善。
+- loader 的实例迁移完善（不做依赖图）；
+- 受限 LuaHotfix（snax 风格函数 patch；按 Lua 业务需求再定，v1 不做）。
 
 ---
 
