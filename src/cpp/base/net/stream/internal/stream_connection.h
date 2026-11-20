@@ -38,6 +38,7 @@
 #include "base/net/loop/connection_table.h"
 #include "base/net/socket/unique_fd.h"
 #include "base/net/stream/internal/handshake_observer_interface.h"
+#include "base/net/stream/internal/lazy_queue.h"
 #include "base/net/stream/stream_layer_interface.h"
 
 namespace breeze
@@ -206,7 +207,9 @@ protected:
     bool idle_registered_ = false;    // 在 EventLoop 的空闲检测里登记过
     bool notified_connected_ = false; // 回调过 OnConnected 才会回调 OnClosed
     Buffer in_;
-    std::deque<Pending> out_;
+    // 发送队列：惰性创建、排空即释放。几乎所有连接的队列永远是空的，而 libstdc++ 的空 std::deque 一构造就是 2 次 new、
+    // 576 字节，占每连接约 62% 的内存；现在空队列只占一个指针。empty() 只读这个指针。
+    LazyQueue<Pending> out_;
 
     PeerInfo peer_;
     const ConnectionHandle handle_;
