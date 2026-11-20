@@ -336,3 +336,67 @@ protoc 版本判断正确触发（日志里能看到"protoc libprotoc 3.12.4 较
 原因是 starwing 走 Lua 表逐字段遍历，MinGW 下 Lua 的字符串/表操作慢得多，差距被放大；
 **decode 两侧一致：Linux 上我们快 1.5–2×**（small 2.1×、medium 1.5×、large 2.0×）。
 所以对外只能说"decode 稳定快，encode 取决于平台与负载"，不能说"encode 全面快 38×"。
+
+### 21.2 与 quanta `luapb`、nfshmx 的对比（2026-11-18，Linux / gcc-14 / `-O2`）
+
+**与 quanta `luapb`：真正的同类对比。** 两边都是"Lua 表 ↔ wire"的 C++ 编解码器。
+把 `extend/luapb` 用 `-std=c++20` 编进同一个进程（**C++23+ 编不过**：`byteswap` 与 `std::byteswap` 二义），
+注册成 `quanta_pb`，与我们在同一 `lua_State`、同一描述符、同一批表上测：
+
+| 负载 | 路径 | encode (ns) | decode (ns) | 交叉校验 |
+|---|---|---|---|---|
+| small 41B | 本库 C++ / 本库 Lua / starwing / **quanta** | 210 / 291 / 277 / **214** | 369 / 446 / 799 / **533** | 四者都 PASS |
+| medium 697B | 本库 C++ / 本库 Lua / starwing / **quanta** | 4277 / 4511 / 4106 / ~~3344~~ | 6948 / 7073 / 10809 / ~~6213~~ | **quanta FAIL** |
+| large 16KB | 本库 C++ / 本库 Lua / starwing / **quanta** | 145 / 886 / 1565 / **821** | 987 / 1659 / 2029 / **1685** | 四者都 PASS |
+
+**quanta 的 medium 数字是废的，而且原因是正确性缺陷**（交叉校验：用它的 encode 产出、交本库 decode）：
+它的编码结果是 793 字节（我们与 starwing 都是 697 字节），`flags` 只剩 2 个元素（`[2]` 从 `false` 变 `true`）；
+反方向（本库 encode → 它 decode）`nums` 与 `flags` **整段为 nil**——两个 packed repeated 字段全丢。
+即 packed repeated 的编解码都有 bug（此前只是"疑似"，现在有复现）。
+
+**能比的部分的结论**：small 上它 encode 略快（214 vs 我们 Lua 表面 291）、我们 decode 略快（446 vs 533）；
+large 上两边基本持平（enc 821 vs 886、dec 1685 vs 1659）。也就是说**纯速度互有胜负，差距都在 30% 以内**，
+而它为此付出的是：packed repeated 有 bug、C++23+ 编不过、内部用 C++ 异常、无嵌套深度上限、oneof 上限 16 且不越界检查、
+uint64 静默回绕、每条消息堆分配 `unordered_set` 做默认值填充。我们的取舍是"encode 略慢一点，换正确性 + 确定性输出 + 严格校验"。
+
+**与 nfshmx：框架层不给 codec，脚本层自带一套（用的是 starwing 的 C 模块）。**
+
+先纠正一个容易搞错的地方：**nfshmx 的 Lua 侧是有 protobuf 编解码的，但不在框架里**。
+C++ 框架只把**信封 + 裸字节**交给 Lua（`GetMsgId` / `GetData` / `GetSize` / `GetParam1,2` / `ToString`），
+编解码由脚本层的 `Install/LuaScript/<项目>/LuaNFrame/` 完成：`LuaProto.lua` 里 `local pb = require "pb"`，
+连带 `pb_io` / `pb_buffer` / `pb_slice` / `pb_conv` / `protoc`——**`pb` 就是 starwing lua-protobuf 的 C 模块**；
+`libprotobuf/*.lua`（protobuf/encoder/decoder/wire_format…）是纯 Lua 的"消息类"封装层，叠在 `pb` 之上。
+
+数据流（两个方向都是字节过框架、编解码在 Lua）：
+
+- **Lua 发消息/RPC**：`local req = Class.New()`（无参 → `pb.defaults`）→ `req:SerializeToString()` → `LuaNFrame.Encode` → `pb.encode` 得到字节 →
+  调 C++ 接口，签名收的正是字节：`SendMsgToGameServer(eType, dstId, msgId, xData, param1, param2)` / `SendTransToGameServer` /
+  `SendMsgByLinkId(linkId, msgId, dataString|table, …)`；RPC 走 `CPPNFrame:GetRpcService(…, request:SerializeToString(), …)` → 拿回字节 → `respone:ParseFromString(bytes)`。
+- **RPC 到达 Lua handler**：C++ `NFCLuaScriptModule::OnHandleRpcService` → `TryRunGlobalScriptFunc("LuaNFrame.DispatchRpcMessage", luaFunc, …, reqType, request, rspType, respone)`；
+  Lua 侧 `reqMsg = protobuf_class[reqType].New(request)`（→ `pb.decode` → `setmetatable(data, cls)`）、`rspMsg = Defaults(rspType).New()`，
+  然后**直接调业务 handler** `luaFunc(reqMsg, rspMsg)`；响应 `Encode(rspType, rspMsg)` → `pb.encode`。
+- **服务间普通消息**：`DispatchServerMessage(luaFunc, strLuaFunc, msgId, packet, param1, param2)` → `luaFunc(msgId, packet, param1, param2)`，
+  handler 拿到的是**信封**，要自己 `LuaNFrame.Decode(name, packet:GetData())` 或 `Class.New(packet)`。
+
+**所以性能上可以直接对齐**：nfshmx 每消息的 Lua 侧成本 ≈ starwing 的 `pb.decode`/`pb.encode`（本机实测 small 799 / medium 10809 / large 2029 ns 解码）
+**再加**它的类封装开销——`setmetatable` 成类实例、`ParseFromString` 那条路径还多一次 `pairs(data)` 逐字段拷贝、
+`LuaNFrame.Defaults()` 里一次 `pb.fields` 逐字段 Lua 循环、以及（Debug 下）`serpent.block(data)` 打 trace；
+字段访问是"表 + 一次元表回退"。我们的对应数字是 402 / 6898 / 1011 ns，且产物就是普通表、没有封装层。
+**结论：同一件事上我们比 nfshmx 的 Lua 侧快，差距主要来自"少一层类封装 + 少一次默认值 Lua 循环 + 无水印式 trace"，而底层 codec 是同一档（它用 starwing，我们用自研）。**
+
+**一个读代码的疑点（未实测）**：`DispatchRpcMessage` 里写响应用的是 `respone = data`——这是对**局部参数**赋值，
+不会写回 C++ 的 `std::string& respone`；同一文件其它地方用的是 `respone:ParseFromString(responeData)`（方法调用才写穿）。
+这条响应路径看起来回不去，建议他们自己核对。
+
+同机量的 libprotobuf C++ 基线（同一份 schema、等价消息）：
+
+| 负载 | 序列化 | 解析（新对象） | 解析（复用对象） |
+|---|---|---|---|
+| small 41B | 31 ns | 82 ns | 57 ns |
+| medium 697B | 555 ns | 2126 ns | 935 ns |
+| large 16KB | 130 ns | 136 ns | 92 ns |
+
+对比我们的 decode（建 Lua 表）：369 / 6948 / 987 ns。**libprotobuf 的纯解析比我们快 3–7×，但它产出的是 C++ 对象，不是 Lua 表**——
+两者不是同一个交付物。谁更划算取决于业务形态：只转发字节、或 Lua 里只读一两个字段 → nfshmx 那种"C++ 解析 + 传字节/绑定"更省；
+要在 Lua 里反复遍历整棵树 → 我们一次建表、之后全是普通表索引（零跨界）。**这一条是推理，不是实测**：本机没有跑起来的 nfshmx 服务，
+无法量它 Lua 侧逐字段访问（LuaIntf 绑定）的真实开销。
