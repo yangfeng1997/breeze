@@ -12,7 +12,7 @@ LengthPrefixCodec::LengthPrefixCodec(std::size_t max_frame)
     assert(max_frame <= std::numeric_limits<std::uint32_t>::max() && "max_frame 超过 u32 能表示的长度");
 }
 
-DecodeResult LengthPrefixCodec::Decode(std::span<const std::byte> data, FrameSink sink, std::size_t& used)
+DecodeResult LengthPrefixCodec::Decode(std::span<std::byte> data, FrameSink sink, std::size_t& used)
 {
     used = 0;
     if (data.size() < kHeaderSize)

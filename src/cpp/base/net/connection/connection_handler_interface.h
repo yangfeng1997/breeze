@@ -22,8 +22,9 @@ enum class CloseReason : std::uint8_t
     ProtocolError, // 解码失败 / 帧超长
     SlowConsumer,  // 发送积压超过 HighWaterMark
     IoError,       // 读写出错，errno 见 OnClosed 的 sys_errno
+    TlsError,      // 握手完成之后的 TLS 错误（record 解密失败等）；握手期失败不进这里，见 NetStats::handshake_failed
 };
-inline constexpr std::size_t kCloseReasonCount = static_cast<std::size_t>(CloseReason::IoError) + 1;
+inline constexpr std::size_t kCloseReasonCount = static_cast<std::size_t>(CloseReason::TlsError) + 1;
 
 // 日志用。
 constexpr const char* ToString(CloseReason r) noexcept
@@ -42,6 +43,8 @@ constexpr const char* ToString(CloseReason r) noexcept
             return "SlowConsumer";
         case CloseReason::IoError:
             return "IoError";
+        case CloseReason::TlsError:
+            return "TlsError";
     }
     return "?";
 }

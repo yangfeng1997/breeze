@@ -28,6 +28,7 @@
 #include "base/net/endpoint/endpoint.h"
 #include "base/net/loop/event_loop_group.h"
 #include "base/net/stream/reconnect_policy.h"
+#include "base/net/stream/stream_layer_interface.h"
 #include "base/net/tcp/tcp_options.h"
 
 namespace breeze
@@ -35,8 +36,12 @@ namespace breeze
 
 struct StreamClientOptions
 {
-    ConnectionOptions connection; // 水位、idle_timeout
+    ConnectionOptions connection; // 水位、idle_timeout、handshake_timeout
     TcpOptions tcp;               // keepalive 等：只对 TCP 端点生效，UDS 端点不看它
+    // 字节流层（TLS）：空 = 明文。只对 TCP 端点有意义，UDS 端点配了它 Start() 返回 EPROTONOSUPPORT。
+    // 握手失败（证书不对、握手超时……）按连接失败处理：退避重试并触发 on_connect_failed，errno 是固定映射的
+    // （ETIMEDOUT / EPROTO / ECONNRESET ……），不是 TLS 库的错误码。
+    std::shared_ptr<const IStreamLayerFactory> tls;
     // 非阻塞 connect 的超时，到点按失败（ETIMEDOUT）重试；否则连到黑洞地址要等内核 SYN 重试约 2 分钟。
     std::chrono::milliseconds connect_timeout{5000};
     ConnectFailedCallback on_connect_failed; // 空 = 不通知（仍会记日志）

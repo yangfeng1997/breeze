@@ -73,6 +73,8 @@ int StreamClient::Start()
     Impl& m = *impl_;
     if (endpoint_.kind() == Endpoint::Kind::Udp)
         return EPROTONOSUPPORT; // 数据报端点要数据报的客户端（rudp），字节流的不收
+    if (m.options.tls && endpoint_.kind() != Endpoint::Kind::Tcp)
+        return EPROTONOSUPPORT; // 层（TLS）只用于 TCP；UDS 上配了它不能静默忽略（options 第一次 Start 才移进 Connector）
     if (!m.group.running())
     {
         // 回调里 Start()（文档允许）可能恰好撞上停机：返回 ESHUTDOWN，不是编程错误。

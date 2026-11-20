@@ -58,6 +58,7 @@ Connector::Connector(EventLoop& loop,
     , endpoint_(std::move(endpoint))
     , conn_options_(options.connection)
     , tcp_options_(options.tcp)
+    , tls_(std::move(options.tls))
     , connect_timeout_(options.connect_timeout)
     , on_connect_failed_(std::move(options.on_connect_failed))
     , user_handler_(handler)
@@ -127,6 +128,17 @@ void Connector::Stop()
         if (IConnection* c = loop_.table().Current(h.slot(), h.generation()))
             c->Close();
         awaiting_closed_.store(true, std::memory_order_release);
+    }
+    else if (connecting_.valid())
+    {
+        // 握手期的半开连接：句柄还没发布，要另外关它。它没有 OnClosed，收尾通知走 OnHandshakeFailed，
+        // 同样要等它回调之后才能销毁本对象，所以也置 awaiting_closed_。
+        if (IConnection* c = loop_.table().Current(connecting_.slot(), connecting_.generation()))
+        {
+            c->Close();
+            awaiting_closed_.store(true, std::memory_order_release);
+        }
+        connecting_ = {};
     }
     phase_ = Phase::Idle;
 }
@@ -206,20 +218,31 @@ void Connector::OnSocketConnected(UniqueFd fd)
     info.endpoint = endpoint_;
     ConfigureSocket(fd.get(), endpoint_.kind(), tcp_options_, info);
 
-    StreamConnection* c =
-        StreamConnection::Create(loop_, std::move(fd), std::move(info), forwarder_, factory_.Create(), conn_options_);
+    StreamConnection* c = StreamConnection::Create(loop_,
+                                                   std::move(fd),
+                                                   std::move(info),
+                                                   forwarder_,
+                                                   factory_.Create(),
+                                                   conn_options_,
+                                                   {.observer = this, .layer = tls_.get(), .role = LayerRole::Client});
+    // 句柄、Connected、退避重置都等握手完成（OnEstablished，在 OnConnected 之前）才做；没有握手的连接就在下面的 Establish 里。
+    phase_ = Phase::Handshaking;
+    connecting_ = c->handle();
+    if (c->Establish())
+        return;
+    // epoll 登记失败：连接已被标记关闭，没有任何回调（包括 OnClosed 与握手失败通知）。
+    connecting_ = {};
+    Failed(ENOMEM);
+}
+
+void Connector::OnEstablished(IConnection& c)
+{
+    connecting_ = {};
     // 句柄先于 OnConnected 发布：OnConnected 里就能经 StreamClient::Send 发数据。
-    handle_.store(c->handle().raw(), std::memory_order_release);
+    handle_.store(c.handle().raw(), std::memory_order_release);
     phase_ = Phase::Connected;
     backoff_.Reset();
-    if (c->Establish())
-    {
-        LoopStats::Bump(loop_.stats().connected);
-        return;
-    }
-    // epoll 登记失败：连接已被标记关闭，没有任何回调（包括 OnClosed）。
-    handle_.store(0, std::memory_order_release);
-    Failed(ENOMEM);
+    LoopStats::Bump(loop_.stats().connected);
 }
 
 void Connector::Failed(int sys_errno)
@@ -256,13 +279,28 @@ void Connector::OnConnectionClosed(IConnection& c, CloseReason reason, int sys_e
 {
     handle_.store(0, std::memory_order_release); // 先清句柄：回调里的 Send 得到 Closed
     user_handler_.OnClosed(c, reason, sys_errno);
+    if (AfterConnectionGone())
+        return;
+    ScheduleRetry(); // 断开立即已经发了 OnClosed；退避之后重连，连接成功才重置退避
+}
+
+void Connector::OnHandshakeFailed(int mapped_errno) noexcept
+{
+    connecting_ = {};
+    if (AfterConnectionGone())
+        return;
+    Failed(mapped_errno); // 握手失败按连接失败处理：退避重试 + on_connect_failed（will_retry 照旧）
+}
+
+bool Connector::AfterConnectionGone()
+{
     if (!running_)
     {
         // Stop / 停机：不重连，此后本 client 不再有任何回调。
         // 清 awaiting_closed_ 必须是这里最后一步：StreamClient 的析构等的就是它，清了之后本对象随时可能被销毁；
         // 也必须在用户的 OnClosed 返回之后，否则析构会和还在执行的用户回调赛跑。
         awaiting_closed_.store(false, std::memory_order_release);
-        return;
+        return true;
     }
     awaiting_closed_.store(false, std::memory_order_release); // running_ 为真时析构会先 Stop()，不会与这里并发
     if (start_when_closed_)
@@ -277,9 +315,9 @@ void Connector::OnConnectionClosed(IConnection& c, CloseReason reason, int sys_e
                                           retry_timer_ = 0;
                                           Attempt();
                                       });
-        return;
+        return true;
     }
-    ScheduleRetry(); // 断开立即已经发了 OnClosed；退避之后重连，连接成功才重置退避
+    return false;
 }
 
 } // namespace breeze

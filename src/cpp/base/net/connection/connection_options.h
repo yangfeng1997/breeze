@@ -23,6 +23,10 @@ struct ConnectionOptions
     // 更严格的判定（必须收到合法心跳、按完整消息时间关闭滴灌式慢速连接）由应用层做。
     // 精度 ≤ 1s（每 100ms 扫 1/10 的槽）。被 PauseRead 暂停的连接不计空闲。
     std::chrono::milliseconds idle_timeout{0};
+
+    // 握手（TLS 握手、WebSocket 升级等）的总时限，从建连起算；超时按握手失败关闭（不回调 OnConnected / OnClosed，
+    // 记入 NetStats::handshake_failed）。没有握手的连接（明文 + LengthPrefix）不看它。
+    std::chrono::milliseconds handshake_timeout{10000};
 };
 
 } // namespace breeze

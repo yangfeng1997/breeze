@@ -40,6 +40,7 @@ PUBLIC_HEADERS = {
     # endpoint/、codec/
     NET + "endpoint/endpoint.h",
     NET + "endpoint/peer_info.h",
+    NET + "codec/codec_host_interface.h",
     NET + "codec/frame_codec_interface.h",
     NET + "codec/length_prefix_codec.h",
     # loop/：EventLoopGroup 与统计（EventLoop 本身不是公开类型）
@@ -48,6 +49,7 @@ PUBLIC_HEADERS = {
     # stream/：TCP / UDS 共用的服务端 / 客户端基类
     NET + "stream/reconnect_policy.h",
     NET + "stream/stream_client.h",
+    NET + "stream/stream_layer_interface.h",
     NET + "stream/stream_server.h",
     # agent/：Sidecar 的同机通道。信封与路由表是业务要直接用的（构造信封、给 Agent 配路由）；
     # AgentClientOptions 里的传输方式枚举在 agent/shm/shm_protocol.h；其余（通道服务端 / 客户端、ShmConnection、路由器实现）是内部件。

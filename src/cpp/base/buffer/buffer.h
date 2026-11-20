@@ -43,6 +43,8 @@ public:
     std::size_t ReadableBytes() const noexcept { return write_ - read_; }
     // 视图只在下一次 Consume / Append / PrepareWrite / Shrink 之前有效。
     std::span<const std::byte> Readable() const noexcept { return {data_.get() + read_, write_ - read_}; }
+    // 可写视图：给要在原地改写已收到字节的消费者（IFrameCodec::Decode 对完整帧去掩码）。有效期同 Readable()。
+    std::span<std::byte> ReadableMut() noexcept { return {data_.get() + read_, write_ - read_}; }
 
     // n 超过 ReadableBytes() 是编程错误。读空时下标回到起点，让下一次写从头开始。
     void Consume(std::size_t n) noexcept;

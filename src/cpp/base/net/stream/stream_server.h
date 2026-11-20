@@ -25,6 +25,7 @@
 #include "base/net/endpoint/endpoint.h"
 #include "base/net/endpoint/peer_info.h"
 #include "base/net/loop/event_loop_group.h"
+#include "base/net/stream/stream_layer_interface.h"
 #include "base/net/tcp/tcp_options.h"
 
 namespace breeze
@@ -32,8 +33,11 @@ namespace breeze
 
 struct StreamServerOptions
 {
-    ConnectionOptions connection; // 水位、idle_timeout：对每条被接受的连接生效
+    ConnectionOptions connection; // 水位、idle_timeout、handshake_timeout：对每条被接受的连接生效
     TcpOptions tcp; // keepalive 等：只对 TCP 端点生效，UDS 端点不看它（TcpServer / UdsServer 的选项里按传输分开）
+    // 字节流层（TLS）：空 = 明文。只对 TCP 端点有意义，UDS 端点配了它 Start() 返回 EPROTONOSUPPORT（不静默忽略）。
+    // 与 codec 互相独立：`tls` = 层 + LengthPrefix，`wss` = 层 + WebSocket。工厂被所有 loop 的线程并发用，须线程安全。
+    std::shared_ptr<const IStreamLayerFactory> tls;
     AcceptFilter accept_filter; // 空 = 全部接受
     int backlog = SOMAXCONN;    // 内核还会按 net.core.somaxconn 截断
 };

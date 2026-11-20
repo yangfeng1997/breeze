@@ -14,11 +14,23 @@
 namespace breeze
 {
 
+// 握手（TLS 握手、WebSocket 升级等）在 OnConnected 之前失败的原因。这样的连接没回调过 OnConnected，也就没有 OnClosed，
+// 不进 NetStats::closed，只记在 handshake_failed 里。主动关闭（Stop / 停机）不算失败。
+enum class HandshakeFailure : std::uint8_t
+{
+    Timeout, // 超过 ConnectionOptions::handshake_timeout
+    Io,      // 对端中途断开、读写出错
+    Tls,     // TLS 层报错（证书、协议、record）
+    Upgrade, // codec 的握手被判非法（WebSocket 升级请求 / 应答不合规）
+};
+inline constexpr std::size_t kHandshakeFailureCount = static_cast<std::size_t>(HandshakeFailure::Upgrade) + 1;
+
 struct NetStats
 {
     // ---- 当前值 ----
-    std::uint64_t connections = 0;        // 已预留 + 已建立的连接数
-    std::uint64_t paused_connections = 0; // 正被 PauseRead 暂停的连接数
+    std::uint64_t connections = 0;           // 已预留 + 已建立的连接数
+    std::uint64_t paused_connections = 0;    // 正被 PauseRead 暂停的连接数
+    std::uint64_t handshaking_connections = 0; // 正在握手（已登记 epoll、还没回调 OnConnected）的连接数
 
     // ---- 累计 ----
     std::uint64_t accepted = 0;  // 服务端接受并建立（回调过 OnConnected）
@@ -31,6 +43,8 @@ struct NetStats
     std::uint64_t rejected_full = 0;         // 所有 loop 的连接表都满
     std::uint64_t rejected_fd_exhausted = 0; // accept 遇 EMFILE / ENFILE
     std::uint64_t rejected_resource = 0;     // 新连接登记 epoll 失败（ENOSPC / ENOMEM）
+    // 握手阶段失败的连接，按原因；下标是 static_cast<size_t>(HandshakeFailure)
+    std::array<std::uint64_t, kHandshakeFailureCount> handshake_failed{};
     // rudp 的握手与数据报（字节流传输恒为 0）：
     std::uint64_t rejected_ticket = 0;   // Hello 被拒：票据不存在 / 已过期 / 已用过 / token 不对（也计入不了 accepted）
     std::uint64_t datagrams_dropped = 0; // 被丢弃的数据报：格式不对、来源没有会话、KCP 不认

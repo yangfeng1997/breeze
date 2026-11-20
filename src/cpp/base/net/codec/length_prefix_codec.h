@@ -20,7 +20,7 @@ public:
     // max_frame 是 payload 的上限，不得超过 UINT32_MAX。
     explicit LengthPrefixCodec(std::size_t max_frame = kDefaultMaxFrame);
 
-    DecodeResult Decode(std::span<const std::byte> data, FrameSink sink, std::size_t& used) override;
+    DecodeResult Decode(std::span<std::byte> data, FrameSink sink, std::size_t& used) override;
     std::size_t EncodeHeader(std::size_t payload_len, std::span<std::byte, kMaxFrameHeaderSize> header_out) override;
 
 private:

@@ -13,6 +13,7 @@ StreamServerOptions ToStreamOptions(TcpServerOptions&& o)
     StreamServerOptions s;
     s.connection = o.connection;
     s.tcp = o.tcp;
+    s.tls = std::move(o.tls);
     s.accept_filter = std::move(o.accept_filter);
     s.backlog = o.backlog;
     return s;

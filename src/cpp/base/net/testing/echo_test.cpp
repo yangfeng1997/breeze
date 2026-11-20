@@ -70,6 +70,8 @@ const char* ReasonName(CloseReason r)
             return "SlowConsumer";
         case CloseReason::IoError:
             return "IoError";
+        case CloseReason::TlsError:
+            return "TlsError";
     }
     return "?";
 }
@@ -307,7 +309,7 @@ public:
             std::string out;
             std::size_t used = 0;
             const DecodeResult r = codec_.Decode(
-                buf_.Readable(),
+                buf_.ReadableMut(),
                 [&](std::span<const std::byte> p) { out.assign(reinterpret_cast<const char*>(p.data()), p.size()); },
                 used);
             if (r == DecodeResult::Ok)

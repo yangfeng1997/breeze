@@ -13,6 +13,7 @@ StreamClientOptions ToStreamOptions(TcpClientOptions&& o)
     StreamClientOptions s;
     s.connection = o.connection;
     s.tcp = o.tcp;
+    s.tls = std::move(o.tls);
     s.connect_timeout = o.connect_timeout;
     s.on_connect_failed = std::move(o.on_connect_failed);
     return s;

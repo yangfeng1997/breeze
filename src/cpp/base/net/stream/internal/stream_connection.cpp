@@ -7,11 +7,15 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstddef>
 #include <limits>
 
 #include "base/logger/logger.h"
 #include "base/logger/logger_macros.h"
 #include "base/net/loop/event_loop.h"
+#include "base/net/stream/internal/identity_layer.h"
+#include "base/net/stream/internal/layered_stream_connection.h"
+#include "base/net/stream/internal/plain_stream_connection.h"
 #include "base/net/stream/internal/stream_socket.h"
 
 namespace breeze
@@ -27,6 +31,48 @@ constexpr std::size_t kReadBytes = 64 * 1024;
 constexpr std::size_t kShrinkAbove = 4 * 1024;
 // 一次 sendmsg 最多 64 个 iovec（一帧占两个：帧头 + payload）。
 constexpr int kMaxIov = 64;
+
+// CloseAfterFlush 写完队列后等对端关闭的最长时间，到点强关。
+constexpr std::chrono::milliseconds kCloseAfterFlushGrace{5000};
+
+// 握手期（OnConnected 之前）死掉的连接，按关闭原因归类：同一个 CloseReason 在握手期与握手之后含义略有不同，
+// 这里只在握手期用。IdleTimeout 就是握手超时（握手超时用它做内部原因）。
+HandshakeFailure ClassifyHandshakeFailure(CloseReason r) noexcept
+{
+    switch (r)
+    {
+        case CloseReason::IdleTimeout:
+            return HandshakeFailure::Timeout;
+        case CloseReason::TlsError:
+            return HandshakeFailure::Tls;
+        case CloseReason::ProtocolError:
+            return HandshakeFailure::Upgrade;
+        default:
+            return HandshakeFailure::Io; // 对端中途断开、读写出错、慢消费者
+    }
+}
+
+// 交给 IHandshakeObserver 的 errno：固定映射，不透传 TLS 库的错误码（值域会与 errno 重叠，碰巧等于 EINVAL / EPERM
+// 的会被 Connector 判成"不可重试"）。IO 错误只放行明确可重试的几种，其余按对端复位算。
+int MapHandshakeErrno(CloseReason r, int sys_errno) noexcept
+{
+    switch (r)
+    {
+        case CloseReason::IdleTimeout:
+            return ETIMEDOUT;
+        case CloseReason::TlsError:
+        case CloseReason::ProtocolError:
+            return EPROTO;
+        case CloseReason::PeerClosed:
+            return ECONNRESET;
+        case CloseReason::IoError:
+            return (sys_errno == ETIMEDOUT || sys_errno == ECONNRESET || sys_errno == EPIPE || sys_errno == ECONNABORTED)
+                       ? sys_errno
+                       : ECONNRESET;
+        default:
+            return ECONNABORTED; // LocalClose / SlowConsumer
+    }
+}
 
 // 返回写出的字节数（0 = 内核缓冲满了）；出错返回 -1，errno 有效。
 // 用 sendmsg + MSG_NOSIGNAL 而不是 writev：对端已关闭时 writev 会向进程发 SIGPIPE，库不该替使用方改信号处置。
@@ -55,18 +101,78 @@ StreamConnection* StreamConnection::Create(EventLoop& loop,
                                            PeerInfo peer,
                                            IConnectionHandler& handler,
                                            std::unique_ptr<IFrameCodec> codec,
-                                           const ConnectionOptions& options)
+                                           const ConnectionOptions& options,
+                                           const StreamConnectionExtras& extras)
 {
     loop.AssertInLoopThread();
+
+    // 热区布局守卫：在 in_ 之前插成员会让热字段整体后移，每条消息多碰缓存行（docs/网络库设计.md §9.1 / §9.3），
+    // 而测试都能过、只有 10 万连接的压测才看得出来。带虚函数的类用 offsetof 是 conditionally-supported，
+    // clang / gcc 默认警告，这里局部关掉；写在成员函数里是因为要访问私有成员。新增状态放冷区（末尾），不动这个数。
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Winvalid-offsetof"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winvalid-offsetof"
+#endif
+    static_assert(offsetof(StreamConnection, in_) == 72, "StreamConnection 的热区布局变了：见上面的注释");
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+
+    // 选子类。层的工厂不得返回空：创建失败是编程错误，悄悄退化成明文比崩溃更糟。
+    std::unique_ptr<IStreamLayer> layer;
+    if (extras.layer != nullptr)
+    {
+        layer = extras.layer->Create(extras.role);
+        if (layer == nullptr)
+            LOG_FATAL("IStreamLayerFactory::Create 返回了空");
+    }
+    const bool encodes_payload = codec->traits().encodes_payload;
+    if (layer == nullptr && encodes_payload)
+        layer = std::make_unique<IdentityLayer>(); // 没有 TLS 但 codec 要改写出站 payload：恒等层，走慢写路径
+
     ConnectionTable& table = loop.table();
     const std::uint32_t slot = table.Allocate(options.high_water_mark);
     const std::uint32_t generation = table.slot(slot).generation.load(std::memory_order_relaxed);
     const ConnectionHandle handle = loop.MakeHandle(slot, generation);
-    std::unique_ptr<StreamConnection> conn(new StreamConnection(
-        loop, std::move(fd), std::move(peer), handler, std::move(codec), options, table.slot(slot), slot, handle));
+
+    std::unique_ptr<StreamConnection> conn;
+    if (layer != nullptr)
+        conn.reset(new LayeredStreamConnection(loop,
+                                               std::move(fd),
+                                               std::move(peer),
+                                               handler,
+                                               std::move(codec),
+                                               options,
+                                               table.slot(slot),
+                                               slot,
+                                               handle,
+                                               std::move(layer),
+                                               encodes_payload));
+    else
+        conn.reset(new PlainStreamConnection(
+            loop, std::move(fd), std::move(peer), handler, std::move(codec), options, table.slot(slot), slot, handle));
+    conn->observer_ = extras.observer;
     StreamConnection* raw = conn.get();
     table.Install(slot, std::move(conn));
     return raw;
+}
+
+PlainStreamConnection::PlainStreamConnection(EventLoop& loop,
+                                             UniqueFd fd,
+                                             PeerInfo peer,
+                                             IConnectionHandler& handler,
+                                             std::unique_ptr<IFrameCodec> codec,
+                                             const ConnectionOptions& options,
+                                             ConnectionTable::Slot& slot,
+                                             std::uint32_t slot_index,
+                                             ConnectionHandle handle)
+    : StreamConnection(loop, std::move(fd), std::move(peer), handler, std::move(codec), options, slot, slot_index, handle)
+{
 }
 
 StreamConnection::StreamConnection(EventLoop& loop,
@@ -89,6 +195,8 @@ StreamConnection::StreamConnection(EventLoop& loop,
     , high_water_(options.high_water_mark)
     , peer_(std::move(peer))
     , handle_(handle)
+    , handshake_timeout_ms_(static_cast<std::uint32_t>(
+          std::clamp<std::int64_t>(options.handshake_timeout.count(), 1, std::numeric_limits<std::uint32_t>::max())))
 {
 }
 
@@ -106,21 +214,64 @@ bool StreamConnection::Establish()
         return false;
     }
     registered_ = true;
-    notified_connected_ = true;
     if (idle_timeout_ms_ != 0)
     {
         loop_.RegisterIdle(slot_index_, idle_timeout_ms_);
         idle_registered_ = true;
     }
+
+    // 握手来源：分层子类在构造时已经置了 LayerHandshaking；codec 的握手由它自己声明。
+    if (codec_->traits().needs_handshake)
+        Set(Flag::CodecHandshaking);
+    if (HandshakePending())
+    {
+        // 先于 Attach / OnEstablish 记账：它们里面出错关闭时，握手失败的统计与通知才对得上。
+        Set(Flag::HandshakeStarted);
+        LoopStats::Bump(loop_.stats().handshaking);
+        timer_ = loop_.RunAfter(std::chrono::milliseconds(handshake_timeout_ms_),
+                                [this]
+                                {
+                                    timer_ = 0;
+                                    CloseWith(CloseReason::IdleTimeout, 0); // 握手超时（原因只在内部用，见 NotifyClosed）
+                                });
+    }
+    codec_->Attach(host_);
+    OnEstablish();
+    if (state_ == State::Disconnected || notified_connected_ || HandshakePending())
+        return true; // 已在握手期里关闭（回收时走握手失败的通知）/ 握手在 Attach 里同步完成已回调过 / 握手还没完成
+    NotifyConnected();
+    return true;
+}
+
+void StreamConnection::NotifyConnected()
+{
+    if (Has(Flag::HandshakeStarted))
+    {
+        LoopStats::Drop(loop_.stats().handshaking);
+        if (timer_ != 0)
+        {
+            loop_.Cancel(timer_); // 握手超时定时器；握手期间不会优雅关闭，所以 timer_ 只可能是它
+            timer_ = 0;
+        }
+    }
+    notified_connected_ = true;
     LOG_DEBUG(
         "connection established {} peer={}", handle_.ToString(), peer_.endpoint ? peer_.endpoint->ToString() : "-");
     handler_.OnConnected(*this);
-    return true;
+}
+
+void StreamConnection::HandshakeSourceDone(Flag source)
+{
+    if (state_ != State::Connected || !Has(source))
+        return; // 连接已关闭，或这个来源重复报告完成：幂等
+    Clear(source);
+    if (!HandshakePending())
+        NotifyConnected();
 }
 
 // ---- 事件分发：HUP（无 IN）→ ERR → IN/RDHUP → OUT ----
 
-void StreamConnection::OnEvents(std::uint32_t events)
+void PlainStreamConnection::OnEvents(std::uint32_t events)
 {
     // 同一轮里本连接可能已经在别的回调里被关闭：对象还在（延后销毁），但不再处理任何事件。
     if (state_ == State::Disconnected)
@@ -145,7 +296,7 @@ void StreamConnection::OnEvents(std::uint32_t events)
 // ---- 读：水平触发，每次就绪只 read 一次 ----
 
 // 从 data 开头起把能解的帧都解出来，返回消耗的字节数。一次解一帧：两帧之间要检查连接是否已经在回调里被关闭。
-std::size_t StreamConnection::DecodeAll(std::span<const std::byte> data)
+std::size_t StreamConnection::DecodeAll(std::span<std::byte> data)
 {
     std::size_t total = 0;
     std::uint64_t messages = 0;
@@ -157,10 +308,15 @@ std::size_t StreamConnection::DecodeAll(std::span<const std::byte> data)
             data.subspan(total),
             [this](std::span<const std::byte> payload) { handler_.OnMessage(*this, payload); },
             used);
-        if (r == DecodeResult::Ok)
+        if (r == DecodeResult::Ok) [[likely]]
         {
             total += used;
             ++messages;
+            continue;
+        }
+        if (r == DecodeResult::Consumed)
+        {
+            total += used; // 握手 / 控制帧 / 非末尾分片：消耗了字节但没有消息，不计数
             continue;
         }
         if (r == DecodeResult::Error)
@@ -171,7 +327,7 @@ std::size_t StreamConnection::DecodeAll(std::span<const std::byte> data)
     return total;
 }
 
-void StreamConnection::HandleRead()
+void PlainStreamConnection::HandleRead()
 {
     static thread_local std::byte buf[kReadBytes];
 
@@ -197,7 +353,7 @@ void StreamConnection::HandleRead()
     if (idle_timeout_ms_ != 0)
         loop_.TouchIdle(slot_index_);
 
-    const std::span<const std::byte> fresh(buf, static_cast<std::size_t>(n));
+    const std::span<std::byte> fresh(buf, static_cast<std::size_t>(n));
     if (in_.ReadableBytes() == 0)
     {
         // 常见路径：没有遗留的半帧，直接从线程本地缓冲分帧，不碰每连接的缓冲；只有尾部的半个帧才拷进去。
@@ -209,7 +365,7 @@ void StreamConnection::HandleRead()
 
     // 上次留下了半个帧：拼上新数据再解。回调看到的视图在 in_ 里，回调期间 in_ 不会被改动（Send 不碰它）。
     in_.Append(fresh);
-    in_.Consume(DecodeAll(in_.Readable()));
+    in_.Consume(DecodeAll(in_.ReadableMut()));
     if (in_.ReadableBytes() == 0 && in_.Capacity() > kShrinkAbove)
         in_.ShrinkIfEmpty(0);
 }
@@ -241,11 +397,11 @@ int FillIov(
 
 } // namespace
 
-SendResult StreamConnection::Send(SharedBuffer payload) { return SendImpl(payload.bytes(), &payload, false); }
+SendResult PlainStreamConnection::Send(SharedBuffer payload) { return SendImpl(payload.bytes(), &payload, false); }
 
-SendResult StreamConnection::Send(std::span<const std::byte> payload) { return SendImpl(payload, nullptr, false); }
+SendResult PlainStreamConnection::Send(std::span<const std::byte> payload) { return SendImpl(payload, nullptr, false); }
 
-void StreamConnection::SendFromTask(SharedBuffer payload)
+void PlainStreamConnection::SendFromTask(SharedBuffer payload)
 {
     if (state_ != State::Connected)
         return; // 连接已标记关闭：槽回收时 pending_bytes 会清零，这里不用减
@@ -253,7 +409,7 @@ void StreamConnection::SendFromTask(SharedBuffer payload)
 }
 
 // owned 非空：调用方交来的 SharedBuffer，入队时直接接管；为空：payload 只是个视图，入队时才拷贝。
-SendResult StreamConnection::SendImpl(std::span<const std::byte> payload, SharedBuffer* owned, bool counted)
+SendResult PlainStreamConnection::SendImpl(std::span<const std::byte> payload, SharedBuffer* owned, bool counted)
 {
     loop_.AssertInLoopThread();
     if (state_ != State::Connected)
@@ -322,7 +478,7 @@ SendResult StreamConnection::SendImpl(std::span<const std::byte> payload, Shared
     return SendResult::Ok;
 }
 
-void StreamConnection::HandleWrite()
+void PlainStreamConnection::HandleWrite()
 {
     while (!out_.empty())
     {
@@ -366,6 +522,47 @@ void StreamConnection::HandleWrite()
     SetWriteInterest(false); // 队列排空：EPOLLOUT 仅在队列非空时注册
     if (state_ == State::Disconnecting)
         ShutdownWrite(); // 优雅关闭：该发的都发完了，告诉对端我们这边结束
+}
+
+// 不经 EncodeHeader 写原始字节（ICodecHost::SendRaw）：与 SendImpl 同构——队列空先直写，没写完入队保序。
+// 都是握手应答、控制帧这类很小的字节，不计 messages_out；超水位照样按慢消费者关闭。
+void PlainStreamConnection::WriteRaw(std::span<const std::byte> bytes)
+{
+    loop_.AssertInLoopThread();
+    if (state_ == State::Disconnected || bytes.empty())
+        return;
+
+    std::size_t written = 0;
+    if (out_.empty())
+    {
+        iovec iov{const_cast<std::byte*>(bytes.data()), bytes.size()};
+        const ssize_t n = SendIov(fd_.get(), &iov, 1);
+        if (n < 0)
+        {
+            LoopStats::Add(loop_.stats().send_closed_io_error);
+            CloseWith(CloseReason::IoError, errno);
+            return;
+        }
+        LoopStats::Bump(loop_.stats().bytes_out, static_cast<std::uint64_t>(n));
+        if (static_cast<std::size_t>(n) == bytes.size())
+            return;
+        written = static_cast<std::size_t>(n);
+    }
+
+    const std::uint64_t pending = slot_.pending_bytes.fetch_add(bytes.size(), std::memory_order_relaxed) + bytes.size();
+    if (pending > high_water_)
+    {
+        LOG_WARN("发送积压 {} 字节超过水位 {}，按慢消费者关闭连接", pending, high_water_);
+        LoopStats::Add(loop_.stats().send_closed_slow_consumer);
+        CloseWith(CloseReason::SlowConsumer, 0);
+        return;
+    }
+    Pending& p = out_.emplace_back();
+    p.header_len = 0; // 没有帧头：Total() 就是 payload.size()，HandleWrite 的 FillIov / 记账都照常
+    p.payload = SharedBuffer::CopyFrom(bytes);
+    p.offset = written;
+    if (!want_write_)
+        SetWriteInterest(true);
 }
 
 void StreamConnection::SetWriteInterest(bool want)
@@ -428,18 +625,50 @@ void StreamConnection::CloseGracefully(std::chrono::milliseconds timeout)
     loop_.AssertInLoopThread();
     if (state_ != State::Connected)
         return;
+    if (HandshakePending())
+    {
+        // 握手没完成的连接业务还没见过，谈不上"优雅"：直接关（停机时 BeginShutdown 会对全部连接调到这里）。
+        CloseWith(CloseReason::LocalClose, 0);
+        return;
+    }
     state_ = State::Disconnecting;
     slot_.state.store(ConnectionTable::State::Disconnecting, std::memory_order_release); // 跨线程 Send 从此得到 Closed
     if (paused_)
-        ResumeRead(); // 暂停着读不到对端在 FIN 之前发来的最后几条消息（对端 FIN 后内核报 EPOLLHUP，会直接关掉）
-    grace_timer_ = loop_.RunAfter(timeout,
-                                  [this]
-                                  {
-                                      grace_timer_ = 0;
-                                      CloseWith(CloseReason::LocalClose, 0); // 对端没在期限内关闭：强关
-                                  });
+        StreamConnection::ResumeRead(); // 暂停着读不到对端在 FIN 之前发来的最后几条消息（对端 FIN 后内核报 EPOLLHUP，会直接关掉）。
+                                        // 显式调基类版本：本类不再是 final，不限定的话是虚调用，不能内联
+    timer_ = loop_.RunAfter(timeout,
+                            [this]
+                            {
+                                timer_ = 0;
+                                CloseWith(CloseReason::LocalClose, 0); // 对端没在期限内关闭：强关
+                            });
+    codec_->OnClosing(); // codec 可以在这里 SendRaw 它自己的关闭帧（WebSocket 的 Close 1001）
+    if (state_ == State::Disconnecting && out_.empty())
+        FinishWrites(); // 否则由 HandleWrite 在队列排空时做
+}
+
+void StreamConnection::CloseAfterFlush(CloseReason reason, int code)
+{
+    loop_.AssertInLoopThread();
+    if (state_ != State::Connected)
+        return;
+    close_reason_ = reason; // 记下来，收尾（CloseWith）时换回它们：对端的 FIN、写完后的收尾、超时都一样
+    close_errno_ = code;
+    Set(Flag::ReasonPinned);
+    state_ = State::Disconnecting;
+    slot_.state.store(ConnectionTable::State::Disconnecting, std::memory_order_release); // 跨线程 Send 从此得到 Closed
+    if (paused_)
+        StreamConnection::ResumeRead();
+    if (timer_ != 0)
+        loop_.Cancel(timer_); // 可能是还没取消的握手超时（codec 在握手中途拒绝对端并要求写完错误应答再关）
+    timer_ = loop_.RunAfter(kCloseAfterFlushGrace,
+                            [this]
+                            {
+                                timer_ = 0;
+                                CloseWith(CloseReason::LocalClose, 0); // 对端没在期限内关闭：强关，原因仍是记下的那个
+                            });
     if (out_.empty())
-        ShutdownWrite(); // 否则由 HandleWrite 在队列排空时做
+        FinishWrites();
 }
 
 // ---- 关闭：标记 → 本轮分发之后回调 OnClosed → 销毁 ----
@@ -450,15 +679,22 @@ void StreamConnection::CloseWith(CloseReason reason, int sys_errno)
 {
     if (state_ == State::Disconnected)
         return;
+    if (Has(Flag::ReasonPinned) && (reason == CloseReason::PeerClosed || reason == CloseReason::LocalClose))
+    {
+        reason = close_reason_; // CloseAfterFlush 记下的原因与 code（例：对端发起的 WebSocket 关闭，带着 close code）
+        sys_errno = close_errno_;
+    }
     state_ = State::Disconnected;
     slot_.state.store(ConnectionTable::State::Disconnected, std::memory_order_release); // 跨线程 Send 从此得到 Closed
     close_reason_ = reason;
     close_errno_ = sys_errno;
-    // 下面三件都要在回收之前做完：定时器里捕获着 this；暂停数与空闲登记是 loop 级的计数。
-    if (grace_timer_ != 0)
+    // 下面几件都要在回收之前做完：定时器里捕获着 this；握手中数、暂停数与空闲登记是 loop 级的计数。
+    if (Has(Flag::HandshakeStarted) && HandshakePending())
+        LoopStats::Drop(loop_.stats().handshaking);
+    if (timer_ != 0)
     {
-        loop_.Cancel(grace_timer_);
-        grace_timer_ = 0;
+        loop_.Cancel(timer_);
+        timer_ = 0;
     }
     if (paused_)
     {
@@ -482,7 +718,18 @@ void StreamConnection::CloseWith(CloseReason reason, int sys_errno)
 void StreamConnection::NotifyClosed()
 {
     if (!notified_connected_)
+    {
+        // 没回调过 OnConnected：没有 OnClosed。握手期死掉的连接记统计、通知 observer（Connector 据此退避重连）；
+        // 登记 epoll 失败的没有握手可言，调用方已记 rejected_resource。
+        if (!Has(Flag::HandshakeStarted))
+            return;
+        if (close_reason_ != CloseReason::LocalClose) // 主动关闭（Stop / 停机）不算失败
+            LoopStats::Bump(loop_.stats().handshake_failed[static_cast<std::size_t>(ClassifyHandshakeFailure(close_reason_))]);
+        LOG_DEBUG("handshake failed {} reason={} errno={}", handle_.ToString(), ToString(close_reason_), close_errno_);
+        if (observer_ != nullptr)
+            observer_->OnHandshakeFailed(MapHandshakeErrno(close_reason_, close_errno_));
         return;
+    }
     LoopStats::Bump(loop_.stats().closed[static_cast<std::size_t>(close_reason_)]);
     LOG_DEBUG("connection closed {} reason={} errno={}", handle_.ToString(), ToString(close_reason_), close_errno_);
     handler_.OnClosed(*this, close_reason_, close_errno_);

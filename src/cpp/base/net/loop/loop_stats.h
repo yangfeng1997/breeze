@@ -31,9 +31,18 @@ struct alignas(64) LoopStats
     }
 
     // ---- 单写者：所属 IO 线程 ----
+    // 热计数器（每次 read / send 都写）放在最前面、同一条缓存行里（结构体按 64 字节对齐）：读路径写 bytes_in + messages_in，
+    // 写路径写 bytes_out + messages_out，各只碰这一条。新增计数器一律加在后面，不要往它们前面插：
+    // 插在前面会把它们挤到下一条缓存行（加握手统计时就发生过：热计数器跨了两条线，写路径从碰一条变成碰两条）。
+    Counter bytes_in{0};
+    Counter bytes_out{0};
+    Counter messages_in{0};
+    Counter messages_out{0};
     Counter accepted{0};
     Counter connected{0};
     Counter closed[kCloseReasonCount]{};
+    Counter handshaking{0}; // 当前正在握手的连接数（Gauge）
+    Counter handshake_failed[kHandshakeFailureCount]{};
     Counter rejected_filter{0};
     Counter rejected_full{0};
     Counter rejected_fd_exhausted{0};
@@ -41,10 +50,6 @@ struct alignas(64) LoopStats
     Counter rejected_ticket{0};   // rudp：Hello 的票据不存在 / 过期 / 已用 / token 不对
     Counter datagrams_dropped{0}; // rudp：格式不对、来源未登记、KCP 不认的数据报
     Counter rudp_updates{0};      // rudp：定时器真正去推进 KCP（调了 Update）的次数；没到点的会话不计
-    Counter bytes_in{0};
-    Counter bytes_out{0};
-    Counter messages_in{0};
-    Counter messages_out{0};
     Counter paused{0}; // 当前暂停的连接数（Gauge）
     Counter max_lag_ns{0};
 
@@ -62,10 +67,13 @@ struct alignas(64) LoopStats
     {
         const auto rd = [](const Counter& c) { return c.load(std::memory_order_relaxed); };
         out.paused_connections += rd(paused);
+        out.handshaking_connections += rd(handshaking);
         out.accepted += rd(accepted);
         out.connected += rd(connected);
         for (std::size_t i = 0; i < kCloseReasonCount; ++i)
             out.closed[i] += rd(closed[i]);
+        for (std::size_t i = 0; i < kHandshakeFailureCount; ++i)
+            out.handshake_failed[i] += rd(handshake_failed[i]);
         out.rejected_filter += rd(rejected_filter);
         out.rejected_full += rd(rejected_full);
         out.rejected_fd_exhausted += rd(rejected_fd_exhausted);

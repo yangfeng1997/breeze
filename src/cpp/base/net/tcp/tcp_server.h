@@ -15,8 +15,11 @@ namespace breeze
 
 struct TcpServerOptions
 {
-    ConnectionOptions connection; // 水位、idle_timeout：对每条被接受的连接生效
+    ConnectionOptions connection; // 水位、idle_timeout、handshake_timeout：对每条被接受的连接生效
     TcpOptions tcp;               // keepalive、TCP_USER_TIMEOUT
+    // 字节流层（TLS）：空 = 明文。与 codec 互相独立（`tls` = 层 + LengthPrefix，`wss` = 层 + WebSocket）。
+    // 工厂被所有 loop 的线程并发用，须线程安全。
+    std::shared_ptr<const IStreamLayerFactory> tls;
     AcceptFilter accept_filter;   // 空 = 全部接受；PeerInfo::endpoint 是对端的 IP 与端口，没有 credentials
     int backlog = SOMAXCONN;      // 内核还会按 net.core.somaxconn 截断
 };

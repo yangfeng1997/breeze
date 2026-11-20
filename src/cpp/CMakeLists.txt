@@ -506,6 +506,7 @@ if(BREEZE_BUILD_NET)
     ${NET_DIR}/stream/internal/loop_server.cpp
     ${NET_DIR}/stream/internal/connector.cpp
     ${NET_DIR}/stream/internal/stream_connection.cpp
+    ${NET_DIR}/stream/internal/layered_stream_connection.cpp
     ${NET_DIR}/tcp/tcp_socket.cpp
     ${NET_DIR}/tcp/tcp_endpoint.cpp
     ${NET_DIR}/tcp/tcp_server.cpp
@@ -878,6 +879,8 @@ if(BREEZE_BUILD_NET)
   breeze_net_test(connection_test DIR connection)
   breeze_net_test(stream_server_test DIR stream)
   breeze_net_test(stream_client_test DIR stream)
+  breeze_net_test(handshake_test DIR stream)
+  breeze_net_test(layered_connection_test DIR stream)
   breeze_net_test(echo_test DIR testing)
   breeze_net_test(net_flow_test DIR testing)
   breeze_net_test(net_lifecycle_test DIR testing)

@@ -15,8 +15,10 @@ namespace breeze
 
 struct TcpClientOptions
 {
-    ConnectionOptions connection; // 水位、idle_timeout
+    ConnectionOptions connection; // 水位、idle_timeout、handshake_timeout
     TcpOptions tcp;               // keepalive、TCP_USER_TIMEOUT
+    // 字节流层（TLS）：空 = 明文。握手失败按连接失败处理：退避重试并触发 on_connect_failed。
+    std::shared_ptr<const IStreamLayerFactory> tls;
     // 非阻塞 connect 的超时，到点按失败（ETIMEDOUT）重试；否则连到黑洞地址要等内核 SYN 重试约 2 分钟。
     std::chrono::milliseconds connect_timeout{5000};
     ConnectFailedCallback on_connect_failed; // 空 = 不通知（仍会记日志）

@@ -27,6 +27,8 @@ namespace
 using Bytes = std::vector<std::byte>;
 
 std::span<const std::byte> View(const Bytes& v) { return {v.data(), v.size()}; }
+// Decode 收可写视图（codec 可以在原地改写完整帧）。
+std::span<std::byte> MutView(Bytes& v) { return {v.data(), v.size()}; }
 
 // 用 EncodeHeader 拼出一帧：帧头 + payload。
 Bytes Frame(LengthPrefixCodec& codec, const std::string& payload)
@@ -47,7 +49,7 @@ DecodeResult Drain(IFrameCodec& codec, Buffer& buf, std::vector<std::string>& fr
     {
         std::size_t used = 0;
         const DecodeResult r = codec.Decode(
-            buf.Readable(),
+            buf.ReadableMut(),
             [&](std::span<const std::byte> p)
             { frames.emplace_back(reinterpret_cast<const char*>(p.data()), p.size()); },
             used);
@@ -207,11 +209,11 @@ void TestRoundTripVariousLengths()
 void TestSinkSeesViewIntoData()
 {
     LengthPrefixCodec codec;
-    const Bytes frame = Frame(codec, "abc");
+    Bytes frame = Frame(codec, "abc");
     std::size_t used = 99;
     bool called = false;
     const auto r = codec.Decode(
-        View(frame),
+        MutView(frame),
         [&](std::span<const std::byte> p)
         {
             called = true;
@@ -228,15 +230,28 @@ void TestSinkSeesViewIntoData()
     two.insert(two.end(), next.begin(), next.end());
     called = false;
     used = 0;
-    CHECK(codec.Decode(View(two), [&](std::span<const std::byte>) { called = true; }, used) == DecodeResult::Ok);
+    CHECK(codec.Decode(MutView(two), [&](std::span<const std::byte>) { called = true; }, used) == DecodeResult::Ok);
     CHECK(called && used == frame.size());
 
     // 不完整：NeedMore，used 被清零
     used = 99;
-    const Bytes partial(frame.begin(), frame.end() - 1);
-    CHECK(
-        codec.Decode(View(partial), [](std::span<const std::byte>) { CHECK(false); }, used) == DecodeResult::NeedMore);
+    Bytes partial(frame.begin(), frame.end() - 1);
+    CHECK(codec.Decode(MutView(partial), [](std::span<const std::byte>) { CHECK(false); }, used) ==
+          DecodeResult::NeedMore);
     CHECK(used == 0);
+}
+
+// 新增的几个虚函数都有默认实现：无状态的 codec 什么也不用做，也不会被当成需要握手 / 改写 payload。
+void TestStatelessCodecTraitsAreDefaults()
+{
+    LengthPrefixCodec codec;
+    const CodecTraits t = codec.traits();
+    CHECK(!t.needs_handshake && !t.encodes_payload);
+    codec.OnClosing(); // 空操作，不崩
+    std::array<std::byte, 4> p{};
+    codec.EncodePayload(p); // 空操作：payload 原样
+    for (const std::byte b : p)
+        CHECK(b == std::byte{0});
 }
 
 void TestFactoryCreatesIndependentInstances()
@@ -277,6 +292,7 @@ int main()
     TestRoundTripVariousLengths();
     TestSinkSeesViewIntoData();
     TestFactoryCreatesIndependentInstances();
+    TestStatelessCodecTraitsAreDefaults();
     std::puts("codec_test: ok");
     return 0;
 }

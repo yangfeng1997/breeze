@@ -123,8 +123,13 @@ void StreamServer::Impl::Adopt(EventLoop& target, UniqueFd fd, PeerInfo info)
         target.table().Unreserve(); // 正在停机：丢掉，不产生回调
         return;
     }
-    StreamConnection* c =
-        StreamConnection::Create(target, std::move(fd), std::move(info), handler, factory.Create(), options.connection);
+    StreamConnection* c = StreamConnection::Create(target,
+                                                   std::move(fd),
+                                                   std::move(info),
+                                                   handler,
+                                                   factory.Create(),
+                                                   options.connection,
+                                                   {.layer = options.tls.get(), .role = LayerRole::Server});
     if (c->Establish())
         LoopStats::Bump(target.stats().accepted);
     else
@@ -162,6 +167,8 @@ int StreamServer::Start()
     Impl& m = *impl_;
     if (m.endpoint.kind() == Endpoint::Kind::Udp)
         return EPROTONOSUPPORT; // 数据报端点要数据报的服务端（rudp），字节流的不收
+    if (m.options.tls && m.endpoint.kind() != Endpoint::Kind::Tcp)
+        return EPROTONOSUPPORT; // 层（TLS）只用于 TCP；UDS 上配了它不能静默忽略
     if (!m.group.running())
     {
         if (m.group.stopping())
