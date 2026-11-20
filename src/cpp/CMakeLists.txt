@@ -548,10 +548,16 @@ if(BREEZE_BUILD_NET)
 
   # TLS（BoringSSL）单独一个库：BoringSSL 只在这里 PRIVATE 链接，不用 TLS 的使用方不背这个依赖；breeze_net 里没有任何 TLS 类型，
   # 它只认 IStreamLayer 接口（stream/stream_layer_interface.h）。公开头（tls_options.h / tls_context.h）也不含 openssl 的头文件。
-  # BREEZE_BUILD_NET_TLS=OFF 时整个库与它的测试都不建（vcpkg 里的 boringssl 仍会被装，拆成 feature 见方案 §2，P3 做）。
+  # BREEZE_BUILD_NET_TLS=OFF 时整个库与它的测试都不建。BoringSSL 是 vcpkg 的 `tls` feature（默认开）：不要它的构建用
+  # `release-notls` 预设（VCPKG_MANIFEST_NO_DEFAULT_FEATURES=ON + BREEZE_BUILD_NET_TLS=OFF），vcpkg 就不会编译 BoringSSL。
   option(BREEZE_BUILD_NET_TLS "构建 breeze_net_tls（BoringSSL 实现的 TLS 层）" ON)
   if(BREEZE_BUILD_NET_TLS)
-    find_package(OpenSSL CONFIG REQUIRED) # vcpkg 的 boringssl 提供 OpenSSL::SSL / OpenSSL::Crypto
+    find_package(OpenSSL CONFIG QUIET) # vcpkg 的 boringssl 提供 OpenSSL::SSL / OpenSSL::Crypto
+    if(NOT TARGET OpenSSL::SSL)
+      message(FATAL_ERROR
+        "BREEZE_BUILD_NET_TLS=ON 需要 BoringSSL，但没有找到：vcpkg 的 `tls` feature 没装"
+        "（用了 -DVCPKG_MANIFEST_NO_DEFAULT_FEATURES=ON？）。要么去掉它，要么改 -DBREEZE_BUILD_NET_TLS=OFF（release-notls 预设）。")
+    endif()
     add_library(breeze_net_tls
       ${NET_DIR}/tls/tls_context.cpp
       ${NET_DIR}/tls/internal/tls_layer.cpp

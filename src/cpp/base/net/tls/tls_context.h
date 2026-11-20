@@ -60,7 +60,7 @@ private:
 };
 
 // 热更证书：持有当前上下文，Reload 原子替换；之后新建的连接用新上下文，已建立的连接不受影响（它们各自持有 SSL_CTX 的引用）。
-// 自己就是 IStreamLayerFactory，直接当 `tls` 选项用。v1 只给这个原子替换：不监听证书文件、不接 NetModule（见方案 §10）。
+// 自己就是 IStreamLayerFactory，直接当 `tls` 选项用。不监听证书文件；NetModule 经 ReloadTls() 用它（framework/net/net_module_tls.cpp）。
 class TlsContextHolder final : public IStreamLayerFactory
 {
 public:

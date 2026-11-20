@@ -6,9 +6,10 @@
 namespace breeze
 {
 
-bool NetModuleHasTls() { return true; }
+namespace
+{
 
-std::shared_ptr<const IStreamLayerFactory> MakeTlsServerLayer(const TlsSetup& s, std::string& error)
+std::shared_ptr<const TlsContext> BuildServer(const TlsSetup& s, std::string& error)
 {
     TlsServerOptions o;
     o.cert_chain.file = s.cert_chain_file;
@@ -20,7 +21,7 @@ std::shared_ptr<const IStreamLayerFactory> MakeTlsServerLayer(const TlsSetup& s,
     return TlsContext::CreateServer(o, error);
 }
 
-std::shared_ptr<const IStreamLayerFactory> MakeTlsClientLayer(const TlsSetup& s, std::string& error)
+std::shared_ptr<const TlsContext> BuildClient(const TlsSetup& s, std::string& error)
 {
     TlsClientOptions o;
     o.server_name = s.server_name;
@@ -29,6 +30,50 @@ std::shared_ptr<const IStreamLayerFactory> MakeTlsClientLayer(const TlsSetup& s,
         o.ca.file = s.ca_file;
     o.min_version = s.min_version_13 ? TlsVersion::Tls13 : TlsVersion::Tls12;
     return TlsContext::CreateClient(o, error);
+}
+
+// TlsContextHolder 的薄包装：上下文怎么建由 build 决定（服务端 / 客户端），Reload 用同一个 build。
+class Reloadable final : public ReloadableTlsLayer
+{
+public:
+    using Build = std::shared_ptr<const TlsContext> (*)(const TlsSetup&, std::string&);
+
+    Reloadable(std::shared_ptr<const TlsContext> initial, Build build)
+        : holder_(std::move(initial))
+        , build_(build)
+    {
+    }
+
+    std::unique_ptr<IStreamLayer> Create(LayerRole role) const override { return holder_.Create(role); }
+
+    bool Reload(const TlsSetup& setup, std::string& error) override
+    {
+        auto next = build_(setup, error);
+        if (!next)
+            return false;
+        holder_.Reload(std::move(next));
+        return true;
+    }
+
+private:
+    TlsContextHolder holder_;
+    Build build_;
+};
+
+} // namespace
+
+bool NetModuleHasTls() { return true; }
+
+std::shared_ptr<ReloadableTlsLayer> MakeTlsServerLayer(const TlsSetup& s, std::string& error)
+{
+    auto ctx = BuildServer(s, error);
+    return ctx ? std::make_shared<Reloadable>(std::move(ctx), &BuildServer) : nullptr;
+}
+
+std::shared_ptr<ReloadableTlsLayer> MakeTlsClientLayer(const TlsSetup& s, std::string& error)
+{
+    auto ctx = BuildClient(s, error);
+    return ctx ? std::make_shared<Reloadable>(std::move(ctx), &BuildClient) : nullptr;
 }
 
 } // namespace breeze

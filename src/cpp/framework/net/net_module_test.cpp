@@ -1041,6 +1041,7 @@ void TestWsThroughModule()
     CHECK(WaitUntil([&] { return sm != nullptr && sm->ready(); }));
 
     Biz cbiz;
+    cbiz.echo = false; // 客户端不回显：否则与服务端的回显互相踢皮球，消息数会越过期望值，轮询等 == 1 就可能错过
     App cli("net-ws-client");
     cli.RegisterModule([](App& a) { return std::make_unique<NetModule>(a, SmallOptions()); });
     cli.RegisterModule(
@@ -1061,6 +1062,21 @@ void TestWsThroughModule()
     Runner brun(bad);
     std::this_thread::sleep_for(300ms);
     CHECK(wrong.connected() == 0 && wrong.messages() == 0);
+}
+
+// net.tls 配了证书路径但读不出来：Init 就失败（带 TLS 字样与路径），不是带着错误的配置跑起来。
+// 没有 TLS 的构建（桩）也要失败：配置要加密，绝不静默退化成明文。
+void TestBadTlsConfigFailsInit()
+{
+    const LeakCheck leak;
+    auto opts = SmallOptions();
+    opts.tls.cert_chain_file = "/nonexistent/breeze-test-server.pem";
+    opts.tls.private_key_file = "/nonexistent/breeze-test-server.key";
+    App app("net-bad-tls");
+    app.RegisterModule([&](App& a) { return std::make_unique<NetModule>(a, opts); });
+    CHECK(app.Build());
+    const auto r = app.Init();
+    CHECK(!r && Has(r.error().msg, "TLS"));
 }
 
 // wss:// 端到端：同一套模块装配，服务端按 net.tls 的证书建 TLS 上下文，客户端按 CA + server_name 校验。
@@ -1102,6 +1118,7 @@ void TestWssThroughModule()
     CHECK(WaitUntil([&] { return sm != nullptr && sm->ready(); }));
 
     Biz cbiz;
+    cbiz.echo = false; // 同上
     auto copts = SmallOptions();
     copts.tls.ca_file = dir.path() + "/ca.pem";
     copts.tls.server_name = "server.test";
@@ -1114,6 +1131,135 @@ void TestWssThroughModule()
     CHECK(cbiz.first_connected().Send(Buf("ping-over-wss")) == SendResult::Ok);
     CHECK(WaitUntil([&] { return cbiz.messages() == 1; }));
     CHECK(cbiz.payloads()[0] == "ping-over-wss");
+}
+
+// 一个独立的 wss 客户端进程（App + NetModule + 一条 wss 连接），测试里用它扮演"不同信任根的客户端"。
+struct WssClientApp
+{
+    WssClientApp(const std::string& ca_file, std::uint16_t port, const char* name)
+        : app(name)
+    {
+        biz.echo = false; // 客户端不回显：否则与服务端的回显互相踢皮球，消息数停不住
+        auto copts = SmallOptions();
+        copts.tls.ca_file = ca_file;
+        copts.tls.server_name = "server.test";
+        app.RegisterModule(
+            [this, copts](App& a)
+            {
+                auto m = std::make_unique<NetModule>(a, copts);
+                net = m.get();
+                return m;
+            });
+        app.RegisterModule([this, port](App& a)
+                           { return std::make_unique<WsClientModule>(a, biz, "wss://127.0.0.1:" + std::to_string(port) + "/game"); });
+        run = std::make_unique<Runner>(app);
+    }
+    Biz biz; // 声明顺序 = 析构的反序：先停 Runner，再销毁 App，最后才是 biz
+    App app;
+    NetModule* net = nullptr;
+    std::unique_ptr<Runner> run;
+};
+
+// 证书热更（NetModule::ReloadTls）：失败保留旧上下文；成功后只有新连接用新证书、老连接不受影响；客户端 CA 也能换。
+void TestWssReloadTls()
+{
+    const LeakCheck leak;
+    const TestPki& pki = Pki();
+    const TempDir dir;
+    const auto path = [&](const std::string& name) { return dir.path() + "/" + name; };
+    const auto write = [&](const std::string& name, const std::string& text)
+    {
+        std::FILE* f = std::fopen(path(name).c_str(), "wb");
+        CHECK(f != nullptr);
+        CHECK(std::fwrite(text.data(), 1, text.size(), f) == text.size());
+        std::fclose(f);
+    };
+    // 服务端证书目前由 CA 签发；other 是另一个 CA 签发的同名证书（换上去之后只有信任 other CA 的客户端连得上）。
+    const TestCert other_server = MakeCert({.cn = "server.test", .dns = {"server.test"}, .issuer = &pki.other_ca});
+    write("server.pem", pki.server.cert_pem);
+    write("server.key", pki.server.key_pem);
+    write("ca1.pem", pki.ca.cert_pem);
+    write("ca2.pem", pki.other_ca.cert_pem);
+    write("ca-live.pem", pki.ca.cert_pem); // 第一个客户端用它：之后改成 other CA 再重载，验证客户端一侧也能热更
+
+    Biz sbiz;
+    auto sopts = SmallOptions();
+    sopts.tls.cert_chain_file = path("server.pem");
+    sopts.tls.private_key_file = path("server.key");
+    App srv("net-wss-reload-server");
+    NetModule* snet = nullptr;
+    srv.RegisterModule(
+        [&](App& a)
+        {
+            auto m = std::make_unique<NetModule>(a, sopts);
+            snet = m.get();
+            return m;
+        });
+    WsServerModule* sm = nullptr;
+    srv.RegisterModule(
+        [&](App& a)
+        {
+            auto m = std::make_unique<WsServerModule>(a, sbiz, "wss://127.0.0.1:0/game");
+            sm = m.get();
+            return m;
+        });
+    Runner srun(srv);
+    CHECK(WaitUntil([&] { return sm != nullptr && sm->ready(); }));
+    const std::uint16_t port = sm->bound().port();
+    const auto handshake_failed = [&]
+    {
+        std::uint64_t n = 0;
+        for (const auto v : snet->group().GetStats().handshake_failed)
+            n += v;
+        return n;
+    };
+
+    // 1. 起点：信任 CA 的客户端连得上、能回显
+    WssClientApp first(path("ca-live.pem"), port, "wss-reload-first");
+    CHECK(WaitUntil([&] { return first.biz.connected() == 1 && sbiz.connected() == 1; }));
+    CHECK(first.biz.first_connected().Send(Buf("before")) == SendResult::Ok);
+    CHECK(WaitUntil([&] { return first.biz.messages() == 1; }));
+
+    // 2. 证书文件被写坏：ReloadTls 失败、错误里写明是服务端上下文，旧上下文照常工作（新客户端仍连得上）
+    write("server.pem", "this is not a certificate");
+    const auto bad = snet->ReloadTls();
+    CHECK(!bad && Has(bad.error().msg, "服务端") && Has(bad.error().msg, "保持旧的"));
+    WssClientApp second(path("ca1.pem"), port, "wss-reload-second");
+    CHECK(WaitUntil([&] { return second.biz.connected() == 1 && sbiz.connected() == 2; }));
+
+    // 3. 换成 other CA 签发的证书并重载：已有连接不受影响；新连接用新证书
+    write("server.pem", other_server.cert_pem);
+    write("server.key", other_server.key_pem);
+    const std::uint64_t failed_before = handshake_failed();
+    CHECK(snet->ReloadTls());
+    CHECK(first.biz.first_connected().Send(Buf("after-reload")) == SendResult::Ok); // 老连接照常
+    CHECK(WaitUntil([&] { return first.biz.messages() == 2; }));
+    WssClientApp trusting_new(path("ca2.pem"), port, "wss-reload-new");
+    CHECK(WaitUntil([&] { return trusting_new.biz.connected() == 1 && sbiz.connected() == 3; }));
+    WssClientApp trusting_old(path("ca1.pem"), port, "wss-reload-old"); // 只信任旧 CA：握手必失败（重试也一样）
+    CHECK(WaitUntil([&] { return handshake_failed() > failed_before; }));
+    CHECK(trusting_old.biz.connected() == 0 && sbiz.connected() == 3);
+
+    // 4. 客户端一侧：把第一个客户端的 CA 文件换成 other CA 并重载；服务端关掉它的连接，它自动重连时用新上下文，才连得上新证书
+    write("ca-live.pem", pki.other_ca.cert_pem);
+    CHECK(first.net != nullptr && first.net->ReloadTls());
+    sbiz.first_connected().Close();
+    CHECK(WaitUntil([&] { return first.biz.connected() == 2; }));
+
+    // 没有 TLS 上下文的模块：明确报错，不是静默成功
+    Biz plain_biz;
+    App plain("net-no-tls");
+    NetModule* pnet = nullptr;
+    plain.RegisterModule(
+        [&](App& a)
+        {
+            auto m = std::make_unique<NetModule>(a, SmallOptions());
+            pnet = m.get();
+            return m;
+        });
+    CHECK(plain.Build() && plain.Init());
+    const auto none = pnet->ReloadTls();
+    CHECK(!none && Has(none.error().msg, "TLS"));
 }
 #endif
 
@@ -1366,7 +1512,9 @@ int main()
     TestWsThroughModule();
 #if defined(BREEZE_TEST_TLS)
     TestWssThroughModule();
+    TestWssReloadTls();
 #endif
+    TestBadTlsConfigFailsInit();
     TestRUdpThroughModule();
     TestRUdpModuleDefaultsReachServer();
     TestUdpAddServerStringPassesFilter();

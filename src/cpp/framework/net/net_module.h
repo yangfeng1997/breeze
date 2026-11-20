@@ -180,6 +180,15 @@ public:
                                                     IMainLoopHandler& handler,
                                                     RUdpClientOptions options);
 
+    // 证书热更：按 NetModuleOptions::tls 里的文件路径重新读证书 / 私钥 / CA，重建 TLS 上下文并原子替换。
+    // **之后新建的连接用新证书，已经建立的连接不受影响**（它们各自持有旧上下文，直到关闭）。
+    // 服务端上下文与客户端上下文各自独立重载：哪个失败哪个保持旧的、错误里写明，另一个照常换。
+    // 失败常见原因：文件读不出来、证书与私钥对不上（证书与私钥文件不是原子地一起换，换到一半会撞上这个——稍后重试即可）。
+    // **Init 之后任意线程可调**（含 Run 之外的线程，例如收到 SIGHUP 的线程；不读也不写模块的阶段状态）。
+    // 没有任何 TLS 上下文（net.tls 没配证书与 server_name），或这个构建没有 TLS，都返回错误。
+    // 不做文件监听：什么时候重载由部署决定（信号、定时器、证书签发流程）。
+    std::expected<void, Error> ReloadTls();
+
     // main 在 App::Run 返回之后调：group 优雅关闭（到 shutdown_deadline 强关），再把事件 Drain 到空。
     // 在主循环线程（调 Run 的线程）上调用。对没 Start 成功的、以及重复调用都是空操作。
     void Shutdown();
@@ -225,9 +234,9 @@ private:
     std::vector<std::unique_ptr<RUdpClient>> rudp_clients_; // 不随模块启动，见 AddRUdpClient
     // ws:// / wss:// 的 codec 工厂（每加一条端点建一个，与 server / client 活得一样久）。
     std::vector<std::unique_ptr<IFrameCodecFactory>> codec_factories_;
-    // tls:// / wss:// 用的上下文，Init 时按 NetModuleOptions::tls 建。
-    std::shared_ptr<const IStreamLayerFactory> tls_server_;
-    std::shared_ptr<const IStreamLayerFactory> tls_client_;
+    // tls:// / wss:// 用的上下文，Init 时按 NetModuleOptions::tls 建；之后指针本身不再变（ReloadTls 只换里面的上下文）。
+    std::shared_ptr<ReloadableTlsLayer> tls_server_;
+    std::shared_ptr<ReloadableTlsLayer> tls_client_;
 };
 
 } // namespace breeze

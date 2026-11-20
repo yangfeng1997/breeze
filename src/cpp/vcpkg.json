@@ -3,7 +3,6 @@
   "version": "0.1.0",
   "builtin-baseline": "9eec002df1cd109f8f104cd966a763daf9751489",
   "dependencies": [
-    "boringssl",
     "cli11",
     "concurrentqueue",
     "fmt",
@@ -13,7 +12,16 @@
     "spdlog",
     "yaml-cpp"
   ],
+  "default-features": [
+    "tls"
+  ],
   "features": {
+    "tls": {
+      "description": "BoringSSL：breeze_net_tls（tls:// 与 wss://）。不要 TLS 的构建用 -DVCPKG_MANIFEST_NO_DEFAULT_FEATURES=ON 配 -DBREEZE_BUILD_NET_TLS=OFF（release-notls 预设）",
+      "dependencies": [
+        "boringssl"
+      ]
+    },
     "lua-apicheck": {
       "description": "Build Lua with LUA_USE_APICHECK + LUAI_ASSERT for breeze::lua_binding tests",
       "dependencies": [

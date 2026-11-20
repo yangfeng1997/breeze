@@ -620,6 +620,35 @@ std::expected<void, Error> NetModule::Start()
 
 bool NetModule::Wake() { return executor_.Drain(options_.wake_budget); }
 
+std::expected<void, Error> NetModule::ReloadTls()
+{
+    if (!tls_server_ && !tls_client_)
+        return Fail(Errc::Module, "net: 没有 TLS 上下文可以重载（net.tls 没配证书 / server_name，或还没 Init）");
+    std::string errors;
+    const auto reload = [&](const std::shared_ptr<ReloadableTlsLayer>& layer, std::string_view which)
+    {
+        if (!layer)
+            return;
+        std::string err;
+        if (layer->Reload(options_.tls, err))
+            LOG_INFO("net: TLS {}上下文已重载", which);
+        else
+        {
+            if (!errors.empty())
+                errors += "；";
+            errors += fmt::format("{}上下文重载失败（保持旧的）：{}", which, err);
+        }
+    };
+    reload(tls_server_, "服务端");
+    reload(tls_client_, "客户端");
+    if (!errors.empty())
+    {
+        LOG_WARN("net: {}", errors);
+        return Fail(Errc::Module, fmt::format("net: {}", errors));
+    }
+    return {};
+}
+
 void NetModule::Shutdown()
 {
     if (phase_ != Phase::Started)
