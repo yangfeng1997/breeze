@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "base/net/loop/event_loop_group.h"
+#include "base/net/loop/group_access.h"
 #include "base/net/stream/stream_client.h"
 #include "base/net/stream/stream_server.h"
 #include "base/net/testing/fake_layer_test_util.h"
@@ -575,6 +576,75 @@ void TestLibraryClientRetriesAfterRejection()
     CHECK(cs.group.GetStats().handshake_failed[static_cast<std::size_t>(HandshakeFailure::Upgrade)] >= 3);
 }
 
+// 批内合并与变长帧头：一段 Send 里每条的帧头长度不同（2 / 4 / 10 字节，由 payload 长度决定），合成一次 sendmsg 时
+// 每帧要带着自己的帧头；明文连接（Plain）与叠在层上的连接（Layered，wss 的形状）各走一遍。
+void TestBatchedSendsKeepEveryFrameHeader()
+{
+    const LeakCheck leak;
+    for (const bool layered : {false, true})
+    {
+        const auto layer = layered ? std::make_shared<FakeLayerFactory>() : nullptr;
+        WsServerOptions so;
+        so.max_message_bytes = 1 << 20;
+        WsServer s(so, 5s, layer);
+        s.rec.on_message = nullptr;
+        auto c = OpenRaw(s, /*fake_layer=*/layered);
+        const ConnectionHandle h = s.rec.WaitConnected(0);
+        EventLoop& loop = GroupAccess::LoopAt(s.group, 0);
+
+        std::vector<std::string> sent;
+        {
+            LoopGate gate(loop);
+            // 0 / 1 / 125（2 字节头）、126 / 300 / 65535（4 字节头）、65536 / 70000（10 字节头）穿插
+            for (const std::size_t n : {std::size_t{0}, std::size_t{5}, std::size_t{300}, std::size_t{1}, std::size_t{70000}, std::size_t{125},
+                                        std::size_t{126}, std::size_t{65535}, std::size_t{65536}, std::size_t{2}, std::size_t{4000}})
+            {
+                sent.emplace_back(n, static_cast<char>('A' + n % 26));
+                CHECK(h.Send(Buf(sent.back())) == SendResult::Ok);
+            }
+        }
+        for (const std::string& p : sent)
+            CHECK(c->ReadFrame() == Bin(p));
+        CHECK(WaitUntil([&] { return loop.table().PendingBytes(h.slot()) == 0; }));
+        CHECK(WaitUntil([&] { return s.stats().messages_out == sent.size(); }));
+        c.reset();
+        s.rec.WaitClosed(0);
+    }
+}
+
+// 库自己的 ws 客户端（出站要掩码，走分层连接）成批发送：合并路径必须退回逐条，每一帧都要带掩码——
+// 否则服务端按规范拒绝未掩码的客户端帧（1002）。回显回来的内容与顺序要对得上。
+void TestBatchedSendsFromLibraryClientAreMasked()
+{
+    const LeakCheck leak;
+    WsServerOptions so;
+    so.max_message_bytes = 1 << 20;
+    WsServer s(so);
+    WsClientOptions co;
+    co.max_message_bytes = 1 << 20;
+    WsClientSide cs(co);
+    {
+        StreamClient c(cs.group, s.ep(), StreamClientOptions{}, FastPolicy(), cs.rec, cs.factory);
+        CHECK(c.Start() == 0);
+        cs.rec.WaitConnected(0);
+        EventLoop& loop = GroupAccess::LoopAt(cs.group, 0);
+        std::vector<std::string> sent;
+        {
+            LoopGate gate(loop);
+            for (int i = 0; i < 12; ++i)
+            {
+                sent.emplace_back(static_cast<std::size_t>(i * 13 % 90) + 1, static_cast<char>('a' + i));
+                CHECK(c.Send(Buf(sent.back())) == SendResult::Ok);
+            }
+        }
+        CHECK(cs.rec.WaitMessages(sent.size(), 10s));
+        CHECK(cs.rec.payloads() == sent);
+        CHECK(s.rec.closed_count() == 0); // 没有因为未掩码的帧被服务端关掉
+    }
+    cs.rec.CheckInvariants();
+    s.rec.CheckInvariants();
+}
+
 // ---- ws 叠在字节流层上（wss 的叠加方式）----
 
 void TestWsOverStreamLayer()
@@ -639,6 +709,8 @@ int main()
     TestEstablishedConnectionSurvivesHandshakeTimeout();
     TestServerGracefulClose();
     TestBroadcastSharedPayload();
+    TestBatchedSendsKeepEveryFrameHeader();
+    TestBatchedSendsFromLibraryClientAreMasked();
     TestLargeMessages();
     TestUpgradeContextVisibleInOnConnected();
     TestManyConnections();

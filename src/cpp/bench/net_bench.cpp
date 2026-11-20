@@ -590,12 +590,14 @@ class MainLoopServer final : public EchoServer
                   EchoBiz& biz,
                   const Endpoint& listen,
                   bool rudp,
+                  std::string scheme,
                   std::promise<Endpoint>& ready,
                   RUdpServer*& rudp_out)
             : Module(a)
             , biz_(biz)
             , listen_(listen)
             , rudp_(rudp)
+            , scheme_(std::move(scheme))
             , ready_(ready)
             , rudp_out_(rudp_out)
         {
@@ -619,7 +621,11 @@ class MainLoopServer final : public EchoServer
                 rudp_out_ = *s; // Start 里的 set_value 把它发布给压测线程
                 return {};
             }
-            auto s = net->AddServer(listen_.ToString(), biz_, factory_);
+            // tls / ws / wss：把 tcp:// 换成对应的 scheme（NetModule 按 net.tls 的证书建上下文）；ws / wss 自带分帧，不给 codec 工厂。
+            std::string url = listen_.ToString();
+            if (scheme_ != "tcp")
+                url = scheme_ + url.substr(3);
+            auto s = (scheme_ == "ws" || scheme_ == "wss") ? net->AddServer(url, biz_) : net->AddServer(url, biz_, factory_);
             if (!s)
                 return std::unexpected(s.error());
             server_ = *s;
@@ -635,6 +641,7 @@ class MainLoopServer final : public EchoServer
         EchoBiz& biz_;
         Endpoint listen_;
         bool rudp_;
+        std::string scheme_;
         LengthPrefixCodecFactory factory_{1024 * 1024};
         std::promise<Endpoint>& ready_;
         RUdpServer*& rudp_out_;
@@ -643,9 +650,11 @@ class MainLoopServer final : public EchoServer
 
 public:
     // rudp = true：udp:// 端点（rudp 服务端，flush_on_send），业务照样在主循环线程上回显。
-    MainLoopServer(int mainloop_cpu, bool rudp)
+    // scheme：tcp（端点原样用）| tls | ws | wss（tcp 端点换 scheme；证书写到临时目录，经 net.tls 的路径交给 NetModule）。
+    MainLoopServer(int mainloop_cpu, bool rudp, std::string scheme = "tcp")
         : mainloop_cpu_(mainloop_cpu)
         , rudp_(rudp)
+        , scheme_(std::move(scheme))
     {
     }
 
@@ -654,6 +663,24 @@ public:
         NetModuleOptions no;
         no.group = {1, g_table_slots}; // 连接表要装得下全部连接
         no.rudp.flush_on_send = true; // 只对 udp:// 生效，与 rudp 一样用低延迟配置
+#if !defined(BREEZE_BENCH_NO_TLS)
+        if (scheme_ == "tls" || scheme_ == "wss")
+        {
+            char tmpl[] = "/tmp/breeze_bench_tls_XXXXXX";
+            REQUIRE(::mkdtemp(tmpl) != nullptr);
+            cert_dir_ = tmpl;
+            const auto write = [&](const char* name, const std::string& text)
+            {
+                const std::string path = cert_dir_ + "/" + name;
+                std::FILE* f = std::fopen(path.c_str(), "wb");
+                REQUIRE(f != nullptr && std::fwrite(text.data(), 1, text.size(), f) == text.size());
+                std::fclose(f);
+                return path;
+            };
+            no.tls.cert_chain_file = write("server.pem", BenchCerts().server.cert_pem);
+            no.tls.private_key_file = write("server.key", BenchCerts().server.key_pem);
+        }
+#endif
         app_ = std::make_unique<App>("bench");
         app_->RegisterModule(
             [&](App& a)
@@ -664,7 +691,7 @@ public:
             });
         std::promise<Endpoint> ready;
         app_->RegisterModule([&](App& a)
-                             { return std::make_unique<BizModule>(a, biz_, ep, rudp_, ready, rudp_server_); });
+                             { return std::make_unique<BizModule>(a, biz_, ep, rudp_, scheme_, ready, rudp_server_); });
         auto bound = ready.get_future();
         thread_ = std::thread(
             [this]
@@ -692,6 +719,12 @@ public:
         thread_.join();
         // 压测客户端已经全部关闭：不排空，直接销毁（group 析构兜底停 IO 线程）。
         app_.reset();
+        if (!cert_dir_.empty())
+        {
+            ::unlink((cert_dir_ + "/server.pem").c_str());
+            ::unlink((cert_dir_ + "/server.key").c_str());
+            ::rmdir(cert_dir_.c_str());
+        }
     }
     pthread_t ServerThread() override { return io_thread_; }
     pthread_t ExtraThread() override { return thread_.native_handle(); }
@@ -712,6 +745,8 @@ public:
 private:
     int mainloop_cpu_;
     bool rudp_;
+    std::string scheme_;
+    std::string cert_dir_; // tls / wss：证书临时目录（进程退出前由 Stop 清理）
     RUdpServer* rudp_server_ = nullptr;
     EchoBiz biz_;
     std::unique_ptr<App> app_;
@@ -933,6 +968,8 @@ private:
 std::unique_ptr<EchoServer> MakeServer(const std::string& impl, const std::string& transport, std::size_t size, int mainloop_cpu)
 {
 #if !defined(BREEZE_BENCH_NO_TLS)
+    if ((transport == "tls" || transport == "ws" || transport == "wss") && impl == "breeze-mainloop")
+        return std::make_unique<MainLoopServer>(mainloop_cpu, false, transport);
     if (transport == "tls")
         return std::make_unique<SecureServer>(/*tls=*/true, /*ws=*/false);
     if (transport == "ws")
@@ -1281,8 +1318,11 @@ public:
         {
             REQUIRE(msg.size() == payload_.size() &&
                     std::memcmp(msg.data(), payload_.data(), payload_.size()) == 0); // 别拿回显错了的实现比性能
-            c.verified = true;
         }
+        if (++c.got < g_fanout) // 服务端对每条请求回 g_fanout 条：等齐才算一次往返
+            return;
+        c.got = 0;
+        c.verified = true;
         if (measuring_ != nullptr && measuring_->load(std::memory_order_relaxed))
         {
             const auto lat =
@@ -1316,6 +1356,7 @@ private:
     struct ConnState
     {
         bool verified = false;
+        int got = 0; // 本次往返已收到的回复条数
         BenchClock::time_point sent_at;
         BenchClock::time_point due; // 定速：下一次该发送的时刻
     };
@@ -1954,16 +1995,16 @@ int main(int argc, char** argv)
     if (secure)
         Die("这个构建没有 TLS（BREEZE_BUILD_NET_TLS=OFF），--transport tls / ws / wss 不可用");
 #endif
-    if (secure && o.impl != "breeze")
-        Die("--transport tls / ws / wss 只支持 --impl breeze（TLS 与 WebSocket 由本库的层与 codec 实现）");
+    if (secure && o.impl != "breeze" && o.impl != "breeze-mainloop")
+        Die("--transport tls / ws / wss 只支持 --impl breeze（IO 线程回显）与 breeze-mainloop（经 NetModule 与主循环）");
     if (secure && o.mem_probe > 0)
         Die("tls / ws / wss 的 --mem-probe 暂不支持：每条服务端 TLS 连接的内存见 tls_layer_test 的 "
             "TestIdleServerLayerMemory（实测约 3171 字节）");
 
     if (g_fanout < 1 || g_fanout > 32)
         Die("--fanout 要在 1 到 32 之间");
-    if (g_fanout > 1 && (o.impl != "breeze-mainloop" || o.transport == "udp" || secure))
-        Die("--fanout 只配 --impl breeze-mainloop 与 tcp / uds（要经 NetModule 的跨线程 Send）");
+    if (g_fanout > 1 && (o.impl != "breeze-mainloop" || o.transport == "udp"))
+        Die("--fanout 只配 --impl breeze-mainloop（要经 NetModule 的跨线程 Send），传输 tcp / uds / tls / ws / wss");
 
     g_table_slots = std::max(o.conns, o.mem_probe) > 60000 ? (1u << 17) : (1u << 16);
     auto server = MakeServer(o.impl, o.transport, o.size, o.mainloop_cpu);

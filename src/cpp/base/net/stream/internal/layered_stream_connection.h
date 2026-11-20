@@ -44,6 +44,7 @@ private:
 
     void OnEvents(std::uint32_t events) override;
     void SendFromTask(SharedBuffer payload) override;
+    void SendBatchFromTask(std::span<SharedBuffer> payloads) override;
     void OnEstablish() override;
     void FinishWrites() override;
     void WriteRaw(std::span<const std::byte> bytes) override;

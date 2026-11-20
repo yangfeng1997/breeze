@@ -29,6 +29,7 @@
 
 #include "base/net/codec/length_prefix_codec.h"
 #include "base/net/loop/event_loop_group.h"
+#include "base/net/loop/group_access.h"
 #include "base/net/stream/stream_client.h"
 #include "base/net/stream/stream_server.h"
 #include "base/net/testing/net_test_util.h"
@@ -430,6 +431,98 @@ void TestCrossThreadSendOverTls()
     }
 }
 
+// 批内合并（TLS）：服务端经句柄对同一连接连续 Send，被 IO 线程同一批取走时整段加密、一次 send（SSL_write 次数不变）。
+// 客户端按序收齐、内容对得上；含超过一个 record 的帧、总量超过层内字节预算（64KB）而部分入队的段；记账回零。
+void TestBatchedSendsOverTls()
+{
+    const LeakCheck leak;
+    TlsServer s(MustServer(ServerOpts(P().server)));
+    s.rec.on_message = nullptr; // 不回显
+    TlsClientSide cs;
+    {
+        StreamClient c(cs.group, s.ep(), TlsClientSide::Options(MustClient(ClientOpts(P().ca))), FastPolicy(), cs.rec, cs.codec);
+        CHECK(c.Start() == 0);
+        cs.rec.WaitConnected(0);
+        const ConnectionHandle sh = s.rec.WaitConnected(0);
+        EventLoop& loop = GroupAccess::LoopAt(s.group, 0);
+
+        std::size_t total = 0;
+        std::uint64_t frames = 0;
+        // 每一轮 n 条、大小参差（含 16KB 边界与多 record 的大帧），整轮在同一批里被取走
+        for (const int n : {2, 3, 15, 16, 17, 40, 100})
+        {
+            std::vector<std::string> sent;
+            {
+                LoopGate gate(loop);
+                for (int i = 0; i < n; ++i)
+                {
+                    const std::size_t size = static_cast<std::size_t>((i * 37) % 300) + (i % 5 == 0 ? 20000u : 0u) + (i % 11 == 0 ? 16384u : 0u);
+                    sent.push_back(Pattern(size, i + n));
+                    CHECK(sh.Send(Buf(sent.back())) == SendResult::Ok);
+                }
+            }
+            frames += static_cast<std::uint64_t>(n);
+            CHECK(cs.rec.WaitMessages(total + static_cast<std::size_t>(n), 30s));
+            const auto got = cs.rec.payloads();
+            for (int i = 0; i < n; ++i)
+                CHECK(got[total + static_cast<std::size_t>(i)] == sent[static_cast<std::size_t>(i)]);
+            total += static_cast<std::size_t>(n);
+        }
+
+        // 总量远超层内预算：16 帧 × 1MB，前几帧加密进层、其余按序入队，EPOLLOUT 排空
+        std::vector<std::string> big;
+        {
+            LoopGate gate(loop);
+            for (int i = 0; i < 16; ++i)
+            {
+                big.push_back(Pattern(1u << 20, 100 + i));
+                CHECK(sh.Send(Buf(big.back())) == SendResult::Ok);
+            }
+        }
+        frames += 16;
+        CHECK(cs.rec.WaitMessages(total + 16, 60s));
+        const auto got = cs.rec.payloads();
+        for (int i = 0; i < 16; ++i)
+            CHECK(got[total + static_cast<std::size_t>(i)] == big[static_cast<std::size_t>(i)]);
+
+        CHECK(WaitUntil([&] { return loop.table().PendingBytes(sh.slot()) == 0; }));
+        CHECK(WaitUntil([&] { return s.stats().messages_out == frames; }));
+        CHECK(s.rec.closed_count() == 0);
+    }
+    cs.rec.CheckInvariants();
+    s.rec.CheckInvariants();
+}
+
+// 段里夹了一个超过 codec 上限的 payload（LengthPrefix 16MB）：退回逐条，行为与没合并时一样——它之前的帧送达，
+// 它触发协议错误关连接，之后的被丢弃。（帧头编码在加密之前，所以不必真的加密 17MB。）
+void TestBatchWithOversizePayloadOverTls()
+{
+    const LeakCheck leak;
+    TlsServer s(MustServer(ServerOpts(P().server)));
+    s.rec.on_message = nullptr;
+    TlsClientSide cs;
+    {
+        StreamClient c(cs.group, s.ep(), TlsClientSide::Options(MustClient(ClientOpts(P().ca))), FastPolicy(), cs.rec, cs.codec);
+        CHECK(c.Start() == 0);
+        cs.rec.WaitConnected(0);
+        const ConnectionHandle sh = s.rec.WaitConnected(0);
+        EventLoop& loop = GroupAccess::LoopAt(s.group, 0);
+        {
+            LoopGate gate(loop);
+            CHECK(sh.Send(Buf("s0")) == SendResult::Ok);
+            CHECK(sh.Send(Buf("s1")) == SendResult::Ok);
+            SharedBuffer big = SharedBuffer::Create(kMaxFrame + 1);
+            std::memset(big.MutableBytes().data(), 'z', big.size());
+            CHECK(sh.Send(std::move(big)) == SendResult::Ok);
+            CHECK(sh.Send(Buf("s3")) == SendResult::Ok);
+        }
+        CHECK(cs.rec.WaitMessages(2, 10s));
+        CHECK(s.rec.WaitClosed(0).reason == CloseReason::ProtocolError);
+        const auto got = cs.rec.payloads();
+        CHECK(got.size() == 2 && got[0] == "s0" && got[1] == "s1"); // 没有大帧、也没有 s3
+    }
+}
+
 // 很多连接同时握手、收发、断开（服务端 2 个 IO 线程）。
 void TestManyConcurrentConnections()
 {
@@ -699,6 +792,8 @@ int main()
     RUN(TestPauseResumeOverTls);
     RUN(TestIdleTimeoutOverTls);
     RUN(TestCrossThreadSendOverTls);
+    RUN(TestBatchedSendsOverTls);
+    RUN(TestBatchWithOversizePayloadOverTls);
     RUN(TestManyConcurrentConnections);
     RUN(TestCertificateReload);
     RUN(TestInteropOpenSslClient);

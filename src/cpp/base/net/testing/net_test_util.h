@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <future>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -110,6 +111,37 @@ public:
 
 private:
     std::string path_;
+};
+
+// 堵住 loop 线程直到 Open()（或析构）：此后经句柄的 Send / Close 都排在任务队列里，放开时被同一批取走
+// （一批最多 64 个任务）。测批内合并（相邻的同连接 Send）用：它保证这些 Send 确定地凑在同一批里。
+class LoopGate
+{
+public:
+    explicit LoopGate(EventLoop& loop)
+    {
+        loop.Post(
+            [this, f = release_.get_future().share()]
+            {
+                started_.store(true);
+                f.wait();
+            });
+        CHECK(WaitUntil([&] { return started_.load(); }));
+    }
+    ~LoopGate() { Open(); }
+    void Open()
+    {
+        if (!opened_)
+        {
+            opened_ = true;
+            release_.set_value();
+        }
+    }
+
+private:
+    std::promise<void> release_;
+    std::atomic<bool> started_{false};
+    bool opened_ = false;
 };
 
 // 在 loop 线程上执行 fn 并等它跑完（loop 已经在运行时，Acceptor::Listen 之类只能在 loop 线程调用）。

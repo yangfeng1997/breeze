@@ -221,6 +221,60 @@ void LayeredStreamConnection::SendFromTask(SharedBuffer payload)
     (void)SendImpl(payload.bytes(), &payload, true);
 }
 
+// 批内相邻的 Send（EventLoop::RunSendRun）：无积压时把这一段**整段加密进层、最后只 send 一次**——K 次 send 变 1 次，
+// SSL_write 的次数不变。语义与逐条 SendFromTask 一致：层内字节有预算（kWireBudget），加密不完的帧按序入队（pending_bytes
+// 发送方已经加过、不再查水位）；整帧加密完的减 pending_bytes 并计 messages_out。
+// 有积压（要保序）、只有一条、帧头编码失败、codec 要改写出站 payload（WebSocket 客户端的掩码要逐条拷贝）都退回逐条。
+void LayeredStreamConnection::SendBatchFromTask(std::span<SharedBuffer> payloads)
+{
+    if (state_ != State::Connected)
+        return;
+    const std::size_t count = payloads.size();
+    const auto one_by_one = [&]
+    {
+        for (SharedBuffer& p : payloads)
+            SendFromTask(std::move(p));
+    };
+    if (count < 2 || count > kMaxSendBatch || encodes_payload_ || !out_.empty() || !layer_->PendingWire().empty())
+        return one_by_one();
+
+    loop_.AssertInLoopThread();
+    std::array<std::byte, kMaxFrameHeaderSize> headers[kMaxSendBatch]; // 不清零：只有 header_len 个字节会被用到
+    std::size_t header_len[kMaxSendBatch];
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        header_len[i] = codec_->EncodeHeader(payloads[i].size(), headers[i]);
+        if (header_len[i] == 0)
+            return one_by_one(); // 有 payload 超过 codec 上限：还没加密任何字节，交给逐条路径按原有规则关连接
+    }
+
+    std::size_t i = 0;
+    std::size_t consumed = 0; // 第 i 帧已经加密的字节（帧头 + payload 合计）
+    for (; i < count; ++i)
+    {
+        consumed = EncryptFrame(headers[i].data(), header_len[i], payloads[i].bytes(), 0);
+        if (state_ == State::Disconnected)
+            return; // 层出错，连接已在 EncryptFrame 里关闭
+        if (consumed != header_len[i] + payloads[i].size())
+            break; // 层内字节到预算了：这一帧（及之后）剩下的入队
+        slot_.pending_bytes.fetch_sub(payloads[i].size(), std::memory_order_relaxed);
+        LoopStats::Bump(loop_.stats().messages_out);
+    }
+    for (; i < count; ++i) // 第一帧带已加密的偏移，其后整帧入队，保序
+    {
+        Pending& p = out_.emplace_back();
+        p.header = headers[i];
+        p.header_len = static_cast<std::uint8_t>(header_len[i]);
+        p.payload = std::move(payloads[i]);
+        p.offset = consumed;
+        consumed = 0;
+        LoopStats::Bump(loop_.stats().messages_out);
+    }
+    FlushWire(); // 整段一次 send；写不完它自己注册 EPOLLOUT
+    if (state_ != State::Disconnected && !out_.empty() && !want_write_)
+        SetWriteInterest(true);
+}
+
 std::size_t LayeredStreamConnection::EncryptFrame(const std::byte* header,
                                                   std::size_t header_len,
                                                   std::span<const std::byte> payload,
