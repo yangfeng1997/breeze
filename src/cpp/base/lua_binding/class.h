@@ -55,7 +55,7 @@ template <class M>
 
     C* self = GetObjectAs<C>(L, 1, declaring);
     if (self == nullptr) {
-        err.Set(ErrorCode::kType, "breeze::lua_binding: bad self (expected object)");
+        err.SetError(ErrorCode::kType, "breeze::lua_binding: bad self (expected object)");
         return -1;
     }
     if (!CheckArgsAt(L, err, 1, static_cast<args_tuple*>(nullptr), std::make_index_sequence<kArity>{})) {
@@ -77,10 +77,10 @@ template <class M>
         }
 #if defined(__cpp_exceptions)
     } catch (const std::exception& e) {
-        err.Set(ErrorCode::kRuntime, e.what());
+        err.SetError(ErrorCode::kLuaError, e.what());
         return -1;
     } catch (...) {
-        err.Set(ErrorCode::kRuntime, "unknown C++ exception in a bound method");
+        err.SetError(ErrorCode::kLuaError, "unknown C++ exception in a bound method");
         return -1;
     }
 #endif
@@ -122,15 +122,15 @@ template <class T, class... A>
         obj = std::apply([](auto&&... item) { return new T(std::forward<decltype(item)>(item)...); }, args);
 #if defined(__cpp_exceptions)
     } catch (const std::exception& e) {
-        err.Set(ErrorCode::kRuntime, e.what());
+        err.SetError(ErrorCode::kLuaError, e.what());
         return -1;
     } catch (...) {
-        err.Set(ErrorCode::kRuntime, "unknown C++ exception in a bound constructor");
+        err.SetError(ErrorCode::kLuaError, "unknown C++ exception in a bound constructor");
         return -1;
     }
 #endif
     if (obj == nullptr) {
-        err.Set(ErrorCode::kRuntime, "breeze::lua_binding: constructor returned null");
+        err.SetError(ErrorCode::kInvalidState, "breeze::lua_binding: constructor returned null");
         return -1;
     }
     PushOwnedObject<T>(L, obj, cls);
@@ -247,7 +247,7 @@ public:
     ClassBuilder& Property(std::string_view name, G getter, S setter) {
         using GT = function_traits<G>;
         using SC = typename function_traits<S>::class_type;
-        using SetArg = std::tuple_element_t<0, typename function_traits<S>::method_args>;
+        using SetterArg = std::tuple_element_t<0, typename function_traits<S>::method_args>;
 
         auto* desc = new PropertyDesc;
         desc->getter = [getter](lua_State* L, void* obj) {
@@ -256,7 +256,7 @@ public:
             Stack<R>::Push(L, value);
         };
         desc->setter = [setter](lua_State* L, void* obj) {
-            ArgStorage<SetArg> value = Stack<ArgStorage<SetArg>>::Get(L, 3);
+            ArgStorage<SetterArg> value = Stack<ArgStorage<SetterArg>>::Get(L, 3);
             std::invoke(setter, static_cast<SC*>(obj), std::move(value));
         };
         cls_->props.push_back(desc);

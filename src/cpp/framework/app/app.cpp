@@ -185,7 +185,8 @@ Result<> App::Build()
             return StateErr("build", state_, Lifecycle::New);
         if (name_.empty())
             return Fail(Errc::EmptyName, std::format("{}", Describe(Errc::EmptyName)));
-        factories = factories_;
+        // 工厂是 move-only 的，整批取走；Build 失败后 App 不可重试（与“启动失败不回滚”一致）。
+        factories = std::move(factories_);
     }
 
     // 工厂在锁外调用：工厂里可能回调 App，持锁会重入

@@ -20,52 +20,53 @@ using namespace breeze::lua_binding;
 
 int main() {
     LuaState lua;
-    CHECK(lua.RunScript("function co() coroutine.yield(1); return 2 end").Ok());
-    LuaFunction function = lua.GetFunction("co").Value();
-    Result<Coroutine> created = Coroutine::Create(lua, function);
-    CHECK(created.Ok());
+    CHECK(lua.RunScript("function co() coroutine.yield(1); return 2 end").has_value());
+    LuaFunction function = ValueOrDie(lua.GetFunction("co"));
+    std::expected<Coroutine, Error> created = Coroutine::Create(lua, function);
+    CHECK(created.has_value());
 
-    Coroutine& coroutine = created.Value();
+    Coroutine& coroutine = ValueOrDie(created);
     auto first = coroutine.Resume();
-    CHECK(first.Ok());
-    CHECK(first.Value().yielded);
+    CHECK(first.has_value());
+    CHECK(ValueOrDie(first).yielded);
     CHECK(!coroutine.Done());
 
     auto second = coroutine.Resume();
-    CHECK(second.Ok());
-    CHECK(!second.Value().yielded);
+    CHECK(second.has_value());
+    CHECK(!ValueOrDie(second).yielded);
     CHECK(coroutine.Done());
 
     auto third = coroutine.Resume();
-    CHECK(!third.Ok());
+    CHECK(!third.has_value());
+    CHECK(third.error().code == ErrorCode::kInvalidState);
 
     // 取消：挂起时标记，下一次 Resume 立即返回 kCancelled。
-    CHECK(lua.RunScript("function quick() return 1 end").Ok());
-    LuaFunction quick = lua.GetFunction("quick").Value();
-    Result<Coroutine> quick_coroutine = Coroutine::Create(lua, quick);
-    CHECK(quick_coroutine.Ok());
-    ResumeToken quick_token = quick_coroutine.Value().Token();
+    CHECK(lua.RunScript("function quick() return 1 end").has_value());
+    LuaFunction quick = ValueOrDie(lua.GetFunction("quick"));
+    std::expected<Coroutine, Error> quick_coroutine = Coroutine::Create(lua, quick);
+    CHECK(quick_coroutine.has_value());
+    ResumeToken quick_token = ValueOrDie(quick_coroutine).Token();
     quick_token.Cancel();
-    auto cancelled_before_resume = quick_coroutine.Value().Resume();
-    CHECK(!cancelled_before_resume.Ok());
-    CHECK(cancelled_before_resume.GetError().code == ErrorCode::kCancelled);
+    auto cancelled_before_resume = ValueOrDie(quick_coroutine).Resume();
+    CHECK(!cancelled_before_resume.has_value());
+    CHECK(cancelled_before_resume.error().code == ErrorCode::kCancelled);
 
     // 运行中取消：count hook 看到原子标志后中断死循环。
-    CHECK(lua.RunScript("function spin() coroutine.yield(); while true do end end").Ok());
-    LuaFunction spin = lua.GetFunction("spin").Value();
-    Result<Coroutine> spin_coroutine = Coroutine::Create(lua, spin);
-    CHECK(spin_coroutine.Ok());
-    ResumeToken spin_token = spin_coroutine.Value().Token();
-    auto yielded = spin_coroutine.Value().Resume();
-    CHECK(yielded.Ok());
-    CHECK(yielded.Value().yielded);
+    CHECK(lua.RunScript("function spin() coroutine.yield(); while true do end end").has_value());
+    LuaFunction spin = ValueOrDie(lua.GetFunction("spin"));
+    std::expected<Coroutine, Error> spin_coroutine = Coroutine::Create(lua, spin);
+    CHECK(spin_coroutine.has_value());
+    ResumeToken spin_token = ValueOrDie(spin_coroutine).Token();
+    auto yielded = ValueOrDie(spin_coroutine).Resume();
+    CHECK(yielded.has_value());
+    CHECK(ValueOrDie(yielded).yielded);
     spin_token.Cancel();
-    auto cancelled_running = spin_coroutine.Value().Resume();
-    CHECK(!cancelled_running.Ok());
-    CHECK(cancelled_running.GetError().code == ErrorCode::kCancelled);
+    auto cancelled_running = ValueOrDie(spin_coroutine).Resume();
+    CHECK(!cancelled_running.has_value());
+    CHECK(cancelled_running.error().code == ErrorCode::kCancelled);
 
     // Token 可以在任意线程析构：析构只减原子引用计数，不碰 VM。
-    ResumeToken moved = spin_coroutine.Value().Token();
+    ResumeToken moved = ValueOrDie(spin_coroutine).Token();
     std::thread worker([token = std::move(moved)]() mutable { token = ResumeToken{}; });
     worker.join();
 

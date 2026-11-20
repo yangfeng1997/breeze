@@ -70,7 +70,7 @@ inline std::optional<Error> CheckTupleReturns(lua_State* L, int first, std::inde
     return std::nullopt;
 }
 
-// 不保护调用后的读返回值：类型不匹配是致命错误（Fatal），没有 Result 可返回。
+// 不保护调用后的读返回值：类型不匹配是致命错误（Fatal），没有 std::expected 可返回。
 template <class R>
 R ReadResultsUnprotected(lua_State* L, int first_result, int restore) {
     using D = std::remove_cvref_t<R>;
@@ -103,15 +103,15 @@ R ReadResultsUnprotected(lua_State* L, int first_result, int restore) {
 // ReturnCount<R>），restore 是调用前的栈顶（结果与错误处理函数都会被清掉）。
 // 返回值类型不匹配是 kType，不能静默变成 0 / false / 空串。
 template <class R>
-Result<R> ReadResults(lua_State* L, int first_result, int restore) {
+std::expected<R, Error> ReadResults(lua_State* L, int first_result, int restore) {
     using D = std::remove_cvref_t<R>;
     if constexpr (std::is_void_v<D>) {
         lua_settop(L, restore);
-        return Ok();
+        return {};
     } else if constexpr (is_tuple_like_v<D>) {
         if (auto error = CheckTupleReturns<D>(L, first_result, std::make_index_sequence<std::tuple_size_v<D>>{})) {
             lua_settop(L, restore);
-            return std::move(*error);
+            return std::unexpected(std::move(*error));
         }
         D value = ReadTuple<D>(L, first_result, std::make_index_sequence<std::tuple_size_v<D>>{});
         lua_settop(L, restore);
@@ -120,7 +120,7 @@ Result<R> ReadResults(lua_State* L, int first_result, int restore) {
         if (!Stack<D>::Check(L, first_result)) {
             Error error = ReturnTypeError<D>(L, first_result);
             lua_settop(L, restore);
-            return error;
+            return std::unexpected(std::move(error));
         }
         D value = Stack<D>::Get(L, first_result);
         lua_settop(L, restore);
@@ -131,11 +131,11 @@ Result<R> ReadResults(lua_State* L, int first_result, int restore) {
 // 函数已经在栈上（func_index）。压 msgh、把 msgh 移到函数下面，再调用。
 // 与 CallGlobal 的区别只是“函数从哪来”。
 template <class R, class... Args>
-Result<R> CallPushed(lua_State* L, int func_index, Args&&... args) {
+std::expected<R, Error> CallPushed(lua_State* L, int func_index, Args&&... args) {
     const int base = lua_absindex(L, func_index);
     if (!lua_checkstack(L, static_cast<int>(sizeof...(Args)) + 5)) {
         lua_settop(L, base - 1);
-        return Error{ErrorCode::kStack, "breeze::lua_binding: Lua stack overflow while pushing arguments"};
+        return Fail(ErrorCode::kStack, "breeze::lua_binding: Lua stack overflow while pushing arguments");
     }
     lua_pushcfunction(L, &MessageHandler);
     lua_insert(L, base);  // [.., msgh, function]
@@ -145,18 +145,18 @@ Result<R> CallPushed(lua_State* L, int func_index, Args&&... args) {
     const int status = lua_pcall(L, static_cast<int>(sizeof...(Args)), ReturnCount<R>(), base);
     if (status != LUA_OK) {
         std::string message = TakeError(L, base - 1);
-        return Error{status == LUA_ERRMEM ? ErrorCode::kMemory : ErrorCode::kRuntime, std::move(message)};
+        return Fail(status == LUA_ERRMEM ? ErrorCode::kMemory : ErrorCode::kLuaError, std::move(message));
     }
     return ReadResults<R>(L, base + 1, base - 1);
 }
 
 // registry 引用版本：先压 msgh，再压函数，省掉 CallPushed 的 lua_insert。
 template <class R, class... Args>
-Result<R> CallRef(lua_State* L, int registry_ref, Args&&... args) {
+std::expected<R, Error> CallRef(lua_State* L, int registry_ref, Args&&... args) {
     const int base = lua_gettop(L);
     if (!lua_checkstack(L, static_cast<int>(sizeof...(Args)) + 4)) {
         lua_settop(L, base);
-        return Error{ErrorCode::kStack, "breeze::lua_binding: Lua stack overflow while pushing arguments"};
+        return Fail(ErrorCode::kStack, "breeze::lua_binding: Lua stack overflow while pushing arguments");
     }
     lua_pushcfunction(L, &MessageHandler);  // base + 1
     lua_rawgeti(L, LUA_REGISTRYINDEX, registry_ref);  // base + 2
@@ -165,17 +165,17 @@ Result<R> CallRef(lua_State* L, int registry_ref, Args&&... args) {
     const int status = lua_pcall(L, static_cast<int>(sizeof...(Args)), ReturnCount<R>(), base + 1);
     if (status != LUA_OK) {
         std::string message = TakeError(L, base);
-        return Error{status == LUA_ERRMEM ? ErrorCode::kMemory : ErrorCode::kRuntime, std::move(message)};
+        return Fail(status == LUA_ERRMEM ? ErrorCode::kMemory : ErrorCode::kLuaError, std::move(message));
     }
     return ReadResults<R>(L, base + 2, base);
 }
 
 template <class R, class... Args>
-Result<R> CallRefNoTraceback(lua_State* L, int registry_ref, Args&&... args) {
+std::expected<R, Error> CallRefNoTraceback(lua_State* L, int registry_ref, Args&&... args) {
     const int base = lua_gettop(L);
     if (!lua_checkstack(L, static_cast<int>(sizeof...(Args)) + 3)) {
         lua_settop(L, base);
-        return Error{ErrorCode::kStack, "breeze::lua_binding: Lua stack overflow while pushing arguments"};
+        return Fail(ErrorCode::kStack, "breeze::lua_binding: Lua stack overflow while pushing arguments");
     }
     lua_rawgeti(L, LUA_REGISTRYINDEX, registry_ref);  // base + 1
 
@@ -183,11 +183,11 @@ Result<R> CallRefNoTraceback(lua_State* L, int registry_ref, Args&&... args) {
     const int status = lua_pcall(L, static_cast<int>(sizeof...(Args)), ReturnCount<R>(), 0);
     if (status != LUA_OK) {
         std::string message = TakeError(L, base);
-        return Error{status == LUA_ERRMEM ? ErrorCode::kMemory : ErrorCode::kRuntime, std::move(message)};
+        return Fail(status == LUA_ERRMEM ? ErrorCode::kMemory : ErrorCode::kLuaError, std::move(message));
     }
     if constexpr (std::is_void_v<std::remove_cvref_t<R>>) {
         // lua_call(nresults = 0) 已经把函数和参数弹掉，栈顶就是 base。
-        return Ok();
+        return {};
     } else {
         return ReadResults<R>(L, base + 1, base);
     }
@@ -245,11 +245,11 @@ Tuple ReadTuple(lua_State* L, int first, std::index_sequence<I...>) {
 }
 
 template <class R, class... Args>
-Result<R> CallGlobal(lua_State* L, std::string_view name, Args&&... args) {
+std::expected<R, Error> CallGlobal(lua_State* L, std::string_view name, Args&&... args) {
     const int base = lua_gettop(L);
     if (!lua_checkstack(L, static_cast<int>(sizeof...(Args)) + 5)) {
         lua_settop(L, base);
-        return Error{ErrorCode::kStack, "breeze::lua_binding: Lua stack overflow while pushing arguments"};
+        return Fail(ErrorCode::kStack, "breeze::lua_binding: Lua stack overflow while pushing arguments");
     }
     lua_pushcfunction(L, &MessageHandler);
     const int msgh = base + 1;
@@ -259,8 +259,8 @@ Result<R> CallGlobal(lua_State* L, std::string_view name, Args&&... args) {
     if (!lua_isfunction(L, -1)) {
         const std::string actual = luaL_typename(L, -1);
         lua_settop(L, base);
-        return Error{ErrorCode::kNotFound,
-                     "breeze::lua_binding: global '" + key + "' is not a function (got " + actual + ")"};
+        return Fail(ErrorCode::kNotFound,
+                     "breeze::lua_binding: global '" + key + "' is not a function (got " + actual + ")");
     }
     // 栈已经是 [msgh][function]，不需要 lua_insert；pcall 的 errfunc 用 msgh 下标。
     PushArgs(L, std::forward<Args>(args)...);
@@ -268,7 +268,7 @@ Result<R> CallGlobal(lua_State* L, std::string_view name, Args&&... args) {
     const int status = lua_pcall(L, static_cast<int>(sizeof...(Args)), ReturnCount<R>(), msgh);
     if (status != LUA_OK) {
         std::string message = TakeError(L, base);
-        return Error{status == LUA_ERRMEM ? ErrorCode::kMemory : ErrorCode::kRuntime, std::move(message)};
+        return Fail(status == LUA_ERRMEM ? ErrorCode::kMemory : ErrorCode::kLuaError, std::move(message));
     }
     return ReadResults<R>(L, base + 2, base);
 }

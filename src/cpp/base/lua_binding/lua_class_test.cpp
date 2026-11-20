@@ -103,7 +103,7 @@ int main() {
         .Method("GetId", &Entity::GetId)
         .Property("id", &Entity::id);
 
-    CHECK(lua.RunScript("e = Entity(); assert(e.id == 0); e.id = 3; assert(e.id == 3)").Ok());
+    CHECK(lua.RunScript("e = Entity(); assert(e.id == 0); e.id = 3; assert(e.id == 3)").has_value());
 
     lua.Class<Player>("Player")
         .Constructor<int>()
@@ -129,29 +129,29 @@ int main() {
         assert(p.id == 3)
         assert(p:GetId() == 3)
     )lua");
-    if (!script.Ok()) {
-        std::fprintf(stderr, "script failed: %s\n", script.GetError().message.c_str());
+    if (!script.has_value()) {
+        std::fprintf(stderr, "script failed: %s\n", script.error().message.c_str());
         return 1;
     }
 
     // C++ 拥有（borrowed）：Lua 不 delete，C++ 自己管理。
     auto* borrowed = new Player(10);
     lua.Set("borrowed", borrowed);
-    CHECK(lua.RunScript("assert(borrowed:Hp() == 10)").Ok());
+    CHECK(lua.RunScript("assert(borrowed:Hp() == 10)").has_value());
     delete borrowed;
-    CHECK(lua.RunScript("borrowed = nil; collectgarbage('collect')").Ok());
+    CHECK(lua.RunScript("borrowed = nil; collectgarbage('collect')").has_value());
 
     // Lua 拥有：__gc 必须析构。
     CHECK(Lifetime::alive == 0);
     lua.Class<Lifetime>("Lifetime").Constructor<>();
-    CHECK(lua.RunScript("life = Lifetime()").Ok());
+    CHECK(lua.RunScript("life = Lifetime()").has_value());
     CHECK(Lifetime::alive == 1);
-    CHECK(lua.RunScript("life = nil; collectgarbage('collect')").Ok());
+    CHECK(lua.RunScript("life = nil; collectgarbage('collect')").has_value());
     CHECK(Lifetime::alive == 0);
 
     // 点号兼容模式：每次访问分配一个闭包，但调用语义正确。
     lua.Class<DotObj>("DotObj").Constructor<>().Method("Get", &DotObj::Get).DotCall();
-    CHECK(lua.RunScript("d = DotObj(); assert(d.Get() == 5)").Ok());
+    CHECK(lua.RunScript("d = DotObj(); assert(d.Get() == 5)").has_value());
 
     // 自动元方法：__tostring / __eq / __lt / __close；派生类继承基类的元方法。
     lua.Class<MetaBase>("MetaBase").Constructor<int>();
@@ -172,15 +172,15 @@ int main() {
         assert(d1 == d2)
         assert(tostring(Streamed(7)) == 'Streamed(7)')
     )lua");
-    if (!meta_script.Ok()) {
-        std::fprintf(stderr, "meta script failed: %s\n", meta_script.GetError().message.c_str());
+    if (!meta_script.has_value()) {
+        std::fprintf(stderr, "meta script failed: %s\n", meta_script.error().message.c_str());
         return 1;
     }
     CHECK(MetaBase::closed == 1);
 
     // 未自动检测的元方法走 MetaMethod 逃生门。
     lua.Class<LenObj>("LenObj").Constructor<>().MetaMethod("__len", &LenObjLen);
-    CHECK(lua.RunScript("assert(#LenObj() == 42)").Ok());
+    CHECK(lua.RunScript("assert(#LenObj() == 42)").has_value());
 
     // shared_ptr：Lua 持有期间对象存活；C++ 侧仍可自己用 std::weak_ptr 观察。
     lua.Class<SharedObj>("SharedObj").Constructor<int>().Property("value", &SharedObj::value);
@@ -189,40 +189,40 @@ int main() {
     auto shared = std::make_shared<SharedObj>(7);
     std::weak_ptr<SharedObj> weak = shared;
     lua.Set("shared_obj", shared);
-    CHECK(lua.RunScript("assert(shared_obj.value == 7)").Ok());
+    CHECK(lua.RunScript("assert(shared_obj.value == 7)").has_value());
 
     // Lua -> C++：函数参数、Get。
     auto from_lua = lua.Call<int>("shared_value", shared);
-    CHECK(from_lua.Ok());
-    CHECK(from_lua.Value() == 7);
+    CHECK(from_lua.has_value());
+    CHECK(ValueOrDie(from_lua) == 7);
     {
         auto shared_back = lua.Get<std::shared_ptr<SharedObj>>("shared_obj");
-        CHECK(shared_back.Ok());
-        CHECK(shared_back.Value() != nullptr);
-        CHECK(shared_back.Value()->value == 7);
+        CHECK(shared_back.has_value());
+        CHECK(ValueOrDie(shared_back) != nullptr);
+        CHECK(ValueOrDie(shared_back)->value == 7);
     }
 
     // C++ 释放后，Lua 仍持有 shared_obj，对象继续存活。
     shared.reset();
     CHECK(!weak.expired());
-    CHECK(lua.RunScript("shared_obj = nil; collectgarbage('collect')").Ok());
+    CHECK(lua.RunScript("shared_obj = nil; collectgarbage('collect')").has_value());
     CHECK(weak.expired());
 
     // 空 shared_ptr 往返为 nil。
     lua.Set("empty_shared", std::shared_ptr<SharedObj>{});
     auto empty_shared = lua.Get<std::shared_ptr<SharedObj>>("empty_shared");
-    CHECK(empty_shared.Ok());
-    CHECK(empty_shared.Value() == nullptr);
+    CHECK(empty_shared.has_value());
+    CHECK(ValueOrDie(empty_shared) == nullptr);
 
     // Class<T>().Constructor 创建的 owned 对象没有控制块，不能反解成 shared_ptr。
-    CHECK(lua.RunScript("owned = SharedObj(3)").Ok());
+    CHECK(lua.RunScript("owned = SharedObj(3)").has_value());
     auto not_shared = lua.Get<std::shared_ptr<SharedObj>>("owned");
-    CHECK(!not_shared.Ok());
-    CHECK(not_shared.GetError().code == ErrorCode::kType);
+    CHECK(!not_shared.has_value());
+    CHECK(not_shared.error().code == ErrorCode::kType);
 
     // 枚举表
     lua.Enum("Color", {{"Red", 1}, {"Green", 2}});
-    CHECK(lua.RunScript("assert(Color.Red == 1 and Color.Green == 2)").Ok());
+    CHECK(lua.RunScript("assert(Color.Red == 1 and Color.Green == 2)").has_value());
 
     std::printf("lua_class_test: ok\n");
     return 0;

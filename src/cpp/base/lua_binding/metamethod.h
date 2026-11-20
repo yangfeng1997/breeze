@@ -74,10 +74,10 @@ bool BuildToString(lua_State* L, ErrorSlot& err) {
         return true;
 #if defined(__cpp_exceptions)
     } catch (const std::exception& e) {
-        err.Set(ErrorCode::kRuntime, e.what());
+        err.SetError(ErrorCode::kLuaError, e.what());
         return false;
     } catch (...) {
-        err.Set(ErrorCode::kRuntime, "unknown C++ exception in __tostring");
+        err.SetError(ErrorCode::kLuaError, "unknown C++ exception in __tostring");
         return false;
     }
 #endif
@@ -95,10 +95,10 @@ bool BuildEquality(lua_State* L, ErrorSlot& err) {
         return true;
 #if defined(__cpp_exceptions)
     } catch (const std::exception& e) {
-        err.Set(ErrorCode::kRuntime, e.what());
+        err.SetError(ErrorCode::kLuaError, e.what());
         return false;
     } catch (...) {
-        err.Set(ErrorCode::kRuntime, "unknown C++ exception in __eq");
+        err.SetError(ErrorCode::kLuaError, "unknown C++ exception in __eq");
         return false;
     }
 #endif
@@ -112,17 +112,17 @@ bool BuildLess(lua_State* L, ErrorSlot& err) {
         T* left = GetObjectAs<T>(L, 1, nullptr);
         T* right = GetObjectAs<T>(L, 2, nullptr);
         if (left == nullptr || right == nullptr) {
-            err.Set(ErrorCode::kType, "breeze::lua_binding: attempt to compare incompatible objects");
+            err.SetError(ErrorCode::kType, "breeze::lua_binding: attempt to compare incompatible objects");
             return false;
         }
         lua_pushboolean(L, (*left < *right) ? 1 : 0);
         return true;
 #if defined(__cpp_exceptions)
     } catch (const std::exception& e) {
-        err.Set(ErrorCode::kRuntime, e.what());
+        err.SetError(ErrorCode::kLuaError, e.what());
         return false;
     } catch (...) {
-        err.Set(ErrorCode::kRuntime, "unknown C++ exception in __lt");
+        err.SetError(ErrorCode::kLuaError, "unknown C++ exception in __lt");
         return false;
     }
 #endif
@@ -135,7 +135,7 @@ bool BuildClose(lua_State* L, ErrorSlot& err) {
 #endif
         T* obj = GetObjectAs<T>(L, 1, nullptr);
         if (obj == nullptr) {
-            err.Set(ErrorCode::kType, "breeze::lua_binding: __close on an invalid object");
+            err.SetError(ErrorCode::kType, "breeze::lua_binding: __close on an invalid object");
             return false;
         }
         if constexpr (HasCloseMethod<T>) {
@@ -146,10 +146,10 @@ bool BuildClose(lua_State* L, ErrorSlot& err) {
         return true;
 #if defined(__cpp_exceptions)
     } catch (const std::exception& e) {
-        err.Set(ErrorCode::kRuntime, e.what());
+        err.SetError(ErrorCode::kLuaError, e.what());
         return false;
     } catch (...) {
-        err.Set(ErrorCode::kRuntime, "unknown C++ exception in __close");
+        err.SetError(ErrorCode::kLuaError, "unknown C++ exception in __close");
         return false;
     }
 #endif

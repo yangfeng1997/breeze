@@ -27,20 +27,20 @@ public:
     }
 
     template <class R, class... Args>
-    Result<R> Call(Args&&... args) const {
+    std::expected<R, Error> Call(Args&&... args) const {
         lua_State* L = State();
         if (L == nullptr) {
-            return Error{ErrorCode::kRuntime, "breeze::lua_binding: LuaFunction used after its LuaState was closed"};
+            return Fail(ErrorCode::kInvalidState, "breeze::lua_binding: LuaFunction used after its LuaState was closed");
         }
         return CallRef<R>(L, ref_, std::forward<Args>(args)...);
     }
 
     // 热路径：不挂 traceback。错误仍然由 pcall 捕获并返回 Result。
     template <class R, class... Args>
-    Result<R> CallNoTraceback(Args&&... args) const {
+    std::expected<R, Error> CallNoTraceback(Args&&... args) const {
         lua_State* L = State();
         if (L == nullptr) {
-            return Error{ErrorCode::kRuntime, "breeze::lua_binding: LuaFunction used after its LuaState was closed"};
+            return Fail(ErrorCode::kInvalidState, "breeze::lua_binding: LuaFunction used after its LuaState was closed");
         }
         return CallRefNoTraceback<R>(L, ref_, std::forward<Args>(args)...);
     }
@@ -61,7 +61,7 @@ struct LuaFunctionView {
     int index = 0;
 
     template <class R, class... Args>
-    Result<R> Call(Args&&... args) const {
+    std::expected<R, Error> Call(Args&&... args) const {
         const int abs = lua_absindex(L, index);
         lua_pushvalue(L, abs);
         return CallPushed<R>(L, lua_gettop(L), std::forward<Args>(args)...);

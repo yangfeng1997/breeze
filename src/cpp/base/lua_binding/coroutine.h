@@ -105,7 +105,7 @@ public:
     }
     ~Coroutine() { Reset(); }
 
-    static Result<Coroutine> Create(LuaStateView lua, const LuaFunction& function) {
+    static std::expected<Coroutine, Error> Create(LuaStateView lua, const LuaFunction& function) {
         lua_State* main = lua.Raw();
         lua_State* co = lua_newthread(main);
         BREEZE_LUA_CHECK(co != nullptr, "breeze::lua_binding: lua_newthread failed");
@@ -136,16 +136,16 @@ public:
     }
 
     template <class... Args>
-    Result<ResumeResult> Resume(Args&&... args) {
+    std::expected<ResumeResult, Error> Resume(Args&&... args) {
         if (main_ == nullptr || co_ == nullptr || done_) {
-            return Error{ErrorCode::kRuntime, "breeze::lua_binding: coroutine is not resumable"};
+            return Fail(ErrorCode::kInvalidState, "breeze::lua_binding: coroutine is not resumable");
         }
         if (control_ != nullptr && control_->cancelled.load(std::memory_order_acquire)) {
             done_ = true;
-            return Error{ErrorCode::kCancelled, "breeze::lua_binding: coroutine cancelled"};
+            return Fail(ErrorCode::kCancelled, "breeze::lua_binding: coroutine cancelled");
         }
         if (!lua_checkstack(co_, static_cast<int>(sizeof...(Args)) + 4)) {
-            return Error{ErrorCode::kStack, "breeze::lua_binding: coroutine stack overflow"};
+            return Fail(ErrorCode::kStack, "breeze::lua_binding: coroutine stack overflow");
         }
         PushArgs(co_, std::forward<Args>(args)...);
 
@@ -167,9 +167,9 @@ public:
             lua_pop(co_, 1);
             done_ = true;
             if (control_ != nullptr && control_->cancelled.load(std::memory_order_acquire)) {
-                return Error{ErrorCode::kCancelled, "breeze::lua_binding: coroutine cancelled"};
+                return Fail(ErrorCode::kCancelled, "breeze::lua_binding: coroutine cancelled");
             }
-            return Error{ErrorCode::kRuntime, std::move(message)};
+            return Fail(ErrorCode::kLuaError, std::move(message));
         }
 
         const bool yielded = status == LUA_YIELD;

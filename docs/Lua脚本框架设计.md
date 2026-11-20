@@ -979,4 +979,4 @@ src/lua/server/<service>/main.lua      主线程 root
 src/lua/server/<service>/worker/<type>/main.lua
 ```
 
-具体实现放框架层，不放进 `base/lua_binding`；绑定库只暴露 `LuaState`、`Result`、`RunFile`、`CallGlobal`、`LuaFunction`。
+具体实现放框架层，不放进 `base/lua_binding`；绑定库只暴露 `LuaState`、`std::expected`、`RunFile`、`CallGlobal`、`LuaFunction`。

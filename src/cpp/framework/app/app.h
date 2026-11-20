@@ -39,7 +39,8 @@ enum class Lifecycle : std::uint8_t
 
 std::string_view ToString(Lifecycle s) noexcept;
 
-using ModuleFactory = std::function<std::unique_ptr<Module>(App&)>;
+// 工厂是 move-only 闭包：std::function 会额外要求可拷贝性。
+using ModuleFactory = std::move_only_function<std::unique_ptr<Module>(App&)>;
 
 class App
 {

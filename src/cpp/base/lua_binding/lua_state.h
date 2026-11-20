@@ -64,7 +64,7 @@ public:
 
     // 只返回拥有所有权的类型；string_view / const char* 会悬空，禁止。
     template <class T>
-    Result<T> Get(std::string_view name) const {
+    std::expected<T, Error> Get(std::string_view name) const {
         static_assert(!std::is_same_v<T, std::string_view> && !std::is_same_v<T, const char*>,
                       "breeze::lua_binding: Get returns owning values; use std::string");
         const std::string key(name);
@@ -77,47 +77,47 @@ public:
                 return value;
             }
             lua_pop(L_, 1);
-            return Error{ErrorCode::kNotFound, "breeze::lua_binding: global '" + key + "' not found"};
+            return Fail(ErrorCode::kNotFound, "breeze::lua_binding: global '" + key + "' not found");
         }
         if (!Stack<T>::Check(L_, -1)) {
             const std::string actual = luaL_typename(L_, -1);
             lua_pop(L_, 1);
-            return Error{ErrorCode::kType, "breeze::lua_binding: global '" + key + "' expects " + Stack<T>::kName +
-                                               ", got " + actual};
+            return Fail(ErrorCode::kType, "breeze::lua_binding: global '" + key + "' expects " + Stack<T>::kName +
+                                               ", got " + actual);
         }
         T value = Stack<T>::Get(L_, -1);
         lua_pop(L_, 1);
         return value;
     }
 
-    Result<LuaTable> GetTable(std::string_view name) const {
+    std::expected<LuaTable, Error> GetTable(std::string_view name) const {
         const std::string key(name);
         lua_getglobal(L_, key.c_str());
         if (lua_isnil(L_, -1)) {
             lua_pop(L_, 1);
-            return Error{ErrorCode::kNotFound, "breeze::lua_binding: global '" + key + "' not found"};
+            return Fail(ErrorCode::kNotFound, "breeze::lua_binding: global '" + key + "' not found");
         }
         if (!lua_istable(L_, -1)) {
             const std::string actual = luaL_typename(L_, -1);
             lua_pop(L_, 1);
-            return Error{ErrorCode::kType, "breeze::lua_binding: global '" + key + "' expects table, got " + actual};
+            return Fail(ErrorCode::kType, "breeze::lua_binding: global '" + key + "' expects table, got " + actual);
         }
         LuaTable table = LuaTable::FromStack(L_, -1);
         lua_pop(L_, 1);
         return table;
     }
 
-    Result<LuaFunction> GetFunction(std::string_view name) const {
+    std::expected<LuaFunction, Error> GetFunction(std::string_view name) const {
         const std::string key(name);
         lua_getglobal(L_, key.c_str());
         if (lua_isnil(L_, -1)) {
             lua_pop(L_, 1);
-            return Error{ErrorCode::kNotFound, "breeze::lua_binding: global '" + key + "' not found"};
+            return Fail(ErrorCode::kNotFound, "breeze::lua_binding: global '" + key + "' not found");
         }
         if (!lua_isfunction(L_, -1)) {
             const std::string actual = luaL_typename(L_, -1);
             lua_pop(L_, 1);
-            return Error{ErrorCode::kType, "breeze::lua_binding: global '" + key + "' expects function, got " + actual};
+            return Fail(ErrorCode::kType, "breeze::lua_binding: global '" + key + "' expects function, got " + actual);
         }
         LuaFunction function = LuaFunction::FromStack(L_, -1);
         lua_pop(L_, 1);
@@ -147,7 +147,7 @@ public:
     }
 
     template <class R, class... Args>
-    Result<R> Call(std::string_view name, Args&&... args) const {
+    std::expected<R, Error> Call(std::string_view name, Args&&... args) const {
         return CallGlobal<R>(L_, name, std::forward<Args>(args)...);
     }
 
@@ -172,9 +172,9 @@ public:
         lua_setglobal(L_, key.c_str());
     }
 
-    Result<void> RunScript(std::string_view source, const char* chunkname = "=breeze::lua_binding");
-    Result<void> RunFile(const char* path);
-    Result<void> RunFile(const std::string& path) { return RunFile(path.c_str()); }
+    std::expected<void, Error> RunScript(std::string_view source, const char* chunkname = "=breeze::lua_binding");
+    std::expected<void, Error> RunFile(const char* path);
+    std::expected<void, Error> RunFile(const std::string& path) { return RunFile(path.c_str()); }
 
     void SetPath(std::string_view path);
     void AddPath(std::string_view path);

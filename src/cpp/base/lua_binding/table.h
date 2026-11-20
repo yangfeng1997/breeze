@@ -31,10 +31,10 @@ public:
     }
 
     template <class T>
-    Result<T> Get(std::string_view key) const {
+    std::expected<T, Error> Get(std::string_view key) const {
         lua_State* L = State();
         if (L == nullptr) {
-            return Error{ErrorCode::kRuntime, "breeze::lua_binding: LuaTable used after its LuaState was closed"};
+            return Fail(ErrorCode::kInvalidState, "breeze::lua_binding: LuaTable used after its LuaState was closed");
         }
         const int top = lua_gettop(L);
         Push();
@@ -49,13 +49,13 @@ public:
                 return value;
             }
             lua_settop(L, top);
-            return Error{ErrorCode::kNotFound, "breeze::lua_binding: key '" + std::string(key) + "' not found"};
+            return Fail(ErrorCode::kNotFound, "breeze::lua_binding: key '" + std::string(key) + "' not found");
         }
         if (!Stack<T>::Check(L, -1)) {
             const std::string actual = luaL_typename(L, -1);
             lua_settop(L, top);
-            return Error{ErrorCode::kType, "breeze::lua_binding: key '" + std::string(key) + "' expects " + Stack<T>::kName +
-                                               ", got " + actual};
+            return Fail(ErrorCode::kType, "breeze::lua_binding: key '" + std::string(key) + "' expects " + Stack<T>::kName +
+                                               ", got " + actual);
         }
         T value = Stack<T>::Get(L, -1);
         lua_settop(L, top);
@@ -75,19 +75,19 @@ public:
     }
 
     template <class R, class... Args>
-    Result<R> Call(std::string_view function, Args&&... args) const {
+    std::expected<R, Error> Call(std::string_view function, Args&&... args) const {
         lua_State* L = State();
         if (L == nullptr) {
-            return Error{ErrorCode::kRuntime, "breeze::lua_binding: LuaTable used after its LuaState was closed"};
+            return Fail(ErrorCode::kInvalidState, "breeze::lua_binding: LuaTable used after its LuaState was closed");
         }
         const int top = lua_gettop(L);
         Push();
         lua_getfield(L, top + 1, std::string(function).c_str());
         if (!lua_isfunction(L, -1)) {
             lua_settop(L, top);
-            return Error{ErrorCode::kNotFound, "breeze::lua_binding: table function '" + std::string(function) + "' not found"};
+            return Fail(ErrorCode::kNotFound, "breeze::lua_binding: table function '" + std::string(function) + "' not found");
         }
-        Result<R> result = CallPushed<R>(L, lua_gettop(L), std::forward<Args>(args)...);
+        std::expected<R, Error> result = CallPushed<R>(L, lua_gettop(L), std::forward<Args>(args)...);
         lua_settop(L, top);
         return result;
     }
@@ -116,20 +116,20 @@ struct LuaTableView {
     }
 
     template <class T>
-    Result<T> Get(std::string_view key) const {
+    std::expected<T, Error> Get(std::string_view key) const {
         const int abs = lua_absindex(L, index);
         const int top = lua_gettop(L);
         lua_pushlstring(L, key.data(), key.size());
         lua_gettable(L, abs);
         if (lua_isnil(L, -1) && !Stack<T>::Check(L, -1)) {
             lua_settop(L, top);
-            return Error{ErrorCode::kNotFound, "breeze::lua_binding: key '" + std::string(key) + "' not found"};
+            return Fail(ErrorCode::kNotFound, "breeze::lua_binding: key '" + std::string(key) + "' not found");
         }
         if (!Stack<T>::Check(L, -1)) {
             const std::string actual = luaL_typename(L, -1);
             lua_settop(L, top);
-            return Error{ErrorCode::kType, "breeze::lua_binding: key '" + std::string(key) + "' expects " + Stack<T>::kName +
-                                               ", got " + actual};
+            return Fail(ErrorCode::kType, "breeze::lua_binding: key '" + std::string(key) + "' expects " + Stack<T>::kName +
+                                               ", got " + actual);
         }
         T value = Stack<T>::Get(L, -1);
         lua_settop(L, top);

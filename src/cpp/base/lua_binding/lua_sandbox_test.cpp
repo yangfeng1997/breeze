@@ -25,7 +25,7 @@ int main() {
         LuaState lua(MakeSandboxOptions(options, stats));
         ApplySandbox(lua, options);
         const auto result = lua.RunScript("local s = string.rep('x', 1024 * 1024)");
-        CHECK(!result.Ok());
+        CHECK(!result.has_value());
         CHECK(stats.failures > 0);
     }
 
@@ -36,7 +36,7 @@ int main() {
         options.instruction_budget = 1'000'000;
         ApplySandbox(lua, options);
         const auto result = lua.RunScript("while true do end");
-        CHECK(!result.Ok());
+        CHECK(!result.has_value());
     }
 
     // 库白名单：io/os/debug 不打开
@@ -45,7 +45,7 @@ int main() {
         SandboxOptions options;
         LuaState lua(MakeSandboxOptions(options, stats));
         ApplySandbox(lua, options);
-        CHECK(lua.RunScript("assert(io == nil and os == nil and debug == nil)").Ok());
+        CHECK(lua.RunScript("assert(io == nil and os == nil and debug == nil)").has_value());
     }
 
     std::printf("lua_sandbox_test: ok\n");

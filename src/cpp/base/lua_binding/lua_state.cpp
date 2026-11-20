@@ -4,36 +4,36 @@
 
 namespace breeze::lua_binding {
 
-Result<void> LuaStateView::RunScript(std::string_view source, const char* chunkname) {
+std::expected<void, Error> LuaStateView::RunScript(std::string_view source, const char* chunkname) {
     const int base = lua_gettop(L_);
     int status = luaL_loadbufferx(L_, source.data(), source.size(), chunkname, "t");
     if (status != LUA_OK) {
         std::string message = TakeError(L_, base);
-        return Error{ErrorCode::kSyntax, std::move(message)};
+        return Fail(ErrorCode::kSyntax, std::move(message));
     }
     status = lua_pcall(L_, 0, LUA_MULTRET, 0);
     if (status != LUA_OK) {
         std::string message = TakeError(L_, base);
-        return Error{status == LUA_ERRMEM ? ErrorCode::kMemory : ErrorCode::kRuntime, std::move(message)};
+        return Fail(status == LUA_ERRMEM ? ErrorCode::kMemory : ErrorCode::kLuaError, std::move(message));
     }
     lua_settop(L_, base);
-    return Ok();
+    return {};
 }
 
-Result<void> LuaStateView::RunFile(const char* path) {
+std::expected<void, Error> LuaStateView::RunFile(const char* path) {
     const int base = lua_gettop(L_);
     int status = luaL_loadfilex(L_, path, "t");
     if (status != LUA_OK) {
         std::string message = TakeError(L_, base);
-        return Error{ErrorCode::kSyntax, std::move(message)};
+        return Fail(ErrorCode::kSyntax, std::move(message));
     }
     status = lua_pcall(L_, 0, LUA_MULTRET, 0);
     if (status != LUA_OK) {
         std::string message = TakeError(L_, base);
-        return Error{status == LUA_ERRMEM ? ErrorCode::kMemory : ErrorCode::kRuntime, std::move(message)};
+        return Fail(status == LUA_ERRMEM ? ErrorCode::kMemory : ErrorCode::kLuaError, std::move(message));
     }
     lua_settop(L_, base);
-    return Ok();
+    return {};
 }
 
 void LuaStateView::SetPath(std::string_view path) {

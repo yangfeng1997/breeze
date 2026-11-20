@@ -1,10 +1,12 @@
 # Lua 绑定库：`base/lua_binding`
 
-`breeze::lua_binding`：Lua 5.5.1 的 C++ 绑定库。小型编译库（`breeze_lua_binding`）加头文件模板；链式 `Class<T>` 构建器为主，luakit 风格键值列表是同一个构建器上的糖衣；默认冒号调用零分配；错误不依赖 C++ 异常（两段式 trampoline + `Result<T>`）；可选 `breeze_lua_binding_ext`（table / string / os 工具）、`sandbox.h`（内存 / 指令 / 时间预算）、`coroutine.h`。
+`breeze::lua_binding`：Lua 5.5.1 的 C++ 绑定库。小型编译库（`breeze_lua_binding`）加头文件模板；链式 `Class<T>` 构建器为主，luakit 风格键值列表是同一个构建器上的糖衣；默认冒号调用零分配；错误不依赖 C++ 异常（两段式 trampoline + `std::expected<T, Error>`）；可选 `breeze_lua_binding_ext`（table / string / os 工具）、`sandbox.h`（内存 / 指令 / 时间预算）、`coroutine.h`。
 
 依赖 vcpkg 的 `lua` 端口（5.5.1，按 C 编译）。**C++26 为基线**（仓库根 `CMakeLists.txt` 设 `CMAKE_CXX_STANDARD 26`，`breeze_lua_binding` 也以 `target_compile_features(... cxx_std_26)` 声明）；不需要网络库，Linux 与 Windows（MSYS2 g++ 16）都能构建。
 
-C++26 下可用的 `std::expected`、`std::move_only_function`、`std::to_underlying`、`std::unreachable` 等（多数从 C++23 起就有），breeze::lua_binding **没有为了用而用**：`Result<T>` 仍是主错误类型，内部也不依赖 `std::move_only_function`。升级标准只是为了不再为低版本兼容性做取舍。
+C++26 下可用的 `std::expected`、`std::move_only_function`、`std::to_underlying`、`std::unreachable` 等（多数从 C++23 起就有），breeze::lua_binding **没有为了用而用**：错误类型直接用标准的 `std::expected<T, Error>`（不再自造 Result），内部也不依赖 `std::move_only_function`。升级标准只是为了不再为低版本兼容性做取舍。
+
+**变更（2026-11-20）**：删除自研的 `Result<T>` / `Result<void>`，统一用标准库 `std::expected<T, Error>`；辅助函数 `Fail(code, msg)` / `ValueOrDie(r)` / `IsNotFound(r)`（见 `error.h`）。
 
 本文记录**为什么是这个样子**。API 的细节与约束写在头文件注释里，本文不重复。
 
@@ -30,8 +32,8 @@ C++26 下可用的 `std::expected`、`std::move_only_function`、`std::to_underl
 - **参数先全部检查、再读取**：检查阶段只用平凡存储，避免在 `lua_error` longjmp 前留下带析构的临时对象；错误消息用 `luaL_typeerror` / `luaL_argerror`（带参数序号与期望/实际类型）。
 - **不用 `std::function` 做每次调用**：自由函数 / lambda 注册时放在 userdata upvalue 里，调用走模板蹦床；成员函数同理（upvalue 1 成员指针，upvalue 2 声明类）。
 - **类身份不用字符串哈希**：`kTypeTag<T>` 的地址作 key；基类转换用注册时生成的 `static_cast`，虚继承也正确。
-- **错误不抛异常**：核心在 `-fno-exceptions` 下编译；C++ 调 Lua 一律 `lua_pcall` 并返回 `Result`；绑定函数在 `Invoke`（noinline）里返回，之后才在只有平凡局部变量的那一层 `lua_error`。
-- **不用 `std::expected` 替换 `Result<T>`**：`Result<T>` 是公共 API，成功时不分配堆内存；C++26 下可以提供互转，但不改主接口。
+- **错误不抛异常**：核心在 `-fno-exceptions` 下编译；C++ 调 Lua 一律 `lua_pcall` 并返回 `std::expected`；绑定函数在 `Invoke`（noinline）里返回，之后才在只有平凡局部变量的那一层 `lua_error`。
+- **统一用 `std::expected<T, Error>`（2026-11-20 起）**：原来自己写的 `Result<T>` 已删除。两者的成功路径都不分配堆内存；`expected` 是标准类型，错误在 union 里、成功时不构造，而且能和框架其它模块共用同一套机制。辅助函数：`Fail(code, msg)`（失败构造）、`ValueOrDie(r)`（失败 abort，保留原 `Value()` 的诊断）、`IsNotFound(r)`。
 
 ## 2. 原实现里发现并处理的问题
 
@@ -54,12 +56,15 @@ sol2 / LuaBridge3：前者上游不支持 5.5（`compat-5.3.h` 的 `#error`、`L
 - **`LuaState` / `LuaStateView`**：`LuaState` 拥有 `lua_State`（`lua_newstate` 或 `luaL_newstate`），`LuaStateView` 是非拥有视图，用于 `luaopen_*`。一个 state 绑定一个线程（一个 Shard）。
 - **`Stack<T>`**：一个 customization point。内置整数（范围/可表示性检查）、浮点、bool、enum、`std::string`、`std::string_view`、`const char*`、`optional`、`vector`、`array`、`map` / `unordered_map`、`span`（push-only）、`tuple`/`pair`（仅返回值多值）、对象指针/引用、`shared_ptr`、`LuaTableView` 栈视图。
 - **两段式 trampoline**（`trampoline.h`）：`Invoke` 里检查参数、构造临时对象、调用用户函数、压返回值；它 normal return 之后，`Trampoline`（只有 `ErrorSlot` 等平凡局部变量）再调用 `RaiseError` → `luaL_typeerror` / `luaL_error`。这样就算 Lua 按 C 编译、`lua_error` 是 longjmp，也不会跳过任何析构。
-- **`Result<T>`**：`Ok()` / `Value()` / `ValueOr()` / `GetError()` / `NotFound()`；错误码含 kNotFound / kRuntime / kSyntax / kMemory / kType / kStack / kCancelled 等。缺函数是 `kNotFound`，不是异常。
-  - `Value()` 是“已经 `Ok()` 之后”的访问器；在错误上调用属于编程错误，经 `BREEZE_LUA_CHECK`（可接 fatal handler）记录后 abort。需要恢复就用 `Ok()` / `ValueOr()` / `GetError()`。
+- **`std::expected<T, Error>`**：`has_value()` / `ValueOrDie()` / `value_or()` / `error()` / `IsNotFound()`；错误码含 kNotFound / kLuaError（Lua VM 报错，绑定函数抛 C++ 异常也走这里）/ kInvalidState（state 已关闭、协程不可恢复）/ kSyntax / kMemory / kType / kStack / kCancelled 等。缺函数是 `kNotFound`，不是异常。
+  - **正常写法是先判断、再用 `*r`**：`if (!r) { 处理 }` 之后 `*r` 安全且没有额外分支。
+  - `ValueOrDie()` 是**自带检查**的取值：失败时经 `BREEZE_LUA_CHECK`（可接 fatal handler）打印 `Error.message` 后 abort。它用于“本作用域无法处理错误、失败即 bug”的场景（测试、启动期不变量），**不要用它代替错误处理**。
+  - `*r` / `r->` 是标准库的**无检查**访问（前置条件 `has_value()`），错误时是 UB；只有刚刚判断过之后才用。`r.value()` 在 `-fno-exceptions` 下 terminate 且没有消息，不使用。
+  - 需要恢复就用 `has_value()` / `value_or()` / `error()`。
   - C++→Lua 的**返回值**也走 `Stack<T>::Check`：类型不匹配返回 `kType`，不会静默变成 0 / false / 空串。
   - “不抛异常”不等于所有 Lua 错误都可恢复：`lua_pushlstring`、`luaL_ref`、表插入等可能分配的操作在 OOM 时会 `longjmp` 到 `lua_atpanic`（breeze::lua_binding 的 handler 记录后 abort），这类内存错误按致命处理，不承诺跨 C++ 栈恢复。
 - **调用**：`CallGlobal`（按名字，晚绑定，热更友好）、`CallPushed`（函数已在栈上）、`LuaFunction::Call`（缓存引用，带 traceback）与 `LuaFunction::CallNoTraceback`（不挂 traceback）。`LuaFunction::Call` 走 `CallRef`：先压 msgh 再压函数，省掉 `lua_insert`；每次调用一次 `lua_checkstack`，`lua_pcall` 后 `lua_settop` 恢复。`CallNoTraceback` 的 void 返回不需要 `settop`。
-  - **逃生门**：`LuaFunction::CallUnprotected` / `LuaStateView::CallUnprotected` 返回裸 `R`（不是 `Result`），走 `lua_call`，不捕获 Lua 错误，用于确认不会报错的热路径。**报错会 longjmp 跳过当前 C++ 栈的析构**；返回值类型不匹配直接 `Fatal`。默认 API 仍然是 pcall。
+  - **逃生门**：`LuaFunction::CallUnprotected` / `LuaStateView::CallUnprotected` 返回裸 `R`（不是 `std::expected`），走 `lua_call`，不捕获 Lua 错误，用于确认不会报错的热路径。**报错会 longjmp 跳过当前 C++ 栈的析构**；返回值类型不匹配直接 `Fatal`。默认 API 仍然是 pcall。
 - **类绑定（`class.h` / `class.cpp`；对象 userdata 访问在 `object.h`，自动元方法在 `metamethod.h`）**：
   - userdata 布局 `[ObjHeader]`（共享所有权时在 header 后**内联** `shared_ptr<void>`，不再单独 `new`）；`ObjHeader` 带 cookie、ClassInfo、对象指针、所有权标志、持有块与释放函数。
   - `ObjHeader` 当前 48B：cookie 8 + cls 8 + obj 8 + flags/pad 8 + holder 8 + destroy_holder 8。内存敏感时可以去掉 `destroy_holder`，用 `kObjShared` 标记调用固定的释放函数，降到 40B（百万实体省 8MB）。这是 header 自身大小，不含 Lua userdata 的 GC 头、metatable 指针和分配器对齐，实际每对象还要再加约 30~50B。
@@ -179,7 +184,7 @@ Lua 5.1–5.4 / LuaJIT / Lua 按 C++ 编译**不属于缺口**：本项目 scope
 
 **已定的 API 策略（保持，不是遗漏）**
 
-- `Result::Value()` 失败 abort；核心不依赖 C++ 异常，可在 `-fno-exceptions` 下编译。
+- `ValueOrDie()` 失败 abort（错误上裸取 `*r` 是 UB）；核心不依赖 C++ 异常，可在 `-fno-exceptions` 下编译。
 - `Reference` / `LuaTable` / `LuaFunction` move-only，**不提供隐式拷贝，需要时用显式 `Clone()`**：拷贝必须 `lua_pushvalue` + `luaL_ref` 新槽，只能在 owner 线程做；一旦类型可拷贝，`std::function` / 容器在 worker 线程的隐式复制会无声破坏线程规则。`Clone()` 的语义见下。
 - 点号 / 冒号按类显式选择，不做自动识别（启发式有歧义）。
 
@@ -187,11 +192,11 @@ Lua 5.1–5.4 / LuaJIT / Lua 按 C++ 编译**不属于缺口**：本项目 scope
 
 | 项 | sol2 | LuaBridge3 | luakit | breeze::lua_binding |
 |---|---|---|---|---|
-| 不抛异常、返回错误 | 没有 `Result<T>`；提供 `SOL_NO_EXCEPTIONS`，错误走 abort / panic | 有 `Result` / `TypeResult`（`std::error_code`）；`value()` 不检查，`throw_on_error()` 仅在启用异常时抛 | 没有，返回 `bool` 或 `luaL_error` | `Result<T>`；`Value()` 失败 abort；核心可在 `-fno-exceptions` 下编译 |
+| 不抛异常、返回错误 | 没有 `Result<T>`；提供 `SOL_NO_EXCEPTIONS`，错误走 abort / panic | 有 `Result` / `TypeResult`（`std::error_code`）；`value()` 不检查，`throw_on_error()` 仅在启用异常时抛 | 没有，返回 `bool` 或 `luaL_error` | `std::expected<T, Error>`；`ValueOrDie()` 失败 abort；核心可在 `-fno-exceptions` 下编译 |
 | `Reference` 可拷贝 | 可拷贝（复制出新的 registry 槽） | 可拷贝 | 可拷贝（复制出新的 registry 槽） | **不允许隐式拷贝；显式 `Clone()` 新建独立槽** |
 | 二进制 codec | 无（`sol::bytecode` 只是加载 Lua chunk，不是对象编解码） | 无 | 有 `lua_codec.h` / `lua_buff.h` / `lua_slice.h` | 无，独立包 |
 
-结论：**无异常构建是行业常见需求**，sol2 / LuaBridge3 都支持；`Result` 也不是我们独有（LuaBridge3 有，只是 `value()` 不检查）。**`Reference` move-only 是 breeze::lua_binding 自己的 API 选择，不是行业惯例**——主流三家都可拷贝。**二进制 codec 与 sol2 / LuaBridge3 一致（不做），与 luakit 不同**（luakit 绑定和序列化是一体的）。
+结论：**无异常构建是行业常见需求**，sol2 / LuaBridge3 都支持；`std::expected` 是标准库类型（LuaBridge3 另有自己的 `Result`，`value()` 不检查）。**`Reference` move-only 是 breeze::lua_binding 自己的 API 选择，不是行业惯例**——主流三家都可拷贝。**二进制 codec 与 sol2 / LuaBridge3 一致（不做），与 luakit 不同**（luakit 绑定和序列化是一体的）。
 
 **需要拷贝时的设计：显式 `Clone()`，独立 registry 槽**
 
@@ -281,7 +286,7 @@ Linux Release（clang 23）实测：
 
 **同为受保护调用时，breeze::lua_binding 比 sol2 safe 快 2~6ns**；sol2 unsafe 仍然最快（9.2 / 10.2），但它不捕获错误。breeze::lua_binding 的同口径逃生门 `CallUnprotected` 是 8.8 / 7.7，和 sol2 unsafe 持平或略快。默认 breeze::lua_binding 仍然是 pcall。
 
-读表 4 字段在 Linux 从 74ns 降到 56ns：热路径改用 `LuaTableView::TryGetField`（`lua_getfield` + `bool`，不构造 `Result`），已经接近裸 API 的 40.5ns（Linux）/ 45.6ns（Windows）。
+读表 4 字段在 Linux 从 74ns 降到 56ns：热路径改用 `LuaTableView::TryGetField`（`lua_getfield` + `bool`，不构造 `expected`），已经接近裸 API 的 40.5ns（Linux）/ 45.6ns（Windows）。
 
 对照组：同样的 handler 用 `SetRawFunction` 绑裸 `lua_CFunction` 时，Lua→C++ add 13.9（Windows）/ 12.8（Linux）、读表 4 字段 44.1 / 43.4ns——已经与 luakit 的 15.0 / 49.8 持平或更快。luakit 在基准里赢的两项，是因为它的 handler 本来就是裸 `lua_CFunction`；breeze::lua_binding 通用绑定多出的 ~4ns / ~20ns 是 ErrorSlot、参数检查、tuple 与 noinline trampoline 的安全成本，不是运行时差异。
 
@@ -293,4 +298,4 @@ Linux Release（clang 23）实测：
 - `Reference` 拷贝已定：不做隐式拷贝，提供显式 `Clone()`（独立 registry 槽、owner 线程）。
 - 无：跨线程 `Reference` 析构已定为“记录并泄漏 + 文档约束”，不做队列。
 - `LuaTableView` 批量读取 API（当前逐字段 55ns，可进一步合并成一次 C 调用）。
-- 是否提供 C++26 `std::expected` 互转（现在只有 `Result`）。
+- ~~是否提供 `std::expected` 互转（现在只有 `Result`）~~ —— 已统一到 `std::expected`（2026-11-20）。

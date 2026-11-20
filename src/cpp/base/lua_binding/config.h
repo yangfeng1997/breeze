@@ -30,7 +30,7 @@ extern "C" {
 #endif
 
 // Lua 按 C 编译时 lua_error 是 longjmp，跨过带析构的 C++ 栈帧会跳过析构。
-// 因此 breeze::lua_binding 的核心不抛异常：错误走 Result / ErrorSlot，lua_error 只在
+// 因此 breeze::lua_binding 的核心不抛异常：错误走 std::expected / ErrorSlot，lua_error 只在
 // 两段式 trampoline 的“只有平凡局部变量”的那一层调用（见 trampoline.h）。
 // 如果 Lua 按 C++ 编译（vcpkg lua 的 cpp feature），lua_error 会变成异常，
 // 这一层假设就不成立，所以这里直接拒绝那种构建。

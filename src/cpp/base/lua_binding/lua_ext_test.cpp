@@ -47,8 +47,8 @@ int main() {
         assert(os.setenv('BREEZE_LUA_EXT_TEST', '1'))
         assert(os.getenv('BREEZE_LUA_EXT_TEST') == '1')
     )lua");
-    if (!script.Ok()) {
-        std::fprintf(stderr, "script failed: %s\n", script.GetError().message.c_str());
+    if (!script.has_value()) {
+        std::fprintf(stderr, "script failed: %s\n", script.error().message.c_str());
         return 1;
     }
 

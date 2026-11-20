@@ -103,7 +103,7 @@ bool CheckOne(lua_State* L, int idx, ErrorSlot& err) {
         return true;
     } else {
         if (!Stack<ArgStorage<T>>::Check(L, idx)) {
-            err.SetArg(idx, Stack<ArgStorage<T>>::kName);
+            err.SetTypeError(idx, Stack<ArgStorage<T>>::kName);
             return false;
         }
         return true;
@@ -175,10 +175,10 @@ template <class F>
         }
 #if defined(__cpp_exceptions)
     } catch (const std::exception& e) {
-        err.Set(ErrorCode::kRuntime, e.what());
+        err.SetError(ErrorCode::kLuaError, e.what());
         return -1;
     } catch (...) {
-        err.Set(ErrorCode::kRuntime, "unknown C++ exception in a bound Lua function");
+        err.SetError(ErrorCode::kLuaError, "unknown C++ exception in a bound Lua function");
         return -1;
     }
 #endif

@@ -92,8 +92,8 @@ int main() {
             return s
         end
     )lua");
-    if (!script.Ok()) {
-        std::fprintf(stderr, "load script failed: %s\n", script.GetError().message.c_str());
+    if (!script.has_value()) {
+        std::fprintf(stderr, "load script failed: %s\n", script.error().message.c_str());
         return 1;
     }
 
@@ -110,17 +110,17 @@ int main() {
         return a + b + c + d;
     });
 
-    LuaFunction noop = lua.GetFunction("lua_noop").Value();
-    LuaFunction add = lua.GetFunction("lua_add").Value();
-    LuaFunction loop = lua.GetFunction("lua_loop").Value();
-    LuaFunction call_cpp = lua.GetFunction("lua_call_cpp").Value();
-    LuaFunction call_cpp_table = lua.GetFunction("lua_call_cpp_table").Value();
-    LuaFunction call_cpp_raw = lua.GetFunction("lua_call_cpp_raw").Value();
-    LuaFunction call_cpp_table_raw = lua.GetFunction("lua_call_cpp_table_raw").Value();
+    LuaFunction noop = ValueOrDie(lua.GetFunction("lua_noop"));
+    LuaFunction add = ValueOrDie(lua.GetFunction("lua_add"));
+    LuaFunction loop = ValueOrDie(lua.GetFunction("lua_loop"));
+    LuaFunction call_cpp = ValueOrDie(lua.GetFunction("lua_call_cpp"));
+    LuaFunction call_cpp_table = ValueOrDie(lua.GetFunction("lua_call_cpp_table"));
+    LuaFunction call_cpp_raw = ValueOrDie(lua.GetFunction("lua_call_cpp_raw"));
+    LuaFunction call_cpp_table_raw = ValueOrDie(lua.GetFunction("lua_call_cpp_table_raw"));
 
     lua.SetRawFunction("cpp_add_raw", &RawCppAdd);
     lua.SetRawFunction("cpp_read_table_raw", &RawCppReadTable);
-    LuaTable table = lua.GetTable("bench_table").Value();
+    LuaTable table = ValueOrDie(lua.GetTable("bench_table"));
 
     constexpr int64_t kIterations = 2'000'000;
 
@@ -146,14 +146,14 @@ int main() {
     RunCase("cpp2lua_add_cached", kIterations, [&](int64_t n) {
         for (int64_t i = 0; i < n; ++i) {
             auto result = add.Call<int>(1, 2);
-            g_sink += result.Value();
+            g_sink += ValueOrDie(result);
         }
     });
 
     RunCase("cpp2lua_add_fast", kIterations, [&](int64_t n) {
         for (int64_t i = 0; i < n; ++i) {
             auto result = add.CallNoTraceback<int>(1, 2);
-            g_sink += result.Value();
+            g_sink += ValueOrDie(result);
         }
     });
 
@@ -172,7 +172,7 @@ int main() {
     RunCase("cpp2lua_add_by_name", kIterations, [&](int64_t n) {
         for (int64_t i = 0; i < n; ++i) {
             auto result = lua.Call<int>("lua_add", 1, 2);
-            g_sink += result.Value();
+            g_sink += ValueOrDie(result);
         }
     });
 
@@ -185,7 +185,7 @@ int main() {
     RunCase("cpp2lua_table_get", kIterations, [&](int64_t n) {
         for (int64_t i = 0; i < n; ++i) {
             auto result = table.Get<int>("a");
-            g_sink += result.Value();
+            g_sink += ValueOrDie(result);
         }
     });
 
@@ -215,7 +215,7 @@ int main() {
     }
     const std::size_t before = stats.allocations;
     for (int i = 0; i < 100'000; ++i) {
-        g_sink += add.Call<int>(1, 2).Value();
+        g_sink += ValueOrDie(add.Call<int>(1, 2));
     }
     std::printf("cpp2lua_add_cached allocations: %zu per 100k calls\n", stats.allocations - before);
 
