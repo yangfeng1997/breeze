@@ -1,12 +1,15 @@
 // ConnectionHandle：位宽打包、跨线程 Send / Close、旧句柄不串到复用同一槽的新连接、各种无效句柄、
-// group 销毁后的句柄、慢消费者（水位）与 pending_bytes 记账、Send 与 Close 并发（tsan 下跑）。
+// group 销毁后的句柄、慢消费者（水位）与 pending_bytes 记账、Send 与 Close 并发（tsan 下跑）、
+// 批内合并（同一批里相邻的同连接 Send 合成一次 sendmsg）的顺序 / 记账 / 部分写入 / 与 Close 的相对顺序。
 //
 // 这一阶段连接仍由单 loop 的 LoopServer 创建（挂在 group 的 loop 0 上）；StreamServer 之后换掉它。
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <future>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -360,6 +363,259 @@ void TestSendRacingClose()
     CHECK(rec.ClosedCount() == 1);
 }
 
+
+// ---- 批内合并（EventLoop::RunSendRun / IConnection::SendBatchFromTask）----
+//
+// 一批任务里相邻的、发往同一条连接的 Send 会合成一次 sendmsg。要让这一段确定地凑在同一批里，先堵住 IO 线程：
+// 此后经句柄的 Send / Close 都排在队列里，放开时被同一批取走（一批最多 64 个任务，一段最多 16 条）。
+
+// 堵住 loop 线程直到 Open()（或析构）。
+class LoopGate
+{
+public:
+    explicit LoopGate(EventLoop& loop)
+    {
+        loop.Post(
+            [this, f = release_.get_future().share()]
+            {
+                started_.store(true);
+                f.wait();
+            });
+        CHECK(WaitUntil([&] { return started_.load(); }));
+    }
+    ~LoopGate() { Open(); }
+    void Open()
+    {
+        if (!opened_)
+        {
+            opened_ = true;
+            release_.set_value();
+        }
+    }
+
+private:
+    std::promise<void> release_;
+    std::atomic<bool> started_{false};
+    bool opened_ = false;
+};
+
+// 读到 EOF 为止，返回 EOF 之前还收到了多少字节（0 = 没有多余的数据）。
+std::size_t DrainUntilEof(TestClient& c)
+{
+    std::size_t total = 0;
+    char buf[4096];
+    for (int spins = 0; spins < 100; ++spins)
+    {
+        if (!c.Wait(POLLIN, 200ms))
+            continue;
+        const ssize_t n = ::recv(c.fd(), buf, sizeof(buf), 0);
+        if (n == 0)
+            return total;
+        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+            return total; // ECONNRESET
+        if (n > 0)
+            total += static_cast<std::size_t>(n);
+    }
+    CHECK(false && "DrainUntilEof：对端没有关闭");
+    return total;
+}
+
+// 各种长度的同连接连续 Send（跨过一段 16 条与一批 64 个任务的边界）：帧完整、顺序不变，计数与字节数对得上。
+void TestBatchedSendsKeepOrderAndAccounting()
+{
+    const LeakCheck leak;
+    Recorder rec;
+    GroupServer s(rec);
+    TestClient c(s.ep());
+    const ConnectionHandle h = rec.WaitHandle(0);
+
+    std::uint64_t frames = 0;
+    std::uint64_t bytes = 0;
+    for (const int round_n : {1, 2, 3, 15, 16, 17, 31, 32, 33, 40, 64, 65, 100, 200})
+    {
+        LoopGate gate(s.loop());
+        std::vector<std::string> sent;
+        for (int i = 0; i < round_n; ++i)
+        {
+            sent.push_back("r" + std::to_string(round_n) + "-" + std::string(static_cast<std::size_t>(i % 7), 'x') +
+                           std::to_string(i));
+            CHECK(h.Send(Buf(sent.back())) == SendResult::Ok);
+            bytes += 4 + sent.back().size();
+        }
+        frames += static_cast<std::uint64_t>(round_n);
+        gate.Open();
+        for (const auto& want : sent)
+            CHECK(c.RecvFrame() == want);
+    }
+    CHECK(WaitUntil([&] { return s.loop().table().PendingBytes(h.slot()) == 0; })); // 记账不漏减、不多减
+    CHECK(WaitUntil(
+        [&]
+        {
+            const NetStats st = s.group.GetStats();
+            return st.messages_out == frames && st.bytes_out == bytes;
+        }));
+    CHECK(rec.ClosedCount() == 0);
+}
+
+// 两条连接交错：A A B A / A A B A ……（段长 2、1 交替）。每条连接内各自保序，互不串。
+void TestBatchedSendsWithInterleavedConnections()
+{
+    const LeakCheck leak;
+    Recorder rec;
+    GroupServer s(rec);
+    TestClient c1(s.ep());
+    const ConnectionHandle h1 = rec.WaitHandle(0);
+    TestClient c2(s.ep());
+    const ConnectionHandle h2 = rec.WaitHandle(1);
+
+    constexpr int kRounds = 60;
+    {
+        LoopGate gate(s.loop());
+        for (int i = 0; i < kRounds; ++i)
+        {
+            const std::string n = std::to_string(i);
+            CHECK(h1.Send(Buf("A" + n + ".0")) == SendResult::Ok);
+            CHECK(h1.Send(Buf("A" + n + ".1")) == SendResult::Ok);
+            CHECK(h2.Send(Buf("B" + n)) == SendResult::Ok);
+            CHECK(h1.Send(Buf("A" + n + ".2")) == SendResult::Ok);
+        }
+    }
+    for (int i = 0; i < kRounds; ++i)
+    {
+        const std::string n = std::to_string(i);
+        CHECK(c1.RecvFrame() == "A" + n + ".0");
+        CHECK(c1.RecvFrame() == "A" + n + ".1");
+        CHECK(c1.RecvFrame() == "A" + n + ".2");
+        CHECK(c2.RecvFrame() == "B" + n);
+    }
+    CHECK(WaitUntil(
+        [&]
+        { return s.loop().table().PendingBytes(h1.slot()) == 0 && s.loop().table().PendingBytes(h2.slot()) == 0; }));
+}
+
+// 一段 Send 之后紧跟 Close / CloseGracefully：段先执行完，再关——与逐条执行的顺序一致；关闭之后再来的 Send 一条也发不出去。
+void TestBatchedSendsThenCloseKeepOrder()
+{
+    const LeakCheck leak;
+    Recorder rec;
+    GroupServer s(rec);
+    {
+        TestClient c(s.ep());
+        const ConnectionHandle h = rec.WaitHandle(0);
+        {
+            LoopGate gate(s.loop());
+            for (int i = 0; i < 20; ++i)
+                CHECK(h.Send(Buf("g" + std::to_string(i))) == SendResult::Ok);
+            h.CloseGracefully(2000ms);
+            for (int i = 0; i < 3; ++i)
+                CHECK(h.Send(Buf("late")) == SendResult::Ok); // 句柄这时还有效，投递成功；执行时连接已在优雅关闭，被丢弃
+        }
+        for (int i = 0; i < 20; ++i)
+            CHECK(c.RecvFrame() == "g" + std::to_string(i));
+        CHECK(DrainUntilEof(c) == 0); // 没有 "late"
+        CHECK(rec.WaitClosed(1)[0].second == CloseReason::LocalClose);
+    }
+    {
+        TestClient c(s.ep());
+        const ConnectionHandle h = rec.WaitHandle(1);
+        {
+            LoopGate gate(s.loop());
+            for (int i = 0; i < 5; ++i)
+                CHECK(h.Send(Buf("h" + std::to_string(i))) == SendResult::Ok);
+            h.Close(); // 立即关：Close 之前的 Send 已经写进内核，照常送达
+        }
+        for (int i = 0; i < 5; ++i)
+            CHECK(c.RecvFrame() == "h" + std::to_string(i));
+        CHECK(DrainUntilEof(c) == 0);
+    }
+    CHECK(WaitUntil([&] { return s.Drained(); }));
+}
+
+// 写不下：一段 16 帧 × 1MB，内核缓冲装不下，某一帧可能只写出一部分——剩下的按序入队、EPOLLOUT 排空，内容逐字节对得上。
+void TestBatchedPartialWriteQueuesTheRestInOrder()
+{
+    const LeakCheck leak;
+    Recorder rec;
+    GroupServer s(rec, {1, 64}, ConnectionOptions{512ull << 20});
+    TestClient c(s.ep());
+    const ConnectionHandle h = rec.WaitHandle(0);
+
+    constexpr int kFrames = 16;
+    constexpr std::size_t kSize = 1024 * 1024;
+    {
+        LoopGate gate(s.loop());
+        for (int i = 0; i < kFrames; ++i)
+        {
+            SharedBuffer b = SharedBuffer::Create(kSize);
+            std::memset(b.MutableBytes().data(), 'a' + i, kSize);
+            // 首尾字节各不相同，才能发现"偏移错位"（整帧同一个字节看不出来）
+            b.MutableBytes()[0] = static_cast<std::byte>(i);
+            b.MutableBytes()[kSize - 1] = static_cast<std::byte>(100 + i);
+            CHECK(h.Send(std::move(b)) == SendResult::Ok);
+        }
+    }
+    CHECK(WaitUntil([&] { return s.loop().table().PendingBytes(h.slot()) > 0; })); // 客户端没读，必有积压
+    for (int i = 0; i < kFrames; ++i)
+    {
+        const std::string f = c.RecvFrame();
+        CHECK(f.size() == kSize);
+        CHECK(static_cast<unsigned char>(f.front()) == i && static_cast<unsigned char>(f.back()) == 100 + i);
+        CHECK(std::all_of(f.begin() + 1, f.end() - 1, [&](char ch) { return ch == static_cast<char>('a' + i); }));
+    }
+    CHECK(WaitUntil([&] { return s.loop().table().PendingBytes(h.slot()) == 0; }));
+    CHECK(WaitUntil([&] { return s.group.GetStats().messages_out == kFrames; }));
+    CHECK(rec.ClosedCount() == 0);
+}
+
+// 段里夹了一个超过 codec 上限的 payload：退回逐条，行为与没合并时一样——它之前的帧送达，它触发协议错误关连接，之后的被丢弃。
+void TestBatchWithOversizePayloadFallsBackToOneByOne()
+{
+    const LeakCheck leak;
+    Recorder rec;
+    GroupServer s(rec, {1, 64}, ConnectionOptions{64ull << 20});
+    TestClient c(s.ep());
+    const ConnectionHandle h = rec.WaitHandle(0);
+    {
+        LoopGate gate(s.loop());
+        CHECK(h.Send(Buf("s0")) == SendResult::Ok);
+        CHECK(h.Send(Buf("s1")) == SendResult::Ok);
+        SharedBuffer big = SharedBuffer::Create(5 * 1024 * 1024); // GroupServer 的 codec 上限是 4MB
+        std::memset(big.MutableBytes().data(), 'z', big.size());
+        CHECK(h.Send(std::move(big)) == SendResult::Ok);
+        CHECK(h.Send(Buf("s3")) == SendResult::Ok);
+    }
+    CHECK(c.RecvFrame() == "s0");
+    CHECK(c.RecvFrame() == "s1");
+    CHECK(DrainUntilEof(c) == 0); // 没有大帧、也没有 s3
+    CHECK(rec.WaitClosed(1)[0].second == CloseReason::ProtocolError);
+    CHECK(WaitUntil([&] { return s.Drained(); }));
+}
+
+// 迟到的段：连接在这一段执行之前已经被关掉（先排在队里的 Post 关它），整段丢弃，不崩、不发。
+void TestBatchedSendsToConnectionClosedBeforeExecution()
+{
+    const LeakCheck leak;
+    Recorder rec;
+    GroupServer s(rec);
+    TestClient c(s.ep());
+    const ConnectionHandle h = rec.WaitHandle(0);
+    {
+        LoopGate gate(s.loop());
+        s.loop().Post(
+            [&]
+            {
+                if (IConnection* conn = s.loop().table().Current(h.slot(), h.generation()))
+                    conn->Close();
+            });
+        for (int i = 0; i < 8; ++i)
+            CHECK(h.Send(Buf("never" + std::to_string(i))) == SendResult::Ok); // 句柄此刻有效，执行时连接已关
+    }
+    CHECK(DrainUntilEof(c) == 0);
+    CHECK(rec.WaitClosed(1)[0].second == CloseReason::LocalClose);
+    CHECK(WaitUntil([&] { return s.Drained(); }));
+    CHECK(s.group.GetStats().messages_out == 0);
+}
+
 } // namespace
 
 int main()
@@ -372,6 +628,12 @@ int main()
     TestSlowConsumerViaHandle();
     TestPendingBytesDrainsToZero();
     TestSendRacingClose();
+    TestBatchedSendsKeepOrderAndAccounting();
+    TestBatchedSendsWithInterleavedConnections();
+    TestBatchedSendsThenCloseKeepOrder();
+    TestBatchedPartialWriteQueuesTheRestInOrder();
+    TestBatchWithOversizePayloadFallsBackToOneByOne();
+    TestBatchedSendsToConnectionClosedBeforeExecution();
     std::puts("connection_handle_test: ok");
     return 0;
 }

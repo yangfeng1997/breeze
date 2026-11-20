@@ -427,6 +427,69 @@ void PlainStreamConnection::SendFromTask(SharedBuffer payload)
     (void)SendImpl(payload.bytes(), &payload, true);
 }
 
+// 批内相邻的 Send：写队列为空时把这几帧合成一次 sendmsg；否则（已有积压要保序、只有一条、帧头编码失败）走逐条。
+// 记账与 SendImpl(counted = true) 逐项一致：整帧写完的减 pending_bytes 并计 messages_out，没写完的入队（pending_bytes
+// 发送方已经加过、不再查水位）并计 messages_out，EPOLLOUT 排空。
+void PlainStreamConnection::SendBatchFromTask(std::span<SharedBuffer> payloads)
+{
+    if (state_ != State::Connected)
+        return;
+    const std::size_t count = payloads.size();
+    const auto one_by_one = [&]
+    {
+        for (SharedBuffer& p : payloads)
+            SendFromTask(std::move(p));
+    };
+    if (count < 2 || count > kMaxSendBatch || !out_.empty())
+        return one_by_one();
+
+    loop_.AssertInLoopThread();
+    std::array<std::byte, kMaxFrameHeaderSize> headers[kMaxSendBatch]; // 不清零：只有 header_len 个字节会被用到
+    std::size_t header_len[kMaxSendBatch];
+    iovec iov[2 * kMaxSendBatch];
+    int cnt = 0;
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        header_len[i] = codec_->EncodeHeader(payloads[i].size(), headers[i]);
+        if (header_len[i] == 0)
+            return one_by_one(); // 有 payload 超过 codec 上限：还没写任何字节，交给逐条路径按原有规则关连接
+        cnt += FillIov(headers[i].data(), header_len[i], payloads[i].bytes(), 0, iov + cnt);
+    }
+
+    const ssize_t n = SendIov(fd_.get(), iov, cnt);
+    if (n < 0)
+    {
+        LoopStats::Add(loop_.stats().send_closed_io_error);
+        CloseWith(CloseReason::IoError, errno);
+        return;
+    }
+    LoopStats::Bump(loop_.stats().bytes_out, static_cast<std::uint64_t>(n));
+
+    std::size_t left = static_cast<std::size_t>(n);
+    std::size_t i = 0;
+    for (; i < count; ++i) // 整帧写完的
+    {
+        const std::size_t total = header_len[i] + payloads[i].size();
+        if (left < total)
+            break;
+        left -= total;
+        slot_.pending_bytes.fetch_sub(payloads[i].size(), std::memory_order_relaxed);
+        LoopStats::Bump(loop_.stats().messages_out);
+    }
+    for (; i < count; ++i) // 没写完的：第一帧带已写出的偏移，其后整帧入队，保序
+    {
+        Pending& p = out_.emplace_back();
+        p.header = headers[i];
+        p.header_len = static_cast<std::uint8_t>(header_len[i]);
+        p.payload = std::move(payloads[i]);
+        p.offset = left;
+        left = 0;
+        LoopStats::Bump(loop_.stats().messages_out);
+    }
+    if (!out_.empty() && !want_write_)
+        SetWriteInterest(true);
+}
+
 // owned 非空：调用方交来的 SharedBuffer，入队时直接接管；为空：payload 只是个视图，入队时才拷贝。
 SendResult PlainStreamConnection::SendImpl(std::span<const std::byte> payload, SharedBuffer* owned, bool counted)
 {

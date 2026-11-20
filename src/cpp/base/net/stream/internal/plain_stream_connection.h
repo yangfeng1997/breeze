@@ -32,6 +32,7 @@ private:
 
     void OnEvents(std::uint32_t events) override;
     void SendFromTask(SharedBuffer payload) override;
+    void SendBatchFromTask(std::span<SharedBuffer> payloads) override;
     // ICodecHost::SendRaw 的实现（握手应答、控制帧）：冷路径，单独成函数，不碰 SendImpl 的函数体。
     void WriteRaw(std::span<const std::byte> bytes) override;
     // counted：发送方（跨线程的 ConnectionHandle::Send）已经把 payload.size() 计入 pending_bytes，并做过水位检查。

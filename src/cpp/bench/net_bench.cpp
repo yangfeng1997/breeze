@@ -131,6 +131,10 @@ void PinTo(int cpu)
     sched_setaffinity(0, sizeof(set), &set); // 绑定调用线程
 }
 
+// breeze-mainloop 的扇出：主循环对**同一条连接**连续 Send 这么多条回复（客户端等齐 K 条才算一次往返）。
+// 1 = 普通回显。用来量"批内连续 Send"的合并收益（跨线程 Send 各自一次 sendmsg，还是批末合成一次）。
+int g_fanout = 1;
+
 struct BenchOptions
 {
     std::string impl = "breeze";
@@ -571,7 +575,12 @@ class MainLoopServer final : public EchoServer
     class EchoBiz final : public IMainLoopHandler
     {
     public:
-        void OnMessage(ConnectionHandle h, SharedBuffer msg) override { (void)h.Send(std::move(msg)); }
+        void OnMessage(ConnectionHandle h, SharedBuffer msg) override
+        {
+            for (int i = 1; i < g_fanout; ++i)
+                (void)h.Send(msg); // 共享同一块字节，只加引用计数
+            (void)h.Send(std::move(msg));
+        }
     };
 
     class BizModule final : public Module
@@ -1027,7 +1036,7 @@ public:
             REQUIRE(::poll(&p, 1, 10000) > 0 && sock::GetSocketError(c.fd.get()) == 0);
             if (target.kind() == Endpoint::Kind::Tcp)
                 (void)tcp::SetNoDelay(c.fd.get());
-            c.rbuf.resize(frame_.size());
+            c.rbuf.resize(frame_.size() * static_cast<std::size_t>(g_fanout));
             epoll_event ev{};
             ev.events = EPOLLIN;
             ev.data.u32 = static_cast<std::uint32_t>(i);
@@ -1071,7 +1080,8 @@ public:
             {
                 const std::uint32_t idx = evs[static_cast<std::size_t>(i)].data.u32;
                 Conn& c = conns_[idx];
-                const ssize_t r = ::read(c.fd.get(), c.rbuf.data() + c.got, frame_.size() - c.got);
+                const std::size_t reply_bytes = frame_.size() * static_cast<std::size_t>(g_fanout);
+                const ssize_t r = ::read(c.fd.get(), c.rbuf.data() + c.got, reply_bytes - c.got);
                 if (r <= 0)
                 {
                     if (r < 0 && (errno == EAGAIN || errno == EINTR))
@@ -1079,12 +1089,14 @@ public:
                     Die("压测中连接被对端关闭或出错");
                 }
                 c.got += static_cast<std::size_t>(r);
-                if (c.got < frame_.size())
+                if (c.got < reply_bytes)
                     continue;
                 // 每条连接的第一个回包逐字节核对：别拿一个回显错了的实现去比性能。
                 if (!c.verified)
                 {
-                    REQUIRE(std::memcmp(c.rbuf.data(), frame_.data(), frame_.size()) == 0);
+                    for (int k = 0; k < g_fanout; ++k)
+                        REQUIRE(std::memcmp(c.rbuf.data() + static_cast<std::size_t>(k) * frame_.size(), frame_.data(),
+                                            frame_.size()) == 0);
                     c.verified = true;
                 }
                 if (measuring.load(std::memory_order_relaxed))
@@ -1891,6 +1903,8 @@ int main(int argc, char** argv)
             o.rate = std::atof(next().c_str());
         else if (a == "--active")
             o.active = std::atoi(next().c_str());
+        else if (a == "--fanout")
+            g_fanout = std::atoi(next().c_str());
         else if (a == "--mem-probe")
             o.mem_probe = std::atoi(next().c_str());
         else if (a == "--client-cpus")
@@ -1945,6 +1959,11 @@ int main(int argc, char** argv)
     if (secure && o.mem_probe > 0)
         Die("tls / ws / wss 的 --mem-probe 暂不支持：每条服务端 TLS 连接的内存见 tls_layer_test 的 "
             "TestIdleServerLayerMemory（实测约 3171 字节）");
+
+    if (g_fanout < 1 || g_fanout > 32)
+        Die("--fanout 要在 1 到 32 之间");
+    if (g_fanout > 1 && (o.impl != "breeze-mainloop" || o.transport == "udp" || secure))
+        Die("--fanout 只配 --impl breeze-mainloop 与 tcp / uds（要经 NetModule 的跨线程 Send）");
 
     g_table_slots = std::max(o.conns, o.mem_probe) > 60000 ? (1u << 17) : (1u << 16);
     auto server = MakeServer(o.impl, o.transport, o.size, o.mainloop_cpu);

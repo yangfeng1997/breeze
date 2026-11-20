@@ -31,6 +31,9 @@ namespace breeze
 
 class EventLoop;
 
+// EventLoop 一次攒给同一条连接的 Send 条数上限（一帧占两个 iovec，16 条 = 32 个，远小于 IOV_MAX）。
+inline constexpr std::size_t kMaxSendBatch = 16;
+
 class IConnection : protected IPollable
 {
 public:
@@ -99,6 +102,13 @@ private:
 
     // 只由 EventLoop 在执行跨线程任务时调用。
     virtual void SendFromTask(SharedBuffer payload) = 0;
+    // 同一批任务里**相邻的、发往同一条连接的** Send（EventLoop 攒的，至多 kMaxSendBatch 条，顺序即投递顺序），一次交给连接。
+    // 语义必须与按序逐条 SendFromTask 完全相同；默认就是逐条。实现可以在写队列为空时合成一次系统调用。会掏空 payloads。
+    virtual void SendBatchFromTask(std::span<SharedBuffer> payloads)
+    {
+        for (SharedBuffer& p : payloads)
+            SendFromTask(std::move(p));
+    }
     virtual void CloseFromTask(CloseReason reason) = 0;
     // 只由 EventLoop 的空闲扫描调用。
     virtual void CloseIdle() = 0;

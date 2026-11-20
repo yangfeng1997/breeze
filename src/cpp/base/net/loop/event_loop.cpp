@@ -360,6 +360,22 @@ void EventLoop::CloseAllConnections()
 
 // ---- 主循环 ----
 
+std::size_t EventLoop::RunSendRun(std::size_t i, std::size_t n)
+{
+    static_assert(kMaxStaged == kMaxSendBatch);
+    const ConnectionHandle h = batch_[i].handle;
+    std::size_t k = 0;
+    std::size_t j = i;
+    for (; j < n && k < kMaxStaged && IsSendTo(batch_[j], h); ++j)
+        staged_[k++] = std::move(batch_[j].payload);
+    // 第二道校验同 RunTask：句柄在投递之后、执行之前可能已经换代，迟到的任务丢弃。
+    if (IConnection* c = table_->Current(h.slot(), h.generation()))
+        c->SendBatchFromTask(std::span<SharedBuffer>(staged_.data(), k));
+    for (std::size_t x = 0; x < k; ++x)
+        staged_[x] = SharedBuffer{}; // 连接已关闭时没人接管：别让缓冲多活一轮
+    return j;
+}
+
 void EventLoop::RunTask(Task& t)
 {
     switch (t.kind)
@@ -407,6 +423,12 @@ void EventLoop::RunTasks(std::size_t n)
     {
         for (std::size_t i = 0; i < n; ++i)
         {
+            const Task& cur = batch_[i];
+            if (cur.kind == Task::Kind::Conn && cur.op == Op::Send && i + 1 < n && IsSendTo(batch_[i + 1], cur.handle))
+            {
+                i = RunSendRun(i, n) - 1;
+                continue;
+            }
             Task t = std::move(batch_[i]);
             RunTask(t);
         }

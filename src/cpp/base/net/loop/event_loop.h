@@ -208,6 +208,14 @@ private:
     int WaitMs(int timeout_ms);
     void RunTask(Task& t);
     void RunTasks(std::size_t n);
+    // 批内合并：RunTasks 在已取出的这一批里向前看，**相邻的、发往同一条连接的** Send 收成一次交给连接
+    // （IConnection::SendBatchFromTask，至多 kMaxStaged 条）。从 i 起执行这一段，返回段尾的下一个下标。
+    // 只看相邻：中间夹了别的任务就不合并，所以任务的相对顺序与逐条执行完全一致；单条 Send 走原路径，不多走一步。
+    std::size_t RunSendRun(std::size_t i, std::size_t n);
+    static bool IsSendTo(const Task& t, ConnectionHandle h) noexcept
+    {
+        return t.kind == Task::Kind::Conn && t.op == Op::Send && t.handle.raw() == h.raw();
+    }
     void RunTimers();
     void ProcessClosing();
     void DropCancelledTimers();
@@ -219,6 +227,7 @@ private:
     static constexpr std::uint32_t kIdleScanSlices = 10;
 
     static constexpr std::size_t kTaskBatch = 64;
+    static constexpr std::size_t kMaxStaged = 16; // = kMaxSendBatch（event_loop.cpp 里 static_assert）
     static constexpr int kMaxTaskRounds = 4; // 每轮最多处理 4 批任务
     static constexpr int kMaxEvents = 1024;
 
@@ -235,6 +244,7 @@ private:
     std::atomic<bool> sleeping_{false};
     MpscQueue<Task> tasks_;
     std::array<Task, kTaskBatch> batch_; // loop 线程专用，复用避免每轮构造
+    std::array<SharedBuffer, kMaxStaged> staged_; // 合并 Send 时的暂存，loop 线程专用，不分配
 
     std::atomic<std::thread::id> loop_tid_{};
     std::atomic<std::uint64_t> iterations_{0};
