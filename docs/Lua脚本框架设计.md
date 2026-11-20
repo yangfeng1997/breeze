@@ -4,7 +4,7 @@
 
 绑定库的 API、错误模型、线程规则见 [Lua绑定库设计.md](Lua绑定库设计.md)。两层职责不同：
 
-- **绑定库**：一个线程里的 `lua_State`、`Reference`、类型转换、类绑定、`Result`；
+- **绑定库**：一个线程里的 `lua_State`、`Reference`、类型转换、类绑定、`std::expected`；
 - **脚本框架**：应用模块生命周期、主线程脚本、worker 线程、任务队列、目录约定、热更策略。
 
 RPC、IDL 生成物、C++/Lua 混合 codec（Lua 侧依赖 protobuf 库）见 [RPC与IDL设计.md](RPC与IDL设计.md)：codec 不在绑定库、也不在脚本框架，属独立库与 RPC 运行时。
@@ -736,7 +736,7 @@ tick:
 - 该文件可能已经执行了一部分，无法回滚；
 - 记录错误，不更新该文件的 mtime；
 - 继续处理其他变化文件（和 nfshmx/quanta 一致）；
-- 进程本身不会崩，前提是执行走 `lua_pcall` / `Result`。
+- 进程本身不会崩，前提是执行走 `lua_pcall` / `std::expected`。
 
 **不会崩进程的前提**
 
@@ -817,7 +817,7 @@ v1 **不直接复制/引入**这个库：
 
 ### 9.1 错误
 
-- 所有脚本调用返回 `Result`；
+- 所有脚本调用返回 `std::expected`；
 - 主线程错误：记录并返回给调用方；
 - worker 错误：返回 `{job_id, ok=false, error}`，不要影响主线程；
 - worker 禁止 `CallUnprotected`，避免 longjmp 穿越线程栈；
@@ -929,7 +929,7 @@ C++ 只负责把配置转成 `WorkerGroupSpec`。
 - 主线程 reload、worker reload；
 - 语法错误在预加载阶段中止，不执行任何变化文件；
 - 单文件运行时错误不崩进程，失败文件 mtime 不更新，其他文件继续处理；
-- `LuaLoader` 执行模块只走 pcall/Result，不使用 `CallUnprotected`；
+- `LuaLoader` 执行模块只走 pcall/std::expected，不使用 `CallUnprotected`；
 - 每个 worker 的队列独立，`ReloadJob` 能到达每个 worker；
 - root 不参与 reload；root 变化走重启；
 - reload 命令单飞：重复请求合并/忽略；

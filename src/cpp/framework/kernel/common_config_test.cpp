@@ -39,7 +39,7 @@ void SetSecrets()
     ::setenv("BREEZE_T_MONGO_URI", "mongodb://admin:mongo-secret@h:27017/?authSource=admin", 1);
 }
 
-ConfigResult<CommonConfig> Read(std::string_view yaml)
+std::expected<CommonConfig, ConfigError> Read(std::string_view yaml)
 {
     auto c = Config::LoadString(yaml, "common.yaml");
     if (!c)

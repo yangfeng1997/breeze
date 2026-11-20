@@ -404,7 +404,7 @@ ConfigError ConfigNode::Error(std::string message) const
     return e;
 }
 
-ConfigResult<std::string> ConfigNode::AsString() const
+std::expected<std::string, ConfigError> ConfigNode::AsString() const
 {
     if (!IsScalar())
         return std::unexpected(Error(fmt::format("期望字符串，实际是{}", impl_ ? KindName(impl_->node) : "不存在")));
@@ -419,7 +419,7 @@ std::string_view ActualKind(const ConfigNode& n)
 }
 
 template <class N>
-ConfigResult<N> ParseNumber(const ConfigNode& n, std::string_view kind)
+std::expected<N, ConfigError> ParseNumber(const ConfigNode& n, std::string_view kind)
 {
     if (!n.IsScalar())
         return std::unexpected(n.Error(fmt::format("期望{}，实际是{}", kind, ActualKind(n))));
@@ -438,7 +438,7 @@ ConfigResult<N> ParseNumber(const ConfigNode& n, std::string_view kind)
 }
 } // namespace
 
-ConfigResult<bool> ConfigNode::AsBool() const
+std::expected<bool, ConfigError> ConfigNode::AsBool() const
 {
     if (!IsScalar())
         return std::unexpected(Error(fmt::format("期望 true 或 false，实际是{}", ActualKind(*this))));
@@ -450,19 +450,19 @@ ConfigResult<bool> ConfigNode::AsBool() const
     return std::unexpected(Error(fmt::format("期望 true 或 false，实际 '{}'", s)));
 }
 
-ConfigResult<std::int64_t> ConfigNode::AsInt64() const { return ParseNumber<std::int64_t>(*this, "整数"); }
-ConfigResult<std::uint64_t> ConfigNode::AsUInt64() const
+std::expected<std::int64_t, ConfigError> ConfigNode::AsInt64() const { return ParseNumber<std::int64_t>(*this, "整数"); }
+std::expected<std::uint64_t, ConfigError> ConfigNode::AsUInt64() const
 {
     // from_chars 对无符号数遇到 '-' 直接判无效，报错信息里已含原文。
     return ParseNumber<std::uint64_t>(*this, "非负整数");
 }
-ConfigResult<double> ConfigNode::AsDouble() const { return ParseNumber<double>(*this, "数字"); }
+std::expected<double, ConfigError> ConfigNode::AsDouble() const { return ParseNumber<double>(*this, "数字"); }
 
 // ---------------------------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------------------------
 
-ConfigResult<Config> Config::Load(const std::vector<std::string>& files)
+std::expected<Config, ConfigError> Config::Load(const std::vector<std::string>& files)
 {
     auto st = std::make_shared<detail::ConfigState>();
     st->root = YAML::Node(YAML::NodeType::Map);
@@ -491,7 +491,7 @@ ConfigResult<Config> Config::Load(const std::vector<std::string>& files)
     return Config(std::move(st));
 }
 
-ConfigResult<Config> Config::LoadString(std::string_view yaml, std::string name)
+std::expected<Config, ConfigError> Config::LoadString(std::string_view yaml, std::string name)
 {
     auto st = std::make_shared<detail::ConfigState>();
     st->root = YAML::Node(YAML::NodeType::Map);

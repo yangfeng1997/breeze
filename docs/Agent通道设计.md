@@ -219,7 +219,7 @@ class IAgentChannel {
 public:
     virtual ~IAgentChannel() = default;
 
-    virtual Result<SendResult> Send(MessageView message) = 0;
+    virtual std::expected<SendResult, Error> Send(MessageView message) = 0;
     virtual void SetHandler(IAgentHandler& handler) = 0;
 
     virtual void Start() = 0;

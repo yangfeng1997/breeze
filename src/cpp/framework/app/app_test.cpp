@@ -51,13 +51,16 @@ public:
 
     std::string_view Name() const override { return name_; }
     std::vector<std::string_view> DependsOn() const override { return deps_; }
-    Result<> Init() override
+    std::expected<void, Error> Init() override
     {
         if (log_)
             log_->push_back(name_);
         return {};
     }
-    Result<> Start() override { return startErr_ ? Fail(Errc::Module, "boom") : Result<>{}; }
+    std::expected<void, Error> Start() override
+    {
+        return startErr_ ? Fail(Errc::Module, "boom") : std::expected<void, Error>{};
+    }
 
     bool startErr_ = false;
 
@@ -213,7 +216,7 @@ public:
         , ss_(ss)
     {
     }
-    Result<> Start() override
+    std::expected<void, Error> Start() override
     {
         pending = 20;
         app().Notify();
@@ -267,7 +270,7 @@ void TestNotifyFromThreads()
             , ss_(ss)
         {
         }
-        Result<> Start() override
+        std::expected<void, Error> Start() override
         {
             for (int i = 0; i < kProducers; ++i)
             {

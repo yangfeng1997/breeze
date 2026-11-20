@@ -31,7 +31,7 @@ std::string Join(const auto& names)
 
 // 对 modules 按 DependsOn 做稳定拓扑排序，返回按序的下标。
 // 无依赖关系的模块保持注册序：每步取注册序号最小的就绪节点，该语义靠 app_test 固定。
-Result<std::vector<std::size_t>> DepsSort(const std::vector<std::unique_ptr<Module>>& modules)
+std::expected<std::vector<std::size_t>, Error> DepsSort(const std::vector<std::unique_ptr<Module>>& modules)
 {
     const std::size_t n = modules.size();
 
@@ -176,7 +176,7 @@ std::unexpected<Error> App::ModuleErr(std::string_view method, std::string_view 
     return Fail(Errc::Module, fmt::format("{}: module {}: {}: {}", name_, module, method, e.msg));
 }
 
-Result<> App::Build()
+std::expected<void, Error> App::Build()
 {
     std::vector<ModuleFactory> factories;
     {
@@ -258,7 +258,7 @@ Result<> App::Build()
     return {};
 }
 
-Result<> App::Run(std::stop_token st)
+std::expected<void, Error> App::Run(std::stop_token st)
 {
     // 无论从哪条路返回，进程都算正在退出
     struct StopOnExit

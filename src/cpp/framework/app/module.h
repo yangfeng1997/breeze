@@ -38,11 +38,11 @@ public:
     // Build 阶段据此做拓扑排序。返回的 view 必须在模块存活期内有效（字面量或成员）。
     virtual std::vector<std::string_view> DependsOn() const { return {}; }
 
-    virtual Result<> Init() = 0;
+    virtual std::expected<void, Error> Init() = 0;
 
     // 返回错误的模块**必须自清理**：它可能已起线程或开了监听，框架不替它收尾
     // （见 lifecycle.cpp 的 Start，无回滚）。
-    virtual Result<> Start() = 0;
+    virtual std::expected<void, Error> Start() = 0;
 
     App& app() const noexcept { return app_; }
 

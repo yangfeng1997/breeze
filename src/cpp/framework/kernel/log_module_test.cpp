@@ -68,13 +68,13 @@ public:
     {
     }
     std::string_view Name() const override { return "probe"; }
-    Result<> Init() override
+    std::expected<void, Error> Init() override
     {
         *ready_ = g_default_logger.load() != nullptr;
         LOG_INFO("probe-init");
         return {};
     }
-    Result<> Start() override { return {}; }
+    std::expected<void, Error> Start() override { return {}; }
 
 private:
     bool* ready_;

@@ -1,4 +1,4 @@
-// 错误码与 Result。对照 src/go/core/app/errors.go。
+// 错误码与 std::expected。对照 src/go/core/app/errors.go。
 //
 // Go 靠 errors.Is 沿 %w 链判定哨兵；C++ 没有链，改用 Errc 判定，msg 已带进程名/模块名前缀。
 
@@ -30,9 +30,6 @@ struct Error
     Errc code;
     std::string msg;
 };
-
-template <class T = void>
-using Result = std::expected<T, Error>;
 
 inline std::unexpected<Error> Fail(Errc code, std::string msg)
 {

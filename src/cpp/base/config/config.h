@@ -55,9 +55,6 @@ struct ConfigError
     std::string Format() const;
 };
 
-template <class T>
-using ConfigResult = std::expected<T, ConfigError>;
-
 // 配置树里的一个位置。便宜的句柄，可随意拷贝。
 class ConfigNode
 {
@@ -78,11 +75,11 @@ public:
     std::vector<ConfigNode> Items() const; // 仅序列
     std::vector<std::string> Keys() const; // 仅映射
 
-    ConfigResult<std::string> AsString() const;
-    ConfigResult<bool> AsBool() const;
-    ConfigResult<std::int64_t> AsInt64() const;
-    ConfigResult<std::uint64_t> AsUInt64() const;
-    ConfigResult<double> AsDouble() const;
+    std::expected<std::string, ConfigError> AsString() const;
+    std::expected<bool, ConfigError> AsBool() const;
+    std::expected<std::int64_t, ConfigError> AsInt64() const;
+    std::expected<std::uint64_t, ConfigError> AsUInt64() const;
+    std::expected<double, ConfigError> AsDouble() const;
 
     // 以本节点的路径、文件、行号构造错误。
     ConfigError Error(std::string message) const;
@@ -105,7 +102,7 @@ template <class T>
     requires(std::is_integral_v<T> && !std::is_same_v<T, bool>)
 struct ConfigTraits<T>
 {
-    static ConfigResult<void> ReadInto(const ConfigNode& n, T& out)
+    static std::expected<void, ConfigError> ReadInto(const ConfigNode& n, T& out)
     {
         constexpr auto lo = std::numeric_limits<T>::min();
         constexpr auto hi = std::numeric_limits<T>::max();
@@ -136,7 +133,7 @@ template <class T>
     requires std::is_floating_point_v<T>
 struct ConfigTraits<T>
 {
-    static ConfigResult<void> ReadInto(const ConfigNode& n, T& out)
+    static std::expected<void, ConfigError> ReadInto(const ConfigNode& n, T& out)
     {
         auto v = n.AsDouble();
         if (!v)
@@ -149,7 +146,7 @@ struct ConfigTraits<T>
 template <>
 struct ConfigTraits<bool>
 {
-    static ConfigResult<void> ReadInto(const ConfigNode& n, bool& out)
+    static std::expected<void, ConfigError> ReadInto(const ConfigNode& n, bool& out)
     {
         auto v = n.AsBool();
         if (!v)
@@ -162,7 +159,7 @@ struct ConfigTraits<bool>
 template <>
 struct ConfigTraits<std::string>
 {
-    static ConfigResult<void> ReadInto(const ConfigNode& n, std::string& out)
+    static std::expected<void, ConfigError> ReadInto(const ConfigNode& n, std::string& out)
     {
         auto v = n.AsString();
         if (!v)
@@ -176,7 +173,7 @@ struct ConfigTraits<std::string>
 template <class T>
 struct ConfigTraits<std::vector<T>>
 {
-    static ConfigResult<void> ReadInto(const ConfigNode& n, std::vector<T>& out)
+    static std::expected<void, ConfigError> ReadInto(const ConfigNode& n, std::vector<T>& out)
     {
         if (!n.IsNull() && !n.IsSeq())
             return std::unexpected(n.Error("期望序列"));
@@ -196,7 +193,7 @@ struct ConfigTraits<std::vector<T>>
 template <class T>
 struct ConfigTraits<std::map<std::string, T>>
 {
-    static ConfigResult<void> ReadInto(const ConfigNode& n, std::map<std::string, T>& out)
+    static std::expected<void, ConfigError> ReadInto(const ConfigNode& n, std::map<std::string, T>& out)
     {
         if (!n.IsNull() && !n.IsMap())
             return std::unexpected(n.Error("期望映射"));
@@ -217,7 +214,7 @@ struct ConfigTraits<std::map<std::string, T>>
 template <class T>
 struct ConfigTraits<std::optional<T>>
 {
-    static ConfigResult<void> ReadInto(const ConfigNode& n, std::optional<T>& out)
+    static std::expected<void, ConfigError> ReadInto(const ConfigNode& n, std::optional<T>& out)
     {
         if (n.IsNull())
         {
@@ -249,7 +246,7 @@ struct ConfigTraits<std::optional<T>>
 template <class E>
 struct EnumTraits
 {
-    static ConfigResult<void> ReadInto(const ConfigNode& n, E& out)
+    static std::expected<void, ConfigError> ReadInto(const ConfigNode& n, E& out)
     {
         auto s = n.AsString();
         if (!s)
@@ -303,7 +300,7 @@ struct EnumTraits
 // 该类型有没有现成的 ConfigTraits（枚举没有，靠 Field(...).Enum / .Parse 读）。
 template <class M>
 concept HasConfigTraits = requires(const ConfigNode& n, M& m) {
-    { ConfigTraits<M>::ReadInto(n, m) } -> std::same_as<ConfigResult<void>>;
+    { ConfigTraits<M>::ReadInto(n, m) } -> std::same_as<std::expected<void, ConfigError>>;
 };
 
 // 该类型是不是一个"结构体"：有字段表。
@@ -332,7 +329,7 @@ struct FieldBinder
     bool required = false;
     bool secret = false;
     bool reloadable = false;
-    std::function<ConfigResult<void>(const ConfigNode&, T&)> read;
+    std::function<std::expected<void, ConfigError>(const ConfigNode&, T&)> read;
     std::function<void(T&)> redact;                         // 把敏感字段改成打码值（递归）
     std::function<std::string(const T&)> flow;              // 值的单行文本（标量 / [..] / {..}）
     std::function<void(const T&, int, std::string&)> block; // "key:" 之后的文本，结构体与 map 换行缩进
@@ -402,7 +399,7 @@ public:
                     return name;
             return "<unknown>";
         };
-        reader_ = [table = std::move(table)](const ConfigNode& n, M& out) -> ConfigResult<void>
+        reader_ = [table = std::move(table)](const ConfigNode& n, M& out) -> std::expected<void, ConfigError>
         {
             auto s = n.AsString();
             if (!s)
@@ -430,7 +427,7 @@ public:
     {
         formatter_ = std::move(format);
         reader_ = [fn = std::move(fn), expected = std::move(expected)](const ConfigNode& n,
-                                                                       M& out) -> ConfigResult<void>
+                                                                       M& out) -> std::expected<void, ConfigError>
         {
             auto s = n.AsString();
             if (!s)
@@ -458,10 +455,10 @@ public:
         b.reloadable = reloadable_;
 
         b.read = [member = member_, reader = reader_, checks = checks_](const ConfigNode& n,
-                                                                        T& out) -> ConfigResult<void>
+                                                                        T& out) -> std::expected<void, ConfigError>
         {
             M tmp = out.*member; // 在现有值（默认值）上改写
-            ConfigResult<void> r;
+            std::expected<void, ConfigError> r;
             if (reader)
                 r = reader(n, tmp);
             else if constexpr (HasConfigTraits<M>)
@@ -522,7 +519,7 @@ private:
     bool required_ = false;
     bool secret_ = false;
     bool reloadable_ = false;
-    std::function<ConfigResult<void>(const ConfigNode&, M&)> reader_;
+    std::function<std::expected<void, ConfigError>(const ConfigNode&, M&)> reader_;
     std::function<std::string(const M&)> formatter_;
     std::vector<std::function<std::string(const M&)>> checks_;
 };
@@ -535,7 +532,7 @@ FieldBuilder<T, M> Field(std::string_view key, M T::* member)
 
 // 空节点（`section:` 后面什么都没写）等于一张空表：全部取默认值，必填项仍然报错。
 template <class T>
-ConfigResult<void> BindStruct(const ConfigNode& node, T& out, const FieldTable<T>& table)
+std::expected<void, ConfigError> BindStruct(const ConfigNode& node, T& out, const FieldTable<T>& table)
 {
     if (!node.IsNull() && !node.IsMap())
         return std::unexpected(node.Error("期望映射（键值对）"));
@@ -563,7 +560,10 @@ struct StructTraits
         static const FieldTable<T> table = ConfigTraits<T>::MakeFields();
         return table;
     }
-    static ConfigResult<void> ReadInto(const ConfigNode& n, T& out) { return BindStruct(n, out, Fields()); }
+    static std::expected<void, ConfigError> ReadInto(const ConfigNode& n, T& out)
+    {
+        return BindStruct(n, out, Fields());
+    }
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -839,7 +839,7 @@ std::vector<std::string> ConfigNonReloadableChanges(const T& current, const T& c
 // 同上，包成错误：message 里列出全部不该变的字段。
 template <class T>
     requires HasFieldTable<T>
-ConfigResult<void> ConfigCheckReload(const T& current, const T& candidate)
+std::expected<void, ConfigError> ConfigCheckReload(const T& current, const T& candidate)
 {
     const auto changed = ConfigNonReloadableChanges(current, candidate);
     if (changed.empty())
@@ -858,15 +858,15 @@ class Config
 {
 public:
     // 按顺序合并，后者覆盖前者。空文件当空表；顶层必须是映射。
-    static ConfigResult<Config> Load(const std::vector<std::string>& files);
+    static std::expected<Config, ConfigError> Load(const std::vector<std::string>& files);
     // 配置来自内存（测试、内嵌默认值）。name 只用于错误信息里的"文件名"。
-    static ConfigResult<Config> LoadString(std::string_view yaml, std::string name = "<string>");
+    static std::expected<Config, ConfigError> LoadString(std::string_view yaml, std::string name = "<string>");
 
     ConfigNode Root() const;
 
     // path 是点号路径。缺失是错误。
     template <class T>
-    ConfigResult<T> Get(std::string_view path) const
+    std::expected<T, ConfigError> Get(std::string_view path) const
     {
         ConfigNode n = Root().Find(path);
         if (!n.Valid())
@@ -879,7 +879,7 @@ public:
 
     // 缺失时返回 fallback；存在但不合法仍是错误（不会悄悄退回默认值）。
     template <class T>
-    ConfigResult<T> GetOr(std::string_view path, T fallback) const
+    std::expected<T, ConfigError> GetOr(std::string_view path, T fallback) const
     {
         ConfigNode n = Root().Find(path);
         if (!n.Valid())

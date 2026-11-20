@@ -24,7 +24,7 @@ std::vector<Module*> Snapshot(const std::vector<std::unique_ptr<Module>>& module
 } // namespace
 
 // 出错模块之前的模块收不到任何通知，框架也不释放它们 Init 期占用的资源。
-Result<> App::Init()
+std::expected<void, Error> App::Init()
 {
     std::vector<Module*> mods;
     {
@@ -46,7 +46,7 @@ Result<> App::Init()
 
 // 比 Init 更需要小心：已 Start 的模块可能已起线程、开了监听，框架不会叫停。
 // 返回错误的模块由 Module::Start 的约定自清理，其余随进程退出被带走。
-Result<> App::Start()
+std::expected<void, Error> App::Start()
 {
     std::vector<Module*> mods;
     {

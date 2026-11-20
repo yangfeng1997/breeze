@@ -83,8 +83,8 @@ public:
 
     std::string_view Name() const override { return "net"; }
     std::vector<std::string_view> DependsOn() const override;
-    Result<> Init() override;
-    Result<> Start() override;
+    std::expected<void, Error> Init() override;
+    std::expected<void, Error> Start() override;
 
     // = executor.Drain(wake_budget)：true 表示仍有积压，App 会补一个唤醒再转一轮。
     bool Wake() override;
@@ -97,21 +97,21 @@ public:
     // accept_filter 对它有意义），factory 对它被忽略：rudp 的消息自带边界，没有 codec。要签发票据就要拿到 RUdpServer，
     // 用 AddRUdpServer（或对返回的 INetServer* 做 dynamic_cast）。
     // AddClient 不收 udp://：rudp 客户端要凭票据握手，用 AddRUdpClient。
-    Result<INetServer*> AddServer(std::string_view endpoint,
-                                  IMainLoopHandler& handler,
-                                  const IFrameCodecFactory& factory);
-    Result<INetServer*> AddServer(std::string_view endpoint,
-                                  IMainLoopHandler& handler,
-                                  const IFrameCodecFactory& factory,
-                                  StreamServerOptions options);
-    Result<INetClient*> AddClient(std::string_view endpoint,
-                                  IMainLoopHandler& handler,
-                                  const IFrameCodecFactory& factory);
-    Result<INetClient*> AddClient(std::string_view endpoint,
-                                  IMainLoopHandler& handler,
-                                  const IFrameCodecFactory& factory,
-                                  StreamClientOptions options,
-                                  ReconnectPolicy policy);
+    std::expected<INetServer*, Error> AddServer(std::string_view endpoint,
+                                                IMainLoopHandler& handler,
+                                                const IFrameCodecFactory& factory);
+    std::expected<INetServer*, Error> AddServer(std::string_view endpoint,
+                                                IMainLoopHandler& handler,
+                                                const IFrameCodecFactory& factory,
+                                                StreamServerOptions options);
+    std::expected<INetClient*, Error> AddClient(std::string_view endpoint,
+                                                IMainLoopHandler& handler,
+                                                const IFrameCodecFactory& factory);
+    std::expected<INetClient*, Error> AddClient(std::string_view endpoint,
+                                                IMainLoopHandler& handler,
+                                                const IFrameCodecFactory& factory,
+                                                StreamClientOptions options,
+                                                ReconnectPolicy policy);
 
     // ---- 本机 Agent（Sidecar）：设计见 docs/共享内存IPC设计.md ----
     // App 一侧：连本机 Agent，握手时协商用共享内存（+ UDS 探活）还是仅 UDS（见 agent/agent_client.h），连上之后表现成一条普通连接，
@@ -119,37 +119,41 @@ public:
     // 第一个重载：端点、是否启用共享内存（net.agent_shm_enabled，关了就是仅 UDS）、环容量取 NetModuleOptions::agent（net.agent_*）；
     // busid 是这个 App 在 Agent 上的通道名；factory 是仅 UDS（含退化）时数据通道的帧格式，要与 Agent 那边一致，要比 Shutdown 活得久。
     // 第二个重载：全部自己给（options.codec 是帧格式）。端点必须是 UDS。
-    Result<agent::AgentClient*> AddAgentClient(std::string_view busid,
-                                               IMainLoopHandler& handler,
-                                               const IFrameCodecFactory& factory);
-    Result<agent::AgentClient*> AddAgentClient(std::string_view endpoint,
-                                               IMainLoopHandler& handler,
-                                               agent::AgentClientOptions options);
+    std::expected<agent::AgentClient*, Error> AddAgentClient(std::string_view busid,
+                                                             IMainLoopHandler& handler,
+                                                             const IFrameCodecFactory& factory);
+    std::expected<agent::AgentClient*, Error> AddAgentClient(std::string_view endpoint,
+                                                             IMainLoopHandler& handler,
+                                                             agent::AgentClientOptions options);
     // Agent 一侧：监听 UDS，App 经共享内存或仅 UDS 接入，消息由路由器在 IO 线程内转发（**不经主循环**，见 agent/agent_router.h）。
     // **要求 net.io_threads = 1**（路由器与路由表是单线程访问的），否则返回错误。table 要比模块活得久，只在路由器所在的 loop 线程上访问。
     // 第一个重载的连接选项取 NetModuleOptions::connection。返回的 AgentServer 里有路由器（router()）与统计。
-    Result<agent::AgentServer*> AddAgentServer(std::string_view endpoint, agent::RouteTable& table);
-    Result<agent::AgentServer*> AddAgentServer(std::string_view endpoint,
-                                               agent::RouteTable& table,
-                                               agent::AgentServerOptions options);
+    std::expected<agent::AgentServer*, Error> AddAgentServer(std::string_view endpoint, agent::RouteTable& table);
+    std::expected<agent::AgentServer*, Error> AddAgentServer(std::string_view endpoint,
+                                                             agent::RouteTable& table,
+                                                             agent::AgentServerOptions options);
     // 回调直接在 IO 线程上执行（不回投主循环）的服务端 / 客户端：Agent 之间的转发链路用，handler 是 AgentServer::router()。
     // 端点是 tcp:// 或 unix://（不收 udp://）。handler 与 factory 要比 Shutdown 活得久。
-    Result<INetServer*> AddIoServer(std::string_view endpoint, IConnectionHandler& handler, const IFrameCodecFactory& factory);
-    Result<INetClient*> AddIoClient(std::string_view endpoint,
-                                   IConnectionHandler& handler,
-                                   const IFrameCodecFactory& factory,
-                                   ReconnectPolicy policy = {});
+    std::expected<INetServer*, Error> AddIoServer(std::string_view endpoint,
+                                                  IConnectionHandler& handler,
+                                                  const IFrameCodecFactory& factory);
+    std::expected<INetClient*, Error> AddIoClient(std::string_view endpoint,
+                                                  IConnectionHandler& handler,
+                                                  const IFrameCodecFactory& factory,
+                                                  ReconnectPolicy policy = {});
 
     // rudp（可靠 UDP，KCP 之上）：设计与准入模型见 rudp/rudp_server.h、rudp_client.h。
     // 服务端随模块启动；没给选项时用 NetModuleOptions 的 connection 与 rudp。rudp 选项不合法返回错误。
-    Result<RUdpServer*> AddRUdpServer(const RUdpEndpoint& endpoint, IMainLoopHandler& handler);
-    Result<RUdpServer*> AddRUdpServer(const RUdpEndpoint& endpoint,
-                                      IMainLoopHandler& handler,
-                                      RUdpServerOptions options);
+    std::expected<RUdpServer*, Error> AddRUdpServer(const RUdpEndpoint& endpoint, IMainLoopHandler& handler);
+    std::expected<RUdpServer*, Error> AddRUdpServer(const RUdpEndpoint& endpoint,
+                                                    IMainLoopHandler& handler,
+                                                    RUdpServerOptions options);
     // 客户端**不随模块启动**：票据要等控制面发下来，业务拿到后（构造时给，或 SetTicket）自己调 Start()，
     // 每次断线都要新票据（不自动重连）。随 group 一起停。没给选项时用 NetModuleOptions 的 connection 与 rudp。
-    Result<RUdpClient*> AddRUdpClient(const RUdpEndpoint& server, IMainLoopHandler& handler);
-    Result<RUdpClient*> AddRUdpClient(const RUdpEndpoint& server, IMainLoopHandler& handler, RUdpClientOptions options);
+    std::expected<RUdpClient*, Error> AddRUdpClient(const RUdpEndpoint& server, IMainLoopHandler& handler);
+    std::expected<RUdpClient*, Error> AddRUdpClient(const RUdpEndpoint& server,
+                                                    IMainLoopHandler& handler,
+                                                    RUdpClientOptions options);
 
     // main 在 App::Run 返回之后调：group 优雅关闭（到 shutdown_deadline 强关），再把事件 Drain 到空。
     // 在主循环线程（调 Run 的线程）上调用。对没 Start 成功的、以及重复调用都是空操作。
@@ -168,7 +172,7 @@ private:
         ShutDown,
     };
 
-    Result<> CheckPhase(std::string_view what) const;
+    std::expected<void, Error> CheckPhase(std::string_view what) const;
     void Rollback();
     // 装配 TCP / UDS 的服务端 / 客户端（handler 已经按需包装过）。AddServer / AddIoServer 与 AddClient / AddIoClient 共用。
     INetServer* MakeStreamServer(const std::optional<TcpEndpoint>& tcp,

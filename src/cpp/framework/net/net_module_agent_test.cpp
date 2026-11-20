@@ -134,7 +134,7 @@ public:
     }
     std::string_view Name() const override { return "agent"; }
     std::vector<std::string_view> DependsOn() const override { return {"net"}; }
-    Result<> Init() override
+    std::expected<void, Error> Init() override
     {
         auto* net = app().GetModule<NetModule>("net");
         auto s = net->AddAgentServer(listen_, table_);
@@ -143,7 +143,7 @@ public:
         server = *s;
         return {};
     }
-    Result<> Start() override
+    std::expected<void, Error> Start() override
     {
         ready.store(true, std::memory_order_release);
         return {};
@@ -169,7 +169,7 @@ public:
     }
     std::string_view Name() const override { return "appmod"; }
     std::vector<std::string_view> DependsOn() const override { return {"net"}; }
-    Result<> Init() override
+    std::expected<void, Error> Init() override
     {
         net = app().GetModule<NetModule>("net");
         auto c = net->AddAgentClient(busid_, biz_, f_);
@@ -178,7 +178,7 @@ public:
         client = *c;
         return {};
     }
-    Result<> Start() override { return {}; }
+    std::expected<void, Error> Start() override { return {}; }
     NetModule* net = nullptr;
     AgentClient* client = nullptr;
 
@@ -212,7 +212,7 @@ struct Runner
     }
     std::stop_source stop;
     std::atomic<std::thread::id> tid{};
-    Result<> result;
+    std::expected<void, Error> result;
     std::atomic<bool> done{false};
     std::thread thread;
 };
@@ -364,21 +364,21 @@ void TestConfigMapsToOptions()
 class FailModule final : public Module
 {
 public:
-    FailModule(App& a, std::function<Result<>(NetModule&)> f)
+    FailModule(App& a, std::function<std::expected<void, Error>(NetModule&)> f)
         : Module(a)
         , f_(std::move(f))
     {
     }
     std::string_view Name() const override { return "fail"; }
     std::vector<std::string_view> DependsOn() const override { return {"net"}; }
-    Result<> Init() override { return f_(*app().GetModule<NetModule>("net")); }
-    Result<> Start() override { return {}; }
+    std::expected<void, Error> Init() override { return f_(*app().GetModule<NetModule>("net")); }
+    std::expected<void, Error> Start() override { return {}; }
 
 private:
-    std::function<Result<>(NetModule&)> f_;
+    std::function<std::expected<void, Error>(NetModule&)> f_;
 };
 
-std::string RunInitFailure(NetModuleOptions options, std::function<Result<>(NetModule&)> assemble)
+std::string RunInitFailure(NetModuleOptions options, std::function<std::expected<void, Error>(NetModule&)> assemble)
 {
     App app("net-test");
     app.RegisterModule([&](App& a) { return std::make_unique<NetModule>(a, options); });
@@ -397,49 +397,49 @@ void TestAssemblyErrors()
     StaticRouteTable table;
     { // Agent 的端点必须是 UDS：fd 只能经 UDS 传递。
         const std::string e = RunInitFailure(Options(),
-                                             [&](NetModule& n) -> Result<>
+                                             [&](NetModule& n) -> std::expected<void, Error>
                                              {
                                                  agent::AgentClientOptions o;
                                                  o.busid = "x";
                                                  auto c = n.AddAgentClient("tcp://127.0.0.1:1", biz, std::move(o));
-                                                 return c ? Result<>{} : std::unexpected(c.error());
+                                                 return c ? std::expected<void, Error>{} : std::unexpected(c.error());
                                              });
         CHECK(Has(e, "tcp://127.0.0.1:1") && Has(e, "UDS"));
     }
     { // 通道名不合法。
         const std::string e = RunInitFailure(Options(),
-                                             [&](NetModule& n) -> Result<>
+                                             [&](NetModule& n) -> std::expected<void, Error>
                                              {
                                                  auto c = n.AddAgentClient("bad name", biz, frames);
-                                                 return c ? Result<>{} : std::unexpected(c.error());
+                                                 return c ? std::expected<void, Error>{} : std::unexpected(c.error());
                                              });
         CHECK(Has(e, "bad name"));
     }
     { // 路由器是单线程的：io_threads 不是 1 就拒绝。
         const std::string e = RunInitFailure(Options(/*io_threads=*/2),
-                                             [&](NetModule& n) -> Result<>
+                                             [&](NetModule& n) -> std::expected<void, Error>
                                              {
                                                  auto s = n.AddAgentServer("unix:///tmp/never-used.sock", table);
-                                                 return s ? Result<>{} : std::unexpected(s.error());
+                                                 return s ? std::expected<void, Error>{} : std::unexpected(s.error());
                                              });
         CHECK(Has(e, "io_threads") && Has(e, "2"));
     }
     { // 监听端点不合法 / 不是 UDS。
         const std::string e = RunInitFailure(Options(),
-                                             [&](NetModule& n) -> Result<>
+                                             [&](NetModule& n) -> std::expected<void, Error>
                                              {
                                                  auto s = n.AddAgentServer("tcp://127.0.0.1:0", table);
-                                                 return s ? Result<>{} : std::unexpected(s.error());
+                                                 return s ? std::expected<void, Error>{} : std::unexpected(s.error());
                                              });
         CHECK(Has(e, "tcp://127.0.0.1:0"));
     }
     { // AddIoServer 不收 udp://。
         const std::string e = RunInitFailure(Options(),
-                                             [&](NetModule& n) -> Result<>
+                                             [&](NetModule& n) -> std::expected<void, Error>
                                              {
                                                  AgentRouter router(table);
                                                  auto s = n.AddIoServer("udp://127.0.0.1:0", router, frames);
-                                                 return s ? Result<>{} : std::unexpected(s.error());
+                                                 return s ? std::expected<void, Error>{} : std::unexpected(s.error());
                                              });
         CHECK(Has(e, "udp://127.0.0.1:0"));
     }

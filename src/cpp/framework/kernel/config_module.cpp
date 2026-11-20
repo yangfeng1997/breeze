@@ -7,7 +7,7 @@
 namespace breeze
 {
 
-Result<> ConfigModule::Init()
+std::expected<void, Error> ConfigModule::Init()
 {
     auto cfg = Config::Load({path_});
     if (!cfg)

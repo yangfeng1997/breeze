@@ -57,7 +57,7 @@ std::vector<std::string_view> NetModule::DependsOn() const
     return {};
 }
 
-Result<> NetModule::Init()
+std::expected<void, Error> NetModule::Init()
 {
     if (from_config_)
     {
@@ -76,16 +76,16 @@ Result<> NetModule::Init()
     return {};
 }
 
-Result<> NetModule::CheckPhase(std::string_view what) const
+std::expected<void, Error> NetModule::CheckPhase(std::string_view what) const
 {
     if (phase_ != Phase::Inited)
         return Fail(Errc::Phase, fmt::format("net: {} 只能在 Init 之后、Start 之前调用", what));
     return {};
 }
 
-Result<INetServer*> NetModule::AddServer(std::string_view endpoint,
-                                         IMainLoopHandler& handler,
-                                         const IFrameCodecFactory& factory)
+std::expected<INetServer*, Error> NetModule::AddServer(std::string_view endpoint,
+                                                       IMainLoopHandler& handler,
+                                                       const IFrameCodecFactory& factory)
 {
     StreamServerOptions so;
     so.connection = options_.connection;
@@ -93,10 +93,10 @@ Result<INetServer*> NetModule::AddServer(std::string_view endpoint,
     return AddServer(endpoint, handler, factory, std::move(so));
 }
 
-Result<INetServer*> NetModule::AddServer(std::string_view endpoint,
-                                         IMainLoopHandler& handler,
-                                         const IFrameCodecFactory& factory,
-                                         StreamServerOptions options)
+std::expected<INetServer*, Error> NetModule::AddServer(std::string_view endpoint,
+                                                       IMainLoopHandler& handler,
+                                                       const IFrameCodecFactory& factory,
+                                                       StreamServerOptions options)
 {
     if (auto r = CheckPhase("AddServer"); !r)
         return std::unexpected(r.error());
@@ -152,9 +152,9 @@ INetServer* NetModule::MakeStreamServer(const std::optional<TcpEndpoint>& tcp,
     return servers_.back().get();
 }
 
-Result<INetClient*> NetModule::AddClient(std::string_view endpoint,
-                                         IMainLoopHandler& handler,
-                                         const IFrameCodecFactory& factory)
+std::expected<INetClient*, Error> NetModule::AddClient(std::string_view endpoint,
+                                                       IMainLoopHandler& handler,
+                                                       const IFrameCodecFactory& factory)
 {
     StreamClientOptions co;
     co.connection = options_.connection;
@@ -162,11 +162,11 @@ Result<INetClient*> NetModule::AddClient(std::string_view endpoint,
     return AddClient(endpoint, handler, factory, std::move(co), ReconnectPolicy{});
 }
 
-Result<INetClient*> NetModule::AddClient(std::string_view endpoint,
-                                         IMainLoopHandler& handler,
-                                         const IFrameCodecFactory& factory,
-                                         StreamClientOptions options,
-                                         ReconnectPolicy policy)
+std::expected<INetClient*, Error> NetModule::AddClient(std::string_view endpoint,
+                                                       IMainLoopHandler& handler,
+                                                       const IFrameCodecFactory& factory,
+                                                       StreamClientOptions options,
+                                                       ReconnectPolicy policy)
 {
     if (auto r = CheckPhase("AddClient"); !r)
         return std::unexpected(r.error());
@@ -218,9 +218,9 @@ INetClient* NetModule::MakeStreamClient(const std::optional<TcpEndpoint>& tcp,
 
 // ---- 本机 Agent ----
 
-Result<agent::AgentClient*> NetModule::AddAgentClient(std::string_view busid,
-                                                      IMainLoopHandler& handler,
-                                                      const IFrameCodecFactory& factory)
+std::expected<agent::AgentClient*, Error> NetModule::AddAgentClient(std::string_view busid,
+                                                                    IMainLoopHandler& handler,
+                                                                    const IFrameCodecFactory& factory)
 {
     agent::AgentClientOptions o;
     o.busid = std::string(busid);
@@ -232,9 +232,9 @@ Result<agent::AgentClient*> NetModule::AddAgentClient(std::string_view busid,
     return AddAgentClient(options_.agent.endpoint, handler, std::move(o));
 }
 
-Result<agent::AgentClient*> NetModule::AddAgentClient(std::string_view endpoint,
-                                                      IMainLoopHandler& handler,
-                                                      agent::AgentClientOptions options)
+std::expected<agent::AgentClient*, Error> NetModule::AddAgentClient(std::string_view endpoint,
+                                                                    IMainLoopHandler& handler,
+                                                                    agent::AgentClientOptions options)
 {
     if (auto r = CheckPhase("AddAgentClient"); !r)
         return std::unexpected(r.error());
@@ -259,16 +259,16 @@ Result<agent::AgentClient*> NetModule::AddAgentClient(std::string_view endpoint,
     return raw;
 }
 
-Result<agent::AgentServer*> NetModule::AddAgentServer(std::string_view endpoint, agent::RouteTable& table)
+std::expected<agent::AgentServer*, Error> NetModule::AddAgentServer(std::string_view endpoint, agent::RouteTable& table)
 {
     agent::AgentServerOptions o;
     o.connection = options_.connection;
     return AddAgentServer(endpoint, table, std::move(o));
 }
 
-Result<agent::AgentServer*> NetModule::AddAgentServer(std::string_view endpoint,
-                                                      agent::RouteTable& table,
-                                                      agent::AgentServerOptions options)
+std::expected<agent::AgentServer*, Error> NetModule::AddAgentServer(std::string_view endpoint,
+                                                                    agent::RouteTable& table,
+                                                                    agent::AgentServerOptions options)
 {
     if (auto r = CheckPhase("AddAgentServer"); !r)
         return std::unexpected(r.error());
@@ -286,7 +286,9 @@ Result<agent::AgentServer*> NetModule::AddAgentServer(std::string_view endpoint,
     return raw;
 }
 
-Result<INetServer*> NetModule::AddIoServer(std::string_view endpoint, IConnectionHandler& handler, const IFrameCodecFactory& factory)
+std::expected<INetServer*, Error> NetModule::AddIoServer(std::string_view endpoint,
+                                                        IConnectionHandler& handler,
+                                                        const IFrameCodecFactory& factory)
 {
     if (auto r = CheckPhase("AddIoServer"); !r)
         return std::unexpected(r.error());
@@ -303,10 +305,10 @@ Result<INetServer*> NetModule::AddIoServer(std::string_view endpoint, IConnectio
     return MakeStreamServer(tcp, uds, handler, factory, std::move(so));
 }
 
-Result<INetClient*> NetModule::AddIoClient(std::string_view endpoint,
-                                          IConnectionHandler& handler,
-                                          const IFrameCodecFactory& factory,
-                                          ReconnectPolicy policy)
+std::expected<INetClient*, Error> NetModule::AddIoClient(std::string_view endpoint,
+                                                         IConnectionHandler& handler,
+                                                         const IFrameCodecFactory& factory,
+                                                         ReconnectPolicy policy)
 {
     if (auto r = CheckPhase("AddIoClient"); !r)
         return std::unexpected(r.error());
@@ -323,7 +325,7 @@ Result<INetClient*> NetModule::AddIoClient(std::string_view endpoint,
     return MakeStreamClient(tcp, uds, handler, factory, std::move(co), policy);
 }
 
-Result<RUdpServer*> NetModule::AddRUdpServer(const RUdpEndpoint& endpoint, IMainLoopHandler& handler)
+std::expected<RUdpServer*, Error> NetModule::AddRUdpServer(const RUdpEndpoint& endpoint, IMainLoopHandler& handler)
 {
     RUdpServerOptions o;
     o.connection = options_.connection;
@@ -331,9 +333,9 @@ Result<RUdpServer*> NetModule::AddRUdpServer(const RUdpEndpoint& endpoint, IMain
     return AddRUdpServer(endpoint, handler, std::move(o));
 }
 
-Result<RUdpServer*> NetModule::AddRUdpServer(const RUdpEndpoint& endpoint,
-                                             IMainLoopHandler& handler,
-                                             RUdpServerOptions options)
+std::expected<RUdpServer*, Error> NetModule::AddRUdpServer(const RUdpEndpoint& endpoint,
+                                                           IMainLoopHandler& handler,
+                                                           RUdpServerOptions options)
 {
     if (auto r = CheckPhase("AddRUdpServer"); !r)
         return std::unexpected(r.error());
@@ -347,7 +349,7 @@ Result<RUdpServer*> NetModule::AddRUdpServer(const RUdpEndpoint& endpoint,
     return raw;
 }
 
-Result<RUdpClient*> NetModule::AddRUdpClient(const RUdpEndpoint& server, IMainLoopHandler& handler)
+std::expected<RUdpClient*, Error> NetModule::AddRUdpClient(const RUdpEndpoint& server, IMainLoopHandler& handler)
 {
     RUdpClientOptions o;
     o.connection = options_.connection;
@@ -355,9 +357,9 @@ Result<RUdpClient*> NetModule::AddRUdpClient(const RUdpEndpoint& server, IMainLo
     return AddRUdpClient(server, handler, std::move(o));
 }
 
-Result<RUdpClient*> NetModule::AddRUdpClient(const RUdpEndpoint& server,
-                                             IMainLoopHandler& handler,
-                                             RUdpClientOptions options)
+std::expected<RUdpClient*, Error> NetModule::AddRUdpClient(const RUdpEndpoint& server,
+                                                           IMainLoopHandler& handler,
+                                                           RUdpClientOptions options)
 {
     if (auto r = CheckPhase("AddRUdpClient"); !r)
         return std::unexpected(r.error());
@@ -384,7 +386,7 @@ void NetModule::Rollback()
     phase_ = Phase::ShutDown;
 }
 
-Result<> NetModule::Start()
+std::expected<void, Error> NetModule::Start()
 {
     if (phase_ != Phase::Inited)
         return Fail(Errc::Phase, "net: Start 之前必须先 Init");

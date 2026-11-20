@@ -135,7 +135,7 @@ public:
     std::string_view Name() const override { return "biz"; }
     std::vector<std::string_view> DependsOn() const override { return {"net"}; }
 
-    Result<> Init() override
+    std::expected<void, Error> Init() override
     {
         net_ = app().GetModule<NetModule>("net");
         auto s = options_ ? net_->AddServer(listen_, biz_, factory_, std::move(*options_))
@@ -145,7 +145,7 @@ public:
         server_ = *s;
         return {};
     }
-    Result<> Start() override
+    std::expected<void, Error> Start() override
     {
         bound_ = server_->endpoint();
         ready_.store(true, std::memory_order_release);
@@ -190,7 +190,7 @@ public:
     }
     std::string_view Name() const override { return "cli"; }
     std::vector<std::string_view> DependsOn() const override { return {"net"}; }
-    Result<> Init() override
+    std::expected<void, Error> Init() override
     {
         auto* net = app().GetModule<NetModule>("net");
         auto c = options_ ? net->AddClient(target_, biz_, f_, std::move(options_->first), options_->second)
@@ -200,7 +200,7 @@ public:
         out_ = *c;
         return {};
     }
-    Result<> Start() override { return {}; }
+    std::expected<void, Error> Start() override { return {}; }
 
 private:
     Biz& biz_;
@@ -222,7 +222,7 @@ public:
     }
     std::string_view Name() const override { return "rudp-server"; }
     std::vector<std::string_view> DependsOn() const override { return {"net"}; }
-    Result<> Init() override
+    std::expected<void, Error> Init() override
     {
         auto* net = app().GetModule<NetModule>("net");
         auto s = options_ ? net->AddRUdpServer(RUdpLoopback(), biz_, std::move(*options_))
@@ -232,7 +232,7 @@ public:
         server_ = *s;
         return {};
     }
-    Result<> Start() override
+    std::expected<void, Error> Start() override
     {
         bound_ = server_->endpoint();
         ready_.store(true, std::memory_order_release);
@@ -269,7 +269,7 @@ public:
     }
     std::string_view Name() const override { return "rudp-client"; }
     std::vector<std::string_view> DependsOn() const override { return {"net"}; }
-    Result<> Init() override
+    std::expected<void, Error> Init() override
     {
         auto* net = app().GetModule<NetModule>("net");
         auto c = options_ ? net->AddRUdpClient(server_, biz_, std::move(*options_)) : net->AddRUdpClient(server_, biz_);
@@ -278,7 +278,7 @@ public:
         out_.store(*c, std::memory_order_release);
         return {};
     }
-    Result<> Start() override { return {}; }
+    std::expected<void, Error> Start() override { return {}; }
 
 private:
     Biz& biz_;
@@ -319,7 +319,7 @@ struct Runner
 
     std::stop_source stop;
     std::atomic<std::thread::id> tid{};
-    Result<> result;
+    std::expected<void, Error> result;
     std::atomic<bool> done{false};
     std::thread thread;
 };

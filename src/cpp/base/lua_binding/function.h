@@ -35,7 +35,7 @@ public:
         return CallRef<R>(L, ref_, std::forward<Args>(args)...);
     }
 
-    // 热路径：不挂 traceback。错误仍然由 pcall 捕获并返回 Result。
+    // 热路径：不挂 traceback。错误仍然由 pcall 捕获并返回 std::expected。
     template <class R, class... Args>
     std::expected<R, Error> CallNoTraceback(Args&&... args) const {
         lua_State* L = State();

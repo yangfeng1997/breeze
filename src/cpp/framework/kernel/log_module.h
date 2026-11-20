@@ -32,8 +32,8 @@ public:
     ~LogModule() override;
 
     std::string_view Name() const override { return "log"; }
-    Result<> Init() override;
-    Result<> Start() override { return {}; }
+    std::expected<void, Error> Init() override;
+    std::expected<void, Error> Start() override { return {}; }
 
 private:
     LoggerConfig cfg_;

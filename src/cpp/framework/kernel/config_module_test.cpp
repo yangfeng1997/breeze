@@ -63,7 +63,7 @@ ModuleFactory MakeConfig(std::string path)
 }
 
 // 起一个只含 ConfigModule 的 App 并 Init；返回 Init 的结果，模块指针经 out 给出。
-Result<> InitWith(App& app, const fs::path& file)
+std::expected<void, Error> InitWith(App& app, const fs::path& file)
 {
     app.RegisterModule(MakeConfig(file.string()));
     if (auto b = app.Build(); !b)

@@ -76,14 +76,14 @@ public:
     // 多个生产者同时叫只产生一个 token，调用方无法也不需要判断自己是不是"有效"的那次。
     void Notify() noexcept;
 
-    Result<> Build();
-    Result<> Init();
-    Result<> Start();
+    std::expected<void, Error> Build();
+    std::expected<void, Error> Init();
+    std::expected<void, Error> Start();
 
     // Build → Init → Start → 主循环。返回错误只表示启动阶段失败，框架不做任何收尾。
     // 主循环跑在**调用方线程**上，不另起线程：返回后 Tick/Wake 与调用方的收尾在时间上
     // 不可能重叠，mu_ 的用法才不用改。
-    Result<> Run(std::stop_token st);
+    std::expected<void, Error> Run(std::stop_token st);
 
 private:
     // Build 阶段筛出的能力子集：裸指针由 modules_ 拥有，Build 之后冻结。

@@ -5,7 +5,7 @@
 namespace breeze
 {
 
-Result<> LogModule::Init()
+std::expected<void, Error> LogModule::Init()
 {
     std::string err;
     logger_ = Logger::Create(cfg_, err);

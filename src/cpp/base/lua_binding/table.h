@@ -100,7 +100,7 @@ struct LuaTableView {
     int index = 0;
 
     // 热路径：key 是字面量时用 lua_getfield，避免每次 push 一个 Lua 字符串；
-    // 返回 bool 而不是 Result，不构造错误消息。
+    // 返回 bool 而不是 std::expected，不构造错误消息。
     template <class T>
     bool TryGetField(const char* key, T& value) const {
         const int abs = lua_absindex(L, index);

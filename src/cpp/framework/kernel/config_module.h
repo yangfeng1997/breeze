@@ -38,8 +38,8 @@ public:
     }
 
     std::string_view Name() const override { return "config"; }
-    Result<> Init() override;
-    Result<> Start() override { return {}; }
+    std::expected<void, Error> Init() override;
+    std::expected<void, Error> Start() override { return {}; }
 
     // 整份 yaml（已展开 ${ENV:}）。业务可以 Get<T>("某段") 读 common.yaml 里自己关心的段。
     Config& Raw() { return *cfg_; }

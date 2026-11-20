@@ -465,7 +465,7 @@ class MainLoopServer final : public EchoServer
         }
         std::string_view Name() const override { return "biz"; }
         std::vector<std::string_view> DependsOn() const override { return {"net"}; }
-        Result<> Init() override
+        std::expected<void, Error> Init() override
         {
             auto* net = app().GetModule<NetModule>("net");
             if (rudp_)
@@ -488,7 +488,7 @@ class MainLoopServer final : public EchoServer
             server_ = *s;
             return {};
         }
-        Result<> Start() override
+        std::expected<void, Error> Start() override
         {
             ready_.set_value(server_->endpoint());
             return {};
@@ -580,7 +580,7 @@ private:
     std::unique_ptr<App> app_;
     NetModule* net_ = nullptr;
     std::stop_source stop_;
-    Result<> result_;
+    std::expected<void, Error> result_;
     std::thread thread_;
     pthread_t io_thread_{};
 };
