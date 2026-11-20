@@ -352,11 +352,15 @@ def make_scratch_dir(protoc: str) -> Path:
     """
     base = None
     if _is_win_exe_on_unix(protoc):  # WSL：用 Windows 的 %TEMP%，protoc.exe 才看得见
-        r = subprocess.run(["cmd.exe", "/c", "echo %TEMP%"], capture_output=True, text=True)
+        # cmd.exe 按系统代码页输出（中文 Windows 上是 GBK），不能按 UTF-8 严格解码；报错信息也一样。
+        r = subprocess.run(["cmd.exe", "/c", "echo %TEMP%"], capture_output=True)
         if r.returncode == 0:
-            u = subprocess.run(["wslpath", "-u", r.stdout.strip()], capture_output=True, text=True)
-            if u.returncode == 0 and Path(u.stdout.strip()).is_dir():
-                base = u.stdout.strip()
+            temp = r.stdout.decode("utf-8", "replace").strip()
+            u = subprocess.run(["wslpath", "-u", temp], capture_output=True)
+            if u.returncode == 0:
+                cand = u.stdout.decode("utf-8", "replace").strip()
+                if Path(cand).is_dir():
+                    base = cand
     return Path(tempfile.mkdtemp(prefix="configgen_", dir=base))
 
 

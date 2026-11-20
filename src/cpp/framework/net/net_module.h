@@ -41,9 +41,11 @@
 #include "base/net/tcp/tcp_server.h"
 #include "base/net/uds/uds_client.h"
 #include "base/net/uds/uds_server.h"
+#include "base/net/ws/ws_options.h"
 #include "framework/app/module.h"
 #include "framework/net/main_loop_executor.h"
 #include "framework/net/main_loop_handler_interface.h"
+#include "framework/net/net_module_tls.h"
 #include "gen/config/net_config.h"
 
 namespace breeze
@@ -69,6 +71,15 @@ struct NetModuleOptions
     AgentLinkOptions agent;
     std::size_t wake_budget = 1024;
     std::chrono::milliseconds shutdown_deadline{5000};
+
+    // ---- tls:// / wss:// ----
+    // 证书路径来自 net.tls（也可在代码里直接给）。Init 时按它建一次上下文：cert_chain_file 非空建服务端上下文，
+    // server_name 非空建客户端上下文；建失败 Init 就失败。端点用了 TLS 却没有对应上下文，AddServer / AddClient 就报错。
+    TlsSetup tls;
+    // ---- ws:// / wss:// ----
+    // 帧选项；端点的路径（"ws://host:port/game" 里的 /game）覆盖 ws_server.path / ws_client.path。
+    WsServerOptions ws_server;
+    WsClientOptions ws_client;
 };
 
 // 校验 net.proto 的取值范围由配置库负责；这里只做字段搬运与单位换算。
@@ -89,14 +100,20 @@ public:
     // = executor.Drain(wake_budget)：true 表示仍有积压，App 会补一个唤醒再转一轮。
     bool Wake() override;
 
-    // 装配：Init 之后、Start 之前（通常在依赖 net 的模块的 Init 里）。endpoint 是 tcp://ip:port | unix:///path |
-    // unix-abstract://name | udp://ip:port（配置里直接写字符串）；不合法返回错误并带上原字符串。
+    // 装配：Init 之后、Start 之前（通常在依赖 net 的模块的 Init 里）。endpoint 是 tcp://ip:port | tls://ip:port |
+    // ws://ip:port[/path] | wss://ip:port[/path] | unix:///path | unix-abstract://name | udp://ip:port（配置里直接写字符串）；
+    // 不合法返回错误并带上原字符串。**ws:// / wss:// 自带分帧**，用不带 codec 工厂的重载；给它工厂是错误（不静默忽略）。
     // 返回的指针在模块存活期内有效。
     // 之后经 INetClient::Send / ConnectionHandle 发送；handler 与 factory 要比 Shutdown 活得久。
     // udp:// 的 AddServer 装配的是 rudp 服务端（用模块的 connection 与 rudp 默认选项；显式选项里只有 connection 与
     // accept_filter 对它有意义），factory 对它被忽略：rudp 的消息自带边界，没有 codec。要签发票据就要拿到 RUdpServer，
     // 用 AddRUdpServer（或对返回的 INetServer* 做 dynamic_cast）。
     // AddClient 不收 udp://：rudp 客户端要凭票据握手，用 AddRUdpClient。
+    // 不带 codec 工厂：只收 ws:// / wss://（WebSocket 自带分帧，选项取 NetModuleOptions::ws_server）。
+    std::expected<INetServer*, Error> AddServer(std::string_view endpoint, IMainLoopHandler& handler);
+    std::expected<INetServer*, Error> AddServer(std::string_view endpoint,
+                                                IMainLoopHandler& handler,
+                                                StreamServerOptions options);
     std::expected<INetServer*, Error> AddServer(std::string_view endpoint,
                                                 IMainLoopHandler& handler,
                                                 const IFrameCodecFactory& factory);
@@ -104,6 +121,14 @@ public:
                                                 IMainLoopHandler& handler,
                                                 const IFrameCodecFactory& factory,
                                                 StreamServerOptions options);
+    // 不带 codec 工厂：只收 ws:// / wss://（选项取 NetModuleOptions::ws_client；Host 头默认用端点里的 authority）。
+    std::expected<INetClient*, Error> AddClient(std::string_view endpoint,
+                                                IMainLoopHandler& handler,
+                                                ReconnectPolicy policy = {});
+    std::expected<INetClient*, Error> AddClient(std::string_view endpoint,
+                                                IMainLoopHandler& handler,
+                                                StreamClientOptions options,
+                                                ReconnectPolicy policy = {});
     std::expected<INetClient*, Error> AddClient(std::string_view endpoint,
                                                 IMainLoopHandler& handler,
                                                 const IFrameCodecFactory& factory);
@@ -198,6 +223,11 @@ private:
     std::vector<std::unique_ptr<INetServer>> servers_;
     std::vector<std::unique_ptr<INetClient>> clients_;
     std::vector<std::unique_ptr<RUdpClient>> rudp_clients_; // 不随模块启动，见 AddRUdpClient
+    // ws:// / wss:// 的 codec 工厂（每加一条端点建一个，与 server / client 活得一样久）。
+    std::vector<std::unique_ptr<IFrameCodecFactory>> codec_factories_;
+    // tls:// / wss:// 用的上下文，Init 时按 NetModuleOptions::tls 建。
+    std::shared_ptr<const IStreamLayerFactory> tls_server_;
+    std::shared_ptr<const IStreamLayerFactory> tls_client_;
 };
 
 } // namespace breeze

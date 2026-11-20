@@ -51,4 +51,52 @@ message NetConfig {
   bool agent_shm_enabled = 15 [(config.default) = "true"];
   // 共享内存每条环（Tx / Rx 各一条）的容量，MB，必须是 2 的幂（Agent 会拒绝别的值）；0 = 用默认的 16。
   uint32 agent_shm_ring_mb = 16 [(config.default) = "0", (config.range) = {min: 0, max: 256}];
+
+  // ---- TLS（tls:// 与 wss:// 端点；设计见 docs/网络库设计.md §4.16）----
+  // 证书 / 私钥 / CA 都是 PEM **文件路径**，内容不进配置；相对路径按进程的工作目录解析。
+  TlsConfig tls = 17;
+  // ---- WebSocket（ws:// 与 wss:// 端点；设计见 docs/网络库设计.md §4.17）----
+  WsConfig ws = 18;
+}
+
+// 协议版本。生成的名字：tls12 / tls13。
+enum TlsVersionConfig {
+  TLS_VERSION_CONFIG_UNSPECIFIED = 0;
+  TLS_VERSION_CONFIG_TLS12 = 1;
+  TLS_VERSION_CONFIG_TLS13 = 2;
+}
+
+message TlsConfig {
+  // 服务端证书链（叶证书在前）与私钥；两个都空 = 不起 TLS 服务端（tls:// / wss:// 监听会报错）。
+  string cert_chain_file = 1;
+  string private_key_file = 2;
+  // 客户端信任的 CA（空 = 系统 CA 目录）；服务端配了它就是 mTLS 的客户端 CA。
+  string ca_file = 3;
+  // 客户端是否校验服务端证书。**只给测试 / 内网自签用**：关了就没有任何中间人防护。
+  bool verify_peer = 4 [(config.default) = "true"];
+  // 配了 ca_file 时：是否要求客户端必须带证书。
+  bool require_client_cert = 5 [(config.default) = "false"];
+  // 客户端 SNI 与证书主机名校验用的名字（verify_peer 为真时必填）；空 = 不做 TLS 客户端。
+  string server_name = 6;
+  // 最低协议版本；默认 1.2（1.3 是首选，这个只是下限）。
+  TlsVersionConfig min_version = 7 [(config.default) = "tls12"];
+}
+
+// 数据消息类型。生成的名字：binary / text。
+enum WsMessageTypeConfig {
+  WS_MESSAGE_TYPE_CONFIG_UNSPECIFIED = 0;
+  WS_MESSAGE_TYPE_CONFIG_BINARY = 1;
+  WS_MESSAGE_TYPE_CONFIG_TEXT = 2;
+}
+
+message WsConfig {
+  // 升级请求头的上限，超过回 431。
+  uint32 max_header_bytes = 1 [(config.default) = "8192", (config.range) = {min: 256, max: 1048576}];
+  // 单条消息（分片重组后）的上限，同时是读缓冲的上界。
+  uint32 max_message_bytes = 2 [(config.default) = "65536", (config.range) = {min: 1024, max: 1073741824}];
+  WsMessageTypeConfig message_type = 3 [(config.default) = "binary"];
+  // 仅 Text：校验 UTF-8（规范要求）。
+  bool validate_utf8 = 4 [(config.default) = "true"];
+  // 允许的 Origin，精确匹配；空 = 不检查（缺失 Origin 视为非浏览器客户端，一律放行）。
+  repeated string allowed_origins = 5;
 }

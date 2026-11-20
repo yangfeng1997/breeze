@@ -27,6 +27,9 @@
 #include "base/net/codec/length_prefix_codec.h"
 #include "base/net/testing/net_test_util.h"
 #include "base/net/testing/rudp_test_util.h"
+#if defined(BREEZE_TEST_TLS)
+#include "base/net/testing/tls_test_util.h"
+#endif
 #include "framework/app/app.h"
 #include "framework/kernel/config_module.h"
 
@@ -208,6 +211,71 @@ private:
     std::string target_;
     INetClient*& out_;
     std::optional<Explicit> options_;
+};
+
+// 不带 codec 工厂的 ws 服务端模块（端点 ws:// / wss://，帧格式由模块内置）。
+class WsServerModule final : public Module
+{
+public:
+    WsServerModule(App& a, Biz& biz, std::string listen)
+        : Module(a)
+        , biz_(biz)
+        , listen_(std::move(listen))
+    {
+    }
+    std::string_view Name() const override { return "ws-server"; }
+    std::vector<std::string_view> DependsOn() const override { return {"net"}; }
+    std::expected<void, Error> Init() override
+    {
+        auto* net = app().GetModule<NetModule>("net");
+        auto s = net->AddServer(listen_, biz_); // 不给工厂
+        if (!s)
+            return std::unexpected(s.error());
+        server_ = *s;
+        return {};
+    }
+    std::expected<void, Error> Start() override
+    {
+        bound_ = server_->endpoint();
+        ready_.store(true, std::memory_order_release);
+        return {};
+    }
+    bool ready() const { return ready_.load(std::memory_order_acquire); }
+    const Endpoint& bound() const { return bound_; }
+
+private:
+    Biz& biz_;
+    std::string listen_;
+    INetServer* server_ = nullptr;
+    Endpoint bound_ = *Endpoint::Tcp("127.0.0.1", 1);
+    std::atomic<bool> ready_{false};
+};
+
+// 不带 codec 工厂的 ws 客户端模块。
+class WsClientModule final : public Module
+{
+public:
+    WsClientModule(App& a, Biz& biz, std::string target)
+        : Module(a)
+        , biz_(biz)
+        , target_(std::move(target))
+    {
+    }
+    std::string_view Name() const override { return "ws-client"; }
+    std::vector<std::string_view> DependsOn() const override { return {"net"}; }
+    std::expected<void, Error> Init() override
+    {
+        auto* net = app().GetModule<NetModule>("net");
+        auto c = net->AddClient(target_, biz_); // 不给工厂
+        if (!c)
+            return std::unexpected(c.error());
+        return {};
+    }
+    std::expected<void, Error> Start() override { return {}; }
+
+private:
+    Biz& biz_;
+    std::string target_;
 };
 
 // 依赖 net 的 rudp 服务端业务模块：Init 里 AddRUdpServer，Start 时发布实际绑定的端点。
@@ -923,10 +991,131 @@ void TestAssemblyErrors()
         const auto c = net->AddClient("udp://127.0.0.1:9", biz, factory);
         CHECK(!c && c.error().code == Errc::Module && Has(c.error().msg, "udp") && Has(c.error().msg, "AddRUdpClient"));
     }
+    // ws:// / wss:// 自带分帧：带了工厂是错误；不带工厂时只认它们
+    {
+        const auto ws_with_factory = net->AddServer("ws://127.0.0.1:0", biz, factory);
+        CHECK(!ws_with_factory && ws_with_factory.error().code == Errc::Module && Has(ws_with_factory.error().msg, "自带分帧"));
+        const auto tcp_no_factory = net->AddServer("tcp://127.0.0.1:0", biz);
+        CHECK(!tcp_no_factory && tcp_no_factory.error().code == Errc::Module && Has(tcp_no_factory.error().msg, "codec 工厂"));
+        CHECK(net->AddServer("ws://127.0.0.1:0", biz)); // ws 可以不给工厂
+
+        const auto client_ws_factory = net->AddClient("ws://127.0.0.1:9", biz, factory);
+        CHECK(!client_ws_factory && Has(client_ws_factory.error().msg, "自带分帧"));
+        const auto client_tcp_none = net->AddClient("tcp://127.0.0.1:9", biz);
+        CHECK(!client_tcp_none && Has(client_tcp_none.error().msg, "codec 工厂"));
+        CHECK(net->AddClient("ws://127.0.0.1:9", biz));
+
+        // 没有 TLS 上下文时 tls:// / wss:// 在装配阶段就报错（不退化成明文）
+        const auto tls_no_ctx = net->AddServer("tls://127.0.0.1:0", biz, factory);
+        CHECK(!tls_no_ctx && Has(tls_no_ctx.error().msg, "TLS"));
+        const auto wss_no_ctx = net->AddServer("wss://127.0.0.1:0", biz);
+        CHECK(!wss_no_ctx && Has(wss_no_ctx.error().msg, "TLS"));
+        const auto wss_client = net->AddClient("wss://127.0.0.1:9", biz);
+        CHECK(!wss_client && Has(wss_client.error().msg, "TLS"));
+
+        // 路径里的查询串 / 片段不参与路由：直接拒绝
+        const auto query = net->AddServer("ws://127.0.0.1:0/a?b=1", biz);
+        CHECK(!query && Has(query.error().msg, "路径"));
+    }
     // 合法的可以装
     CHECK(net->AddServer("tcp://127.0.0.1:0", biz, factory));
     CHECK(net->AddClient("unix:///tmp/breeze-net-module-test.sock", biz, factory));
 }
+
+// ws:// 端到端（经模块装配、不加工厂）：路径由端点给出；路径不符的客户端握手上失败、一直重试。
+void TestWsThroughModule()
+{
+    const LeakCheck leak;
+    Biz sbiz;
+    App srv("net-ws-server");
+    srv.RegisterModule([](App& a) { return std::make_unique<NetModule>(a, SmallOptions()); });
+    WsServerModule* sm = nullptr;
+    srv.RegisterModule(
+        [&](App& a)
+        {
+            auto m = std::make_unique<WsServerModule>(a, sbiz, "ws://127.0.0.1:0/game");
+            sm = m.get();
+            return m;
+        });
+    Runner srun(srv);
+    CHECK(WaitUntil([&] { return sm != nullptr && sm->ready(); }));
+
+    Biz cbiz;
+    App cli("net-ws-client");
+    cli.RegisterModule([](App& a) { return std::make_unique<NetModule>(a, SmallOptions()); });
+    cli.RegisterModule(
+        [&](App& a) { return std::make_unique<WsClientModule>(a, cbiz, "ws://127.0.0.1:" + std::to_string(sm->bound().port()) + "/game"); });
+    Runner crun(cli);
+    CHECK(WaitUntil([&] { return cbiz.connected() == 1 && sbiz.connected() == 1; }));
+
+    CHECK(cbiz.first_connected().Send(Buf("ping-over-ws")) == SendResult::Ok);
+    CHECK(WaitUntil([&] { return cbiz.messages() == 1; }));
+    CHECK(cbiz.payloads()[0] == "ping-over-ws"); // 服务端回显
+
+    // 路径不符：服务端回 404，客户端握手失败、持续重试，业务看不到连接
+    Biz wrong;
+    App bad("net-ws-wrong-path");
+    bad.RegisterModule([](App& a) { return std::make_unique<NetModule>(a, SmallOptions()); });
+    bad.RegisterModule(
+        [&](App& a) { return std::make_unique<WsClientModule>(a, wrong, "ws://127.0.0.1:" + std::to_string(sm->bound().port()) + "/other"); });
+    Runner brun(bad);
+    std::this_thread::sleep_for(300ms);
+    CHECK(wrong.connected() == 0 && wrong.messages() == 0);
+}
+
+// wss:// 端到端：同一套模块装配，服务端按 net.tls 的证书建 TLS 上下文，客户端按 CA + server_name 校验。
+// 只在构建里有 TLS 时编（CMake 给 BREEZE_TEST_TLS）。
+#if defined(BREEZE_TEST_TLS)
+void TestWssThroughModule()
+{
+    const LeakCheck leak;
+    if (!NetModuleHasTls())
+        return; // 理论上不会：BREEZE_TEST_TLS 只在 BREEZE_BUILD_NET_TLS 时定义
+    const TestPki pki;
+    const TempDir dir;
+    const auto write = [&](const std::string& name, const std::string& text)
+    {
+        std::FILE* f = std::fopen((dir.path() + "/" + name).c_str(), "wb");
+        CHECK(f != nullptr);
+        CHECK(std::fwrite(text.data(), 1, text.size(), f) == text.size());
+        std::fclose(f);
+    };
+    write("ca.pem", pki.ca.cert_pem);
+    write("server.pem", pki.server.cert_pem);
+    write("server.key", pki.server.key_pem);
+
+    Biz sbiz;
+    auto sopts = SmallOptions();
+    sopts.tls.cert_chain_file = dir.path() + "/server.pem";
+    sopts.tls.private_key_file = dir.path() + "/server.key";
+    App srv("net-wss-server");
+    srv.RegisterModule([&](App& a) { return std::make_unique<NetModule>(a, sopts); });
+    WsServerModule* sm = nullptr;
+    srv.RegisterModule(
+        [&](App& a)
+        {
+            auto m = std::make_unique<WsServerModule>(a, sbiz, "wss://127.0.0.1:0/game");
+            sm = m.get();
+            return m;
+        });
+    Runner srun(srv);
+    CHECK(WaitUntil([&] { return sm != nullptr && sm->ready(); }));
+
+    Biz cbiz;
+    auto copts = SmallOptions();
+    copts.tls.ca_file = dir.path() + "/ca.pem";
+    copts.tls.server_name = "server.test";
+    App cli("net-wss-client");
+    cli.RegisterModule([&](App& a) { return std::make_unique<NetModule>(a, copts); });
+    cli.RegisterModule(
+        [&](App& a) { return std::make_unique<WsClientModule>(a, cbiz, "wss://127.0.0.1:" + std::to_string(sm->bound().port()) + "/game"); });
+    Runner crun(cli);
+    CHECK(WaitUntil([&] { return cbiz.connected() == 1 && sbiz.connected() == 1; }));
+    CHECK(cbiz.first_connected().Send(Buf("ping-over-wss")) == SendResult::Ok);
+    CHECK(WaitUntil([&] { return cbiz.messages() == 1; }));
+    CHECK(cbiz.payloads()[0] == "ping-over-wss");
+}
+#endif
 
 // ---- 配置 ----
 
@@ -1174,6 +1363,10 @@ int main()
     TestShutdownKeepsDrainingWhileWaiting();
     TestStartFailureRollsBackAndReportsEndpoint();
     TestAssemblyErrors();
+    TestWsThroughModule();
+#if defined(BREEZE_TEST_TLS)
+    TestWssThroughModule();
+#endif
     TestRUdpThroughModule();
     TestRUdpModuleDefaultsReachServer();
     TestUdpAddServerStringPassesFilter();

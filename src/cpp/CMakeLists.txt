@@ -164,10 +164,14 @@ function(breeze_proto_descriptor target)
   if(NOT proto_dir)
     set(proto_dir ${CMAKE_SOURCE_DIR}/../../proto)
   endif()
+  # 调用方给的是相对路径（`set(BREEZE_LUA_PB_DIR base/lua_pb)`）：file(RELATIVE_PATH) 要求绝对路径，
+  # 以前没有 protoc 时这里被跳过，所以直到机器上装了 protoc 才暴露。
+  get_filename_component(proto_dir "${proto_dir}" ABSOLUTE)
   set(out_dir ${A_OUT_DIR})
   if(NOT out_dir)
     set(out_dir ${CMAKE_SOURCE_DIR}/../../run/proto)
   endif()
+  get_filename_component(out_dir "${out_dir}" ABSOLUTE)
   set(out_name ${A_NAME})
   if(NOT out_name)
     set(out_name descriptor.pb)
@@ -207,7 +211,8 @@ function(breeze_proto_descriptor target)
   file(RELATIVE_PATH rel_out ${proto_dir} ${out_file})
   set(inc_args -I .)
   foreach(inc ${A_INCLUDE})
-    file(RELATIVE_PATH rel_inc ${proto_dir} ${inc})
+    get_filename_component(inc_abs "${inc}" ABSOLUTE)
+    file(RELATIVE_PATH rel_inc ${proto_dir} ${inc_abs})
     list(APPEND inc_args -I ${rel_inc})
   endforeach()
   set(rel_srcs)
@@ -619,9 +624,20 @@ breeze_apply_log_level(breeze_kernel)
 # framework/net：把 base/net 的连接事件回投 App 主循环（MainLoopExecutor）并装配成模块（NetModule）。
 # net.proto 生成的头文件经 breeze_config_schemas 传递。网络库只支持 Linux。
 if(BREEZE_BUILD_NET)
-  add_library(breeze_net_module ${NET_MODULE_DIR}/main_loop_executor.cpp ${NET_MODULE_DIR}/net_module.cpp)
+  # tls:// / wss:// 的上下文经**链接期选择**：ON 时链真正调 breeze_net_tls 的那份，OFF 时链桩（明确报错、不退化成明文）。
+  # breeze_net_module 自己不含任何 TLS 类型（见 framework/net/net_module_tls.h）。
+  if(BREEZE_BUILD_NET_TLS)
+    set(NET_MODULE_TLS_SRC ${NET_MODULE_DIR}/net_module_tls.cpp)
+  else()
+    set(NET_MODULE_TLS_SRC ${NET_MODULE_DIR}/net_module_tls_stub.cpp)
+  endif()
+  add_library(breeze_net_module ${NET_MODULE_DIR}/main_loop_executor.cpp ${NET_MODULE_DIR}/net_module.cpp ${NET_MODULE_TLS_SRC})
   target_link_libraries(breeze_net_module PUBLIC breeze_net breeze_net_rudp breeze_net_agent breeze_kernel breeze_queue
                         breeze_config_schemas)
+  if(BREEZE_BUILD_NET_TLS)
+    # PUBLIC：net_module 的测试与使用方经它间接用到 TlsContext 的符号（静态库不传递链接就需要每个使用方自己链）。
+    target_link_libraries(breeze_net_module PUBLIC breeze_net_tls)
+  endif()
   target_compile_options(breeze_net_module PRIVATE -Wall -Wextra)
   breeze_apply_log_level(breeze_net_module)
 endif()
@@ -980,6 +996,11 @@ if(BREEZE_BUILD_NET)
 
   breeze_net_module_test(main_loop_executor_test)
   breeze_net_module_test(net_module_test)
+  # wss:// 的端到端用例要用 BoringSSL 现造证书（testing/tls_test_util.h）。
+  if(BREEZE_BUILD_NET_TLS)
+    target_link_libraries(net_module_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_definitions(net_module_test PRIVATE BREEZE_TEST_TLS=1)
+  endif()
   breeze_net_module_test(net_module_agent_test)
   # NetModule(app) 的用例读仓库里真实的 config/common.yaml（net 段）
   target_compile_definitions(net_module_test PRIVATE BREEZE_CONFIG_DIR="${CONFIG_SCHEMA_ROOT}/..")

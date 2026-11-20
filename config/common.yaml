@@ -50,3 +50,17 @@ net:
   agent_endpoint: unix:///run/breeze/agent.sock
   agent_shm_enabled: true
   agent_shm_ring_mb: 0
+  tls:
+    cert_chain_file: ""
+    private_key_file: ""
+    ca_file: ""
+    verify_peer: true
+    require_client_cert: false
+    server_name: ""
+    min_version: tls12
+  ws:
+    max_header_bytes: 8192
+    max_message_bytes: 65536
+    message_type: binary
+    validate_utf8: true
+    allowed_origins: []

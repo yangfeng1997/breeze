@@ -6,6 +6,12 @@
 
 #pragma once
 
+#include <poll.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+
 #include <openssl/bio.h>
 #include <openssl/bn.h>
 #include <openssl/ec_key.h>
@@ -19,6 +25,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
+#include <mutex>
+#include <thread>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -222,6 +231,106 @@ inline std::shared_ptr<const TlsContext> MustClient(const TlsClientOptions& o)
     CHECK(c != nullptr);
     return c;
 }
+
+// 一个一次性的 TCP 中继：接一条连接、转发到目标，把两个方向的字节都抓下来（证明线上没有明文时用）。
+class Relay
+{
+public:
+    explicit Relay(const Endpoint& target)
+        : target_(target)
+    {
+        listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        CHECK(listen_fd_ >= 0);
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        CHECK(::bind(listen_fd_, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0);
+        CHECK(::listen(listen_fd_, 4) == 0);
+        socklen_t len = sizeof(a);
+        CHECK(::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&a), &len) == 0);
+        port_ = ntohs(a.sin_port);
+        thread_ = std::thread([this] { Run(); });
+    }
+    ~Relay()
+    {
+        stop_.store(true);
+        thread_.join();
+        ::close(listen_fd_);
+    }
+    Endpoint endpoint() const { return *Endpoint::Tcp("127.0.0.1", port_); }
+    std::string captured() const
+    {
+        const std::lock_guard lk(mu_);
+        return captured_;
+    }
+
+private:
+    void Run()
+    {
+        pollfd lp{listen_fd_, POLLIN, 0};
+        int a = -1;
+        while (!stop_.load() && a < 0)
+            if (::poll(&lp, 1, 50) > 0)
+                a = ::accept(listen_fd_, nullptr, nullptr);
+        if (a < 0)
+            return;
+        const int b = ::socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in t{};
+        t.sin_family = AF_INET;
+        t.sin_port = htons(target_.port());
+        ::inet_pton(AF_INET, target_.address().c_str(), &t.sin_addr);
+        CHECK(::connect(b, reinterpret_cast<sockaddr*>(&t), sizeof(t)) == 0);
+        char buf[64 * 1024];
+        while (!stop_.load())
+        {
+            pollfd fds[2] = {{a, POLLIN, 0}, {b, POLLIN, 0}};
+            if (::poll(fds, 2, 50) <= 0)
+                continue;
+            bool eof = false;
+            for (int i = 0; i < 2; ++i)
+            {
+                if (!(fds[i].revents & (POLLIN | POLLHUP)))
+                    continue;
+                const ssize_t n = ::recv(fds[i].fd, buf, sizeof(buf), 0);
+                if (n <= 0)
+                {
+                    eof = true;
+                    continue;
+                }
+                {
+                    const std::lock_guard lk(mu_);
+                    captured_.append(buf, static_cast<std::size_t>(n));
+                }
+                const int other = i == 0 ? b : a;
+                std::size_t off = 0;
+                while (off < static_cast<std::size_t>(n))
+                {
+                    const ssize_t w = ::send(other, buf + off, static_cast<std::size_t>(n) - off, MSG_NOSIGNAL);
+                    if (w <= 0)
+                    {
+                        eof = true;
+                        break;
+                    }
+                    off += static_cast<std::size_t>(w);
+                }
+            }
+            if (eof)
+                break;
+        }
+        ::close(a);
+        ::close(b);
+    }
+
+    Endpoint target_;
+    int listen_fd_ = -1;
+    std::uint16_t port_ = 0;
+    std::atomic<bool> stop_{false};
+    mutable std::mutex mu_;
+    std::string captured_;
+    std::thread thread_;
+};
+
+
 
 // ---- 两个层在内存里互相喂 ----
 
