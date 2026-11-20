@@ -48,6 +48,9 @@
 //                                       连接数 × R 决定、与服务端快慢无关，延迟与服务端 CPU 才有意义
 //                                       （闭环全速时延迟只是排队）
 //                 [--mem-probe N]       不压测，只测建 N 条空闲连接的内存与空闲 CPU
+//                 [--storm N]           重连风暴：N 个客户端线程不停 connect → RST 断开，量每次 accept 的服务端 CPU 与
+//                                       跨 loop 投递闭包的分配占比（--io-threads 是服务端 loop 数，默认 4）
+//                 [--fanout K]          breeze-mainloop：主循环对同一连接连续 Send K 条回复（量批内合并）
 
 #include <poll.h>
 #include <sched.h>
@@ -75,6 +78,7 @@
 
 #include "base/net/codec/length_prefix_codec.h"
 #include "base/net/connection/connection_interface.h"
+#include "base/net/endpoint/peer_info.h"
 #include "base/net/loop/event_loop_group.h"
 #include "base/net/loop/event_loop_thread.h"
 #include "base/net/loop/group_access.h"
@@ -134,6 +138,8 @@ void PinTo(int cpu)
 // breeze-mainloop 的扇出：主循环对**同一条连接**连续 Send 这么多条回复（客户端等齐 K 条才算一次往返）。
 // 1 = 普通回显。用来量"批内连续 Send"的合并收益（跨线程 Send 各自一次 sendmsg，还是批末合成一次）。
 int g_fanout = 1;
+int g_storm_threads = 0; // > 0：重连风暴模式（--storm N：N 个客户端线程不停 connect → RST 断开），见 Storm()
+int g_io_threads = 4;    // 重连风暴里服务端的 loop 数
 
 struct BenchOptions
 {
@@ -1906,6 +1912,129 @@ int MemProbe(const BenchOptions& o, const Endpoint& ep, EchoServer& server, bool
     return 0;
 }
 
+
+// ---- 重连风暴（--storm N）----
+//
+// 量"跨 loop accept"这条路径占的比例：服务端是 production 的 StreamServer（g_io_threads 个 loop，accept 在 loop 0，
+// 连接按"最少的 loop"分给各 loop，非本 loop 的经 EventLoop::Post 投递一个带 UniqueFd + PeerInfo 的闭包）；
+// N 个客户端线程不停 connect → 立刻以 RST 断开（SO_LINGER 0，不留 TIME_WAIT，本机临时端口只有 4096 个）。
+// 输出每次 accept 服务端所有 IO 线程合计的 CPU 微秒，以及同一个闭包（同样的捕获、同样的 move_only_function 与
+// make_unique）单独的 构造 + 销毁 成本——后者除以前者就是这条投递路径里"分配"占 accept 的比例。
+double ClosureAllocNs()
+{
+    struct Captures
+    {
+        void* self;
+        void* target;
+        UniqueFd fd;
+        PeerInfo info;
+    };
+    constexpr int kIters = 2'000'000;
+    const auto t0 = BenchClock::now();
+    std::uint64_t sink = 0;
+    for (int i = 0; i < kIters; ++i)
+    {
+        Captures c{&sink, &sink, UniqueFd{}, PeerInfo{}};
+        // 与 EventLoop::Post 相同：lambda → move_only_function → make_unique<move_only_function>
+        auto task = std::make_unique<std::move_only_function<void()>>(
+            std::move_only_function<void()>([c = std::move(c), &sink]() mutable { sink += reinterpret_cast<std::uintptr_t>(c.self); }));
+        asm volatile("" ::"r"(task.get()) : "memory");
+    }
+    const double ns = std::chrono::duration<double, std::nano>(BenchClock::now() - t0).count() / kIters;
+    if (sink == 42)
+        std::puts("");
+    return ns;
+}
+
+int Storm(const BenchOptions& o)
+{
+    class NullHandler final : public IConnectionHandler
+    {
+    public:
+        void OnMessage(IConnection&, std::span<const std::byte>) noexcept override {}
+    } handler;
+    LengthPrefixCodecFactory factory(1 << 20);
+    EventLoopGroup group({static_cast<std::uint32_t>(g_io_threads), 65536});
+    StreamServerOptions so;
+    so.backlog = 4096;
+    StreamServer server(group, *Endpoint::Tcp("127.0.0.1", 0), std::move(so), handler, factory);
+    REQUIRE(group.Start() == 0);
+    REQUIRE(server.Start() == 0);
+    const std::uint16_t port = server.endpoint().port();
+
+    std::vector<pthread_t> io_threads;
+    for (int i = 0; i < g_io_threads; ++i)
+    {
+        std::promise<pthread_t> ready;
+        GroupAccess::LoopAt(group, static_cast<std::size_t>(i)).Post([&ready] { ready.set_value(::pthread_self()); });
+        io_threads.push_back(ready.get_future().get());
+    }
+
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> clients;
+    for (int t = 0; t < g_storm_threads; ++t)
+    {
+        clients.emplace_back(
+            [&, t]
+            {
+                if (!o.client_cpus.empty())
+                    PinTo(o.client_cpus[static_cast<std::size_t>(t) % o.client_cpus.size()]);
+                const Endpoint ep = *Endpoint::Tcp("127.0.0.1", port);
+                while (!stop.load(std::memory_order_relaxed))
+                {
+                    UniqueFd fd;
+                    if (sock::CreateStreamSocket(ep, fd) != 0)
+                        continue;
+                    const linger lg{1, 0}; // close 发 RST：不进 TIME_WAIT
+                    ::setsockopt(fd.get(), SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+                    int rc;
+                    while ((rc = sock::Connect(fd.get(), ep)) == EAGAIN)
+                        std::this_thread::yield();
+                    if (rc == EINPROGRESS)
+                    {
+                        pollfd p{fd.get(), POLLOUT, 0};
+                        if (::poll(&p, 1, 1000) <= 0)
+                            continue;
+                    }
+                } // fd 析构 = close
+            });
+    }
+
+    const auto cpu_total = [&]
+    {
+        double sum = 0;
+        for (const pthread_t th : io_threads)
+            sum += ThreadCpuSeconds(th);
+        return sum;
+    };
+    std::this_thread::sleep_for(std::chrono::seconds(o.warmup_s));
+    const std::uint64_t acc0 = group.GetStats().accepted;
+    const double cpu0 = cpu_total();
+    const auto t0 = BenchClock::now();
+    std::this_thread::sleep_for(std::chrono::seconds(o.duration_s));
+    const std::uint64_t acc1 = group.GetStats().accepted;
+    const double cpu1 = cpu_total();
+    const double secs = std::chrono::duration<double>(BenchClock::now() - t0).count();
+    stop = true;
+    for (auto& c : clients)
+        c.join();
+    group.Shutdown(std::chrono::milliseconds(0));
+
+    const double accepted = static_cast<double>(acc1 - acc0);
+    const double us_per_accept = accepted > 0 ? (cpu1 - cpu0) * 1e6 / accepted : 0.0;
+    const double alloc_ns = ClosureAllocNs();
+    std::printf(
+        "STORM io_threads=%d client_threads=%d accepted_per_s=%.0f server_cpu_us_per_accept=%.2f closure_alloc_ns=%.0f "
+        "closure_share_pct=%.2f\n",
+        g_io_threads,
+        g_storm_threads,
+        accepted / secs,
+        us_per_accept,
+        alloc_ns,
+        us_per_accept > 0 ? alloc_ns / 1000.0 / us_per_accept * 100.0 : 0.0);
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -1946,6 +2075,10 @@ int main(int argc, char** argv)
             o.active = std::atoi(next().c_str());
         else if (a == "--fanout")
             g_fanout = std::atoi(next().c_str());
+        else if (a == "--storm")
+            g_storm_threads = std::atoi(next().c_str());
+        else if (a == "--io-threads")
+            g_io_threads = std::atoi(next().c_str());
         else if (a == "--mem-probe")
             o.mem_probe = std::atoi(next().c_str());
         else if (a == "--client-cpus")
@@ -2001,6 +2134,8 @@ int main(int argc, char** argv)
         Die("tls / ws / wss 的 --mem-probe 暂不支持：每条服务端 TLS 连接的内存见 tls_layer_test 的 "
             "TestIdleServerLayerMemory（实测约 3171 字节）");
 
+    if (g_storm_threads > 0)
+        return Storm(o);
     if (g_fanout < 1 || g_fanout > 32)
         Die("--fanout 要在 1 到 32 之间");
     if (g_fanout > 1 && (o.impl != "breeze-mainloop" || o.transport == "udp"))
