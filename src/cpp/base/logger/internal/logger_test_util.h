@@ -8,7 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
-#include <format>
+#include <fmt/format.h>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -29,7 +29,7 @@ namespace breeze::testutil
 
 inline std::filesystem::path TempDir(const char* tag)
 {
-    auto p = std::filesystem::temp_directory_path() / std::format("breeze_logger_test_{}_{}", ::getpid(), tag);
+    auto p = std::filesystem::temp_directory_path() / fmt::format("breeze_logger_test_{}_{}", ::getpid(), tag);
     std::filesystem::remove_all(p);
     return p;
 }

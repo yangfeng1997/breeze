@@ -15,7 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <format>
+#include <fmt/format.h>
 #include <limits>
 #include <map>
 #include <random>
@@ -591,7 +591,7 @@ void TestCacheDoesNotAffectComparison()
     const VarType b = "42";
     CHECK(a.As<int>() == 42 && b.As<double>() == 42.0); // 两边缓存不同
     CHECK(a == b && a == "42" && std::hash<VarType>{}(a) == std::hash<VarType>{}(b));
-    CHECK(std::format("{}", a) == "42" && std::format("{}", b) == "42");
+    CHECK(fmt::format("{}", a) == "42" && fmt::format("{}", b) == "42");
     CHECK(a.NumericEqual(b) && b.NumericEqual(a));
     const VarType c = "42.0";
     CHECK(c.As<int>() == 42 && !(a == c) && a.NumericEqual(c));
@@ -825,11 +825,11 @@ void TestContainersDoNotTouchCache()
 
 void TestFormatAndHash()
 {
-    CHECK(std::format("{}", VarType(42)) == "42");
-    CHECK(std::format("{}", VarType("hello")) == "hello");
-    CHECK(std::format("[{:>6}]", VarType(42)) == "[    42]");
-    CHECK(std::format("[{:<6}]", VarType("ab")) == "[ab    ]");
-    CHECK(std::format("{} {}", VarType(1.5), VarType(true)) == "1.5 true");
+    CHECK(fmt::format("{}", VarType(42)) == "42");
+    CHECK(fmt::format("{}", VarType("hello")) == "hello");
+    CHECK(fmt::format("[{:>6}]", VarType(42)) == "[    42]");
+    CHECK(fmt::format("[{:<6}]", VarType("ab")) == "[ab    ]");
+    CHECK(fmt::format("{} {}", VarType(1.5), VarType(true)) == "1.5 true");
 
     std::unordered_map<VarType, int> m;
     m[VarType("a")] = 1;

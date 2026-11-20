@@ -8,7 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
-#include <format>
+#include <fmt/format.h>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -37,7 +37,7 @@ int Eval() { return ++g_evals; }
 
 int main()
 {
-    const auto dir = fs::temp_directory_path() / std::format("breeze_strip_test_{}", ::getpid());
+    const auto dir = fs::temp_directory_path() / fmt::format("breeze_strip_test_{}", ::getpid());
     fs::remove_all(dir);
     LoggerConfig cfg;
     cfg.file.dir = dir.string();

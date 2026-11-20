@@ -7,7 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
-#include <format>
+#include <fmt/format.h>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -35,7 +35,7 @@ const fs::path kRealCommon = fs::path(BREEZE_CONFIG_DIR) / "common.yaml";
 
 fs::path TempDir(const char* tag)
 {
-    auto p = fs::temp_directory_path() / std::format("breeze_cfgmod_test_{}_{}", ::getpid(), tag);
+    auto p = fs::temp_directory_path() / fmt::format("breeze_cfgmod_test_{}_{}", ::getpid(), tag);
     fs::remove_all(p);
     fs::create_directories(p);
     return p;

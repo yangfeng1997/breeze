@@ -19,7 +19,7 @@
 
 #pragma once
 
-#include <format>
+#include <fmt/format.h>
 #include <source_location>
 
 #include "base/logger/logger.h"
@@ -42,7 +42,7 @@
     {                                                                                                                  \
         ::breeze::Logger& breeze_lg_ = ::breeze::detail::Ref(lg);                                                      \
         if (breeze_lg_.ShouldLog(lvl))                                                                                 \
-            breeze_lg_.Log(lvl, ::std::source_location::current(), ::std::format(__VA_ARGS__));                        \
+            breeze_lg_.Log(lvl, ::std::source_location::current(), ::fmt::format(__VA_ARGS__));                        \
     } while (0)
 
 // ---- 内层：指定 logger ----
@@ -77,7 +77,7 @@
 #endif
 
 #define BREEZE_LOG_FATAL(lg, ...)                                                                                      \
-    ::breeze::detail::Ref(lg).Fatal(::std::source_location::current(), ::std::format(__VA_ARGS__))
+    ::breeze::detail::Ref(lg).Fatal(::std::source_location::current(), ::fmt::format(__VA_ARGS__))
 
 // ---- 外层：默认 logger ----
 #define LOG_TRACE(...) BREEZE_LOG_TRACE(::breeze::CurrentLogger(), __VA_ARGS__)

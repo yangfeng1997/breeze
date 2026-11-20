@@ -2,7 +2,7 @@
 
 #include <cerrno>
 #include <cstring>
-#include <format>
+#include <fmt/format.h>
 #include <optional>
 
 #include "base/logger/logger_macros.h"
@@ -79,7 +79,7 @@ Result<> NetModule::Init()
 Result<> NetModule::CheckPhase(std::string_view what) const
 {
     if (phase_ != Phase::Inited)
-        return Fail(Errc::Phase, std::format("net: {} 只能在 Init 之后、Start 之前调用", what));
+        return Fail(Errc::Phase, fmt::format("net: {} 只能在 Init 之后、Start 之前调用", what));
     return {};
 }
 
@@ -104,7 +104,7 @@ Result<INetServer*> NetModule::AddServer(std::string_view endpoint,
     if (!ep)
         return Fail(
             Errc::Module,
-            std::format(
+            fmt::format(
                 "net: 监听端点 '{}' 不合法（tcp://ip:port | udp://ip:port | unix:///path | unix-abstract://name）",
                 endpoint));
     if (const auto udp = RUdpEndpoint::From(*ep))
@@ -121,7 +121,7 @@ Result<INetServer*> NetModule::AddServer(std::string_view endpoint,
     const auto tcp = TcpEndpoint::From(*ep);
     const auto uds = tcp ? std::optional<UdsEndpoint>{} : UdsEndpoint::From(*ep);
     if (!tcp && !uds) // Endpoint 新增了种类而这里没跟上：明确报错，不要去解引用空的 optional
-        return Fail(Errc::Module, std::format("net: 监听端点 '{}' 的传输种类还没有对应的服务端", endpoint));
+        return Fail(Errc::Module, fmt::format("net: 监听端点 '{}' 的传输种类还没有对应的服务端", endpoint));
     return MakeStreamServer(tcp, uds, executor_.Wrap(handler), factory, std::move(options));
 }
 
@@ -174,17 +174,17 @@ Result<INetClient*> NetModule::AddClient(std::string_view endpoint,
     if (!ep)
         return Fail(
             Errc::Module,
-            std::format(
+            fmt::format(
                 "net: 对端端点 '{}' 不合法（tcp://ip:port | udp://ip:port | unix:///path | unix-abstract://name）",
                 endpoint));
     if (RUdpEndpoint::From(*ep))
         return Fail(Errc::Module,
-                    std::format("net: 对端端点 '{}' 是 rudp（udp）：客户端要凭控制面发的票据握手，请用 AddRUdpClient",
+                    fmt::format("net: 对端端点 '{}' 是 rudp（udp）：客户端要凭控制面发的票据握手，请用 AddRUdpClient",
                                 endpoint));
     const auto tcp = TcpEndpoint::From(*ep);
     const auto uds = tcp ? std::optional<UdsEndpoint>{} : UdsEndpoint::From(*ep);
     if (!tcp && !uds)
-        return Fail(Errc::Module, std::format("net: 对端端点 '{}' 的传输种类还没有对应的客户端", endpoint));
+        return Fail(Errc::Module, fmt::format("net: 对端端点 '{}' 的传输种类还没有对应的客户端", endpoint));
     return MakeStreamClient(tcp, uds, executor_.Wrap(handler), factory, std::move(options), policy);
 }
 
@@ -241,11 +241,11 @@ Result<agent::AgentClient*> NetModule::AddAgentClient(std::string_view endpoint,
     const auto ep = Endpoint::Parse(endpoint);
     if (!ep || (ep->kind() != Endpoint::Kind::Unix && ep->kind() != Endpoint::Kind::UnixAbstract))
         return Fail(Errc::Module,
-                    std::format("net: Agent 端点 '{}' 不合法（必须是 unix:///path 或 unix-abstract://name：fd 只能经 UDS 传递）",
+                    fmt::format("net: Agent 端点 '{}' 不合法（必须是 unix:///path 或 unix-abstract://name：fd 只能经 UDS 传递）",
                                 endpoint));
     if (!shm::wire::IsValidBusId(options.busid))
         return Fail(Errc::Module,
-                    std::format("net: Agent 通道名 '{}' 不合法（[A-Za-z0-9._:@-]，1 到 63 个字符）", options.busid));
+                    fmt::format("net: Agent 通道名 '{}' 不合法（[A-Za-z0-9._:@-]，1 到 63 个字符）", options.busid));
     if (!options.on_connect_failed)
     {
         const std::string target(endpoint);
@@ -274,12 +274,12 @@ Result<agent::AgentServer*> NetModule::AddAgentServer(std::string_view endpoint,
         return std::unexpected(r.error());
     if (options_.group.io_threads != 1)
         return Fail(Errc::Module,
-                    std::format("net: AddAgentServer 要求 net.io_threads = 1（Agent 的路由器与路由表是单线程访问的），当前是 {}",
+                    fmt::format("net: AddAgentServer 要求 net.io_threads = 1（Agent 的路由器与路由表是单线程访问的），当前是 {}",
                                 options_.group.io_threads));
     const auto ep = Endpoint::Parse(endpoint);
     if (!ep || (ep->kind() != Endpoint::Kind::Unix && ep->kind() != Endpoint::Kind::UnixAbstract))
         return Fail(Errc::Module,
-                    std::format("net: Agent 监听端点 '{}' 不合法（必须是 unix:///path 或 unix-abstract://name）", endpoint));
+                    fmt::format("net: Agent 监听端点 '{}' 不合法（必须是 unix:///path 或 unix-abstract://name）", endpoint));
     auto server = std::make_unique<agent::AgentServer>(*group_, *ep, table, std::move(options));
     agent::AgentServer* raw = server.get();
     servers_.push_back(std::move(server));
@@ -292,11 +292,11 @@ Result<INetServer*> NetModule::AddIoServer(std::string_view endpoint, IConnectio
         return std::unexpected(r.error());
     const auto ep = Endpoint::Parse(endpoint);
     if (!ep)
-        return Fail(Errc::Module, std::format("net: 监听端点 '{}' 不合法（tcp://ip:port | unix:///path | unix-abstract://name）", endpoint));
+        return Fail(Errc::Module, fmt::format("net: 监听端点 '{}' 不合法（tcp://ip:port | unix:///path | unix-abstract://name）", endpoint));
     const auto tcp = TcpEndpoint::From(*ep);
     const auto uds = tcp ? std::optional<UdsEndpoint>{} : UdsEndpoint::From(*ep);
     if (!tcp && !uds)
-        return Fail(Errc::Module, std::format("net: 监听端点 '{}' 不是 tcp / unix（AddIoServer 不收 udp://）", endpoint));
+        return Fail(Errc::Module, fmt::format("net: 监听端点 '{}' 不是 tcp / unix（AddIoServer 不收 udp://）", endpoint));
     StreamServerOptions so;
     so.connection = options_.connection;
     so.tcp = options_.tcp;
@@ -312,11 +312,11 @@ Result<INetClient*> NetModule::AddIoClient(std::string_view endpoint,
         return std::unexpected(r.error());
     const auto ep = Endpoint::Parse(endpoint);
     if (!ep)
-        return Fail(Errc::Module, std::format("net: 对端端点 '{}' 不合法（tcp://ip:port | unix:///path | unix-abstract://name）", endpoint));
+        return Fail(Errc::Module, fmt::format("net: 对端端点 '{}' 不合法（tcp://ip:port | unix:///path | unix-abstract://name）", endpoint));
     const auto tcp = TcpEndpoint::From(*ep);
     const auto uds = tcp ? std::optional<UdsEndpoint>{} : UdsEndpoint::From(*ep);
     if (!tcp && !uds)
-        return Fail(Errc::Module, std::format("net: 对端端点 '{}' 不是 tcp / unix（AddIoClient 不收 udp://）", endpoint));
+        return Fail(Errc::Module, fmt::format("net: 对端端点 '{}' 不是 tcp / unix（AddIoClient 不收 udp://）", endpoint));
     StreamClientOptions co;
     co.connection = options_.connection;
     co.tcp = options_.tcp;
@@ -339,7 +339,7 @@ Result<RUdpServer*> NetModule::AddRUdpServer(const RUdpEndpoint& endpoint,
         return std::unexpected(r.error());
     if (!options.rudp.Valid())
         return Fail(Errc::Module,
-                    std::format("net: rudp 服务端 {} 的传输参数不合法（见 RUdpOptions::Valid）", endpoint.ToString()));
+                    fmt::format("net: rudp 服务端 {} 的传输参数不合法（见 RUdpOptions::Valid）", endpoint.ToString()));
     IConnectionHandler& wrapped = executor_.Wrap(handler);
     auto server = std::make_unique<RUdpServer>(*group_, endpoint, std::move(options), wrapped);
     RUdpServer* raw = server.get();
@@ -363,7 +363,7 @@ Result<RUdpClient*> NetModule::AddRUdpClient(const RUdpEndpoint& server,
         return std::unexpected(r.error());
     if (!options.rudp.Valid())
         return Fail(Errc::Module,
-                    std::format("net: rudp 客户端 {} 的传输参数不合法（见 RUdpOptions::Valid）", server.ToString()));
+                    fmt::format("net: rudp 客户端 {} 的传输参数不合法（见 RUdpOptions::Valid）", server.ToString()));
     IConnectionHandler& wrapped = executor_.Wrap(handler);
     auto client = std::make_unique<RUdpClient>(*group_, server, std::move(options), wrapped);
     RUdpClient* raw = client.get();
@@ -390,7 +390,7 @@ Result<> NetModule::Start()
         return Fail(Errc::Phase, "net: Start 之前必须先 Init");
     if (const int e = group_->Start(); e != 0)
         return Fail(Errc::Module,
-                    std::format("net: 启动 EventLoopGroup 失败（io_threads={} max_connections_per_loop={}）: {}",
+                    fmt::format("net: 启动 EventLoopGroup 失败（io_threads={} max_connections_per_loop={}）: {}",
                                 options_.group.io_threads,
                                 options_.group.max_connections_per_loop,
                                 std::strerror(e)));
@@ -398,7 +398,7 @@ Result<> NetModule::Start()
     {
         if (const int e = s->Start(); e != 0)
         {
-            const std::string msg = std::format("net: 监听 {} 失败: {}", s->endpoint().ToString(), std::strerror(e));
+            const std::string msg = fmt::format("net: 监听 {} 失败: {}", s->endpoint().ToString(), std::strerror(e));
             Rollback();
             return Fail(Errc::Module, msg);
         }
@@ -409,7 +409,7 @@ Result<> NetModule::Start()
         if (const int e = c->Start(); e != 0)
         {
             const std::string msg =
-                std::format("net: 启动对 {} 的连接失败: {}", c->endpoint().ToString(), std::strerror(e));
+                fmt::format("net: 启动对 {} 的连接失败: {}", c->endpoint().ToString(), std::strerror(e));
             Rollback();
             return Fail(Errc::Module, msg);
         }

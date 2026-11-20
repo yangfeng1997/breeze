@@ -4,7 +4,7 @@
 #include "framework/app/app.h"
 
 #include <algorithm>
-#include <format>
+#include <fmt/format.h>
 #include <map>
 #include <ranges>
 #include <stdexcept>
@@ -57,11 +57,11 @@ Result<std::vector<std::size_t>> DepsSort(const std::vector<std::unique_ptr<Modu
             if (it == idx.end())
             {
                 return Fail(Errc::UnknownDep,
-                            std::format("module {}: {}: {}", modules[i]->Name(), Describe(Errc::UnknownDep), dep));
+                            fmt::format("module {}: {}: {}", modules[i]->Name(), Describe(Errc::UnknownDep), dep));
             }
             if (it->second == i)
             {
-                return Fail(Errc::SelfDep, std::format("module {}: {}", modules[i]->Name(), Describe(Errc::SelfDep)));
+                return Fail(Errc::SelfDep, fmt::format("module {}: {}", modules[i]->Name(), Describe(Errc::SelfDep)));
             }
             dependents[it->second].push_back(i);
             ++indeg[i];
@@ -99,7 +99,7 @@ Result<std::vector<std::size_t>> DepsSort(const std::vector<std::unique_ptr<Modu
             if (!done[i])
                 stuck.push_back(modules[i]->Name());
         }
-        return Fail(Errc::Cycle, std::format("{} among: {}", Describe(Errc::Cycle), Join(stuck)));
+        return Fail(Errc::Cycle, fmt::format("{} among: {}", Describe(Errc::Cycle), Join(stuck)));
     }
     return out;
 }
@@ -167,13 +167,13 @@ std::unexpected<Error> App::StateErr(std::string_view method, Lifecycle cur, Lif
 {
     return Fail(
         Errc::Phase,
-        std::format(
+        fmt::format(
             "{}: {}: current {}, want {}: {}", name_, method, ToString(cur), ToString(want), Describe(Errc::Phase)));
 }
 
 std::unexpected<Error> App::ModuleErr(std::string_view method, std::string_view module, const Error& e) const
 {
-    return Fail(Errc::Module, std::format("{}: module {}: {}: {}", name_, module, method, e.msg));
+    return Fail(Errc::Module, fmt::format("{}: module {}: {}: {}", name_, module, method, e.msg));
 }
 
 Result<> App::Build()
@@ -184,7 +184,7 @@ Result<> App::Build()
         if (state_ != Lifecycle::New)
             return StateErr("build", state_, Lifecycle::New);
         if (name_.empty())
-            return Fail(Errc::EmptyName, std::format("{}", Describe(Errc::EmptyName)));
+            return Fail(Errc::EmptyName, fmt::format("{}", Describe(Errc::EmptyName)));
         // 工厂是 move-only 的，整批取走；Build 失败后 App 不可重试（与“启动失败不回滚”一致）。
         factories = std::move(factories_);
     }
@@ -198,7 +198,7 @@ Result<> App::Build()
         const auto at = [&](Errc c, std::string_view detail = {})
         {
             return Fail(
-                c, std::format("{}: factory #{}{}{}: {}", name_, i, detail.empty() ? "" : ": ", detail, Describe(c)));
+                c, fmt::format("{}: factory #{}{}{}: {}", name_, i, detail.empty() ? "" : ": ", detail, Describe(c)));
         };
         if (!factories[i])
             return at(Errc::NilFactory);
@@ -215,7 +215,7 @@ Result<> App::Build()
 
     auto order = DepsSort(built);
     if (!order)
-        return Fail(order.error().code, std::format("{}: {}", name_, order.error().msg));
+        return Fail(order.error().code, fmt::format("{}: {}", name_, order.error().msg));
 
     std::vector<std::unique_ptr<Module>> sorted;
     sorted.reserve(built.size());
@@ -240,7 +240,7 @@ Result<> App::Build()
     // 模块没出现在这行里就是没被收到。
     const auto namesOf = [](const auto& caps)
     { return Join(caps | std::views::transform([](const auto& c) { return c.module->Name(); })); };
-    const auto summary = std::format("app built app={} modules={} tickable=[{}] waker=[{}]",
+    const auto summary = fmt::format("app built app={} modules={} tickable=[{}] waker=[{}]",
                                      name_,
                                      sorted.size(),
                                      namesOf(tickables),

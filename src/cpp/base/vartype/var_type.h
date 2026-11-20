@@ -6,7 +6,7 @@
 //   b.As<double>(0.0);                // 3.5；转不了就给默认值
 //   if (auto n = c.TryAs<int>()) ...  // 严格转换，失败是 nullopt
 //   if (a == 42 && b == 3.5 && c == true) ...
-//   std::format("{}", a);             // "42"
+//   fmt::format("{}", a);             // "42"
 //
 // 转换规则（TryAs / As / explicit 转换都一样）：
 //   - 先去掉两端的 ASCII 空白，允许一个前导 '+'；整串必须恰好是一个数（"12abc"、"0x10"、"" 都失败），不会像 strtoll
@@ -64,7 +64,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <format>
+#include <fmt/format.h>
 #include <functional>
 #include <limits>
 #include <map>
@@ -472,13 +472,13 @@ struct std::hash<breeze::VarType>
     std::size_t operator()(const breeze::VarType& v) const noexcept { return std::hash<std::string_view>{}(v.view()); }
 };
 
-// std::format("{}", v)：按字符串格式化，支持 {:>10} 这类字符串的格式说明。
+// fmt::format("{}", v)：按字符串格式化，支持 {:>10} 这类字符串的格式说明。
 template <>
-struct std::formatter<breeze::VarType, char> : std::formatter<std::string_view, char>
+struct fmt::formatter<breeze::VarType, char> : fmt::formatter<std::string_view, char>
 {
     template <typename FormatContext>
     auto format(const breeze::VarType& v, FormatContext& ctx) const
     {
-        return std::formatter<std::string_view, char>::format(v.view(), ctx);
+        return fmt::formatter<std::string_view, char>::format(v.view(), ctx);
     }
 };

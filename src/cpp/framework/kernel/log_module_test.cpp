@@ -7,7 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
-#include <format>
+#include <fmt/format.h>
 #include <fstream>
 #include <memory>
 #include <sstream>
@@ -34,7 +34,7 @@ namespace
 
 fs::path TempDir(const char* tag)
 {
-    auto p = fs::temp_directory_path() / std::format("breeze_logmod_test_{}_{}", ::getpid(), tag);
+    auto p = fs::temp_directory_path() / fmt::format("breeze_logmod_test_{}_{}", ::getpid(), tag);
     fs::remove_all(p);
     return p;
 }

@@ -1,7 +1,7 @@
 #include "base/metrics/message_stats.h"
 
 #include <algorithm>
-#include <format>
+#include <fmt/format.h>
 #include <tuple>
 #include <utility>
 
@@ -26,13 +26,13 @@ void AppendSection(
         msgs += e.total.count;
         bytes += e.total.bytes;
     }
-    out += std::format("\n  {} ({} keys, {} msgs, {} bytes):", title, entries.size(), msgs, bytes);
+    out += fmt::format("\n  {} ({} keys, {} msgs, {} bytes):", title, entries.size(), msgs, bytes);
     const std::size_t shown = top_n == 0 ? entries.size() : std::min(top_n, entries.size());
     for (std::size_t i = 0; i < shown; ++i)
         out +=
-            std::format("\n    {}  {} msgs  {} bytes", key(entries[i]), entries[i].total.count, entries[i].total.bytes);
+            fmt::format("\n    {}  {} msgs  {} bytes", key(entries[i]), entries[i].total.count, entries[i].total.bytes);
     if (shown < entries.size())
-        out += std::format("\n    ... {} more", entries.size() - shown);
+        out += fmt::format("\n    ... {} more", entries.size() - shown);
 }
 
 } // namespace
@@ -82,14 +82,14 @@ MessageStats::Snapshot MessageStats::GetSnapshot() const
 std::string MessageStats::Format(std::size_t top_n, std::int64_t window_ms) const
 {
     const Snapshot s = GetSnapshot();
-    std::string out = std::format("msgstats[{}]", label_);
+    std::string out = fmt::format("msgstats[{}]", label_);
     if (window_ms >= 0)
-        out += std::format(" window={}ms", window_ms);
+        out += fmt::format(" window={}ms", window_ms);
     AppendSection(out, "by id", s.by_id, top_n, [](const Snapshot::ById& e) { return e.id; });
     AppendSection(
         out, "by name", s.by_name, top_n, [](const Snapshot::ByName& e) -> const std::string& { return e.name; });
     if (s.dropped.count != 0)
-        out += std::format(
+        out += fmt::format(
             "\n  dropped (max_keys={}): {} msgs  {} bytes", options_.max_keys, s.dropped.count, s.dropped.bytes);
     return out;
 }

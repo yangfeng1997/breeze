@@ -34,6 +34,9 @@ find_package(kcp CONFIG REQUIRED)                # rudp 内部用（ARQ，只在
 find_package(readerwriterqueue CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
 find_package(yaml-cpp CONFIG REQUIRED)
+# fmt 是格式化的事实标准（全仓库不用 std::format）；spdlog 本来就按 SPDLOG_FMT_EXTERNAL 链接它，
+# 这里只是把直接依赖显式化，保证 find_package(fmt) 不依赖 spdlog 的传递关系。
+find_package(fmt CONFIG REQUIRED)
 # vcpkg 的 lua 端口经 wrapper 暴露成标准 FindLua 变量（LUA_INCLUDE_DIR / LUA_LIBRARIES）。
 # 不用 find_package(Lua 5.5)：Lua 5.5 的 LUA_VERSION_MAJOR 是 LUAI_TOSTR(...)，FindLua 解析不了；
 # 版本约束由 base/lua_binding/config.h 的 static_assert(LUA_VERSION_NUM >= 505) 负责。
@@ -222,14 +225,15 @@ function(breeze_proto_descriptor target)
   add_custom_target(${target} DEPENDS ${out_file})
 endfunction()
 
-# yaml-cpp 同理只 PRIVATE：config.h 不含它。
+# yaml-cpp 只 PRIVATE：config.h 不含它。fmt 则出现在 config.h 的内联函数里，必须 PUBLIC 传给使用方。
 add_library(breeze_config ${CONFIG_DIR}/config.cpp)
-target_link_libraries(breeze_config PRIVATE yaml-cpp::yaml-cpp)
+target_link_libraries(breeze_config PRIVATE yaml-cpp::yaml-cpp PUBLIC fmt::fmt)
 target_compile_options(breeze_config PRIVATE -Wall -Wextra)
 
-# spdlog 同理只 PRIVATE：logger.h / logger_macros.h 不含它，internal/ 里的头含它。
+# spdlog 只 PRIVATE：logger.h / logger_macros.h 不含它，internal/ 里的头含它。
+# fmt 是 PUBLIC：logger_macros.h 是公开头，宏展开成 ::fmt::format，使用方要能解析 <fmt/format.h> 并链接 fmt。
 add_library(breeze_logger ${LOGGER_DIR}/logger.cpp)
-target_link_libraries(breeze_logger PRIVATE spdlog::spdlog)
+target_link_libraries(breeze_logger PRIVATE spdlog::spdlog PUBLIC fmt::fmt)
 target_compile_options(breeze_logger PRIVATE -Wall -Wextra)
 
 # 无锁队列：模板必须在头文件里，所以 moodycamel 经 INTERFACE 传给使用方（与上面 PRIVATE 的 CLI11 不同）。
@@ -289,9 +293,10 @@ add_library(breeze_fsm INTERFACE)
 add_library(breeze_uri ${URI_DIR}/uri.cpp)
 target_compile_options(breeze_uri PRIVATE -Wall -Wextra)
 
-# 弱类型值（VarType）：字符串存放、按需转数字 / 布尔。只有头文件，依赖 breeze_string 的严格数字解析。
+# 弱类型值（VarType）：字符串存放、按需转数字 / 布尔。只有头文件，依赖 breeze_string 的严格数字解析；
+# 头里有 fmt::formatter 特化，所以 fmt 也经 INTERFACE 传出去。
 add_library(breeze_vartype INTERFACE)
-target_link_libraries(breeze_vartype INTERFACE breeze_string)
+target_link_libraries(breeze_vartype INTERFACE breeze_string fmt::fmt)
 
 # 字符串工具（Split / Join / Trim / 数字解析……）：只依赖标准库，不限平台。
 add_library(breeze_string ${STRING_DIR}/string_util.cpp)
@@ -325,7 +330,7 @@ if(BREEZE_BUILD_NET)
 endif()
 
 # Lua 5.5 绑定库：小型编译库 + 头文件模板。自带断言/日志，不依赖 breeze_assert，
-# 因此不受 BREEZE_BUILD_NET 限制；只依赖 vcpkg 的 lua 和标准库。
+# 因此不受 BREEZE_BUILD_NET 限制；只依赖 vcpkg 的 lua、fmt 和标准库。
 add_library(breeze_lua_binding
   ${BREEZE_LUA_BINDING_DIR}/check.cpp
   ${BREEZE_LUA_BINDING_DIR}/error.cpp
@@ -333,7 +338,7 @@ add_library(breeze_lua_binding
   ${BREEZE_LUA_BINDING_DIR}/class.cpp
   ${BREEZE_LUA_BINDING_DIR}/sandbox.cpp)
 target_include_directories(breeze_lua_binding PUBLIC ${LUA_INCLUDE_DIR})
-target_link_libraries(breeze_lua_binding PUBLIC ${LUA_LIBRARIES})
+target_link_libraries(breeze_lua_binding PUBLIC ${LUA_LIBRARIES} fmt::fmt)
 target_compile_features(breeze_lua_binding PUBLIC cxx_std_26)  # 公开头要求 C++26，与仓库全局标准一致
 target_compile_options(breeze_lua_binding PRIVATE -Wall -Wextra)
 

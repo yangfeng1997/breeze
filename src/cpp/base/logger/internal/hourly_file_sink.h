@@ -27,7 +27,7 @@
 #include <cstdio>
 #include <ctime>
 #include <filesystem>
-#include <format>
+#include <fmt/format.h>
 #include <mutex>
 #include <string>
 
@@ -93,7 +93,7 @@ private:
     static std::string HourKey(spdlog::log_clock::time_point tp)
     {
         const std::tm tm = spdlog::details::os::localtime(spdlog::log_clock::to_time_t(tp));
-        return std::format("{:04}-{:02}-{:02}_{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour);
+        return fmt::format("{:04}-{:02}-{:02}_{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour);
     }
 
     // 严格匹配 HourKey 的输出：YYYY-MM-DD_HH。旧格式（纯数字）与其它写法都不认，宁可漏删也不误删。
@@ -121,8 +121,8 @@ private:
 
     std::string SegmentFile() const
     {
-        return segment_ == 0 ? std::format("{}.{}.log", name_, hourKey_)
-                             : std::format("{}.{}.{}.log", name_, hourKey_, segment_);
+        return segment_ == 0 ? fmt::format("{}.{}.log", name_, hourKey_)
+                             : fmt::format("{}.{}.{}.log", name_, hourKey_, segment_);
     }
 
     // 打开当前段（追加：同小时重启不覆盖），记下已有大小，软链指过去。
@@ -159,7 +159,7 @@ private:
     void Cap()
     {
         capped_ = true;
-        WriteNote(std::format("本小时日志量超限（单文件 {} 字节 x {} 个），后续日志被丢弃，下个小时恢复",
+        WriteNote(fmt::format("本小时日志量超限（单文件 {} 字节 x {} 个），后续日志被丢弃，下个小时恢复",
                               maxFileBytes_,
                               maxFilesPerHour_));
     }
@@ -180,7 +180,7 @@ private:
         end_ = start_ + std::chrono::hours(1);
 
         if (droppedPrev > 0)
-            WriteNote(std::format("上一个小时因超限共丢弃 {} 条日志", droppedPrev));
+            WriteNote(fmt::format("上一个小时因超限共丢弃 {} 条日志", droppedPrev));
         if (retainHours_ > 0)
             Cleanup(tp);
     }

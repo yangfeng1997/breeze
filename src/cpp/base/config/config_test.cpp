@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fmt/format.h>
 #include <fstream>
 #include <string>
 
@@ -230,7 +231,7 @@ std::string WriteTemp(const fs::path& dir, const char* name, const char* content
 
 void TestMergeOrderAndOrigin()
 {
-    const auto dir = fs::temp_directory_path() / std::format("breeze_config_test_{}", ::getpid());
+    const auto dir = fs::temp_directory_path() / fmt::format("breeze_config_test_{}", ::getpid());
     fs::remove_all(dir);
     const auto base = WriteTemp(dir,
                                 "base.yaml",
@@ -471,14 +472,14 @@ void TestPlaceholderErrors()
 
 void TestFilePlaceholder()
 {
-    const auto dir = fs::temp_directory_path() / std::format("breeze_config_secret_{}", ::getpid());
+    const auto dir = fs::temp_directory_path() / fmt::format("breeze_config_secret_{}", ::getpid());
     fs::remove_all(dir);
     fs::create_directories(dir);
     {
         std::ofstream(dir / "unix") << "s3cr3t\n";
         std::ofstream(dir / "crlf", std::ios::binary) << "pw\r\n";
     }
-    auto cfg = Load(std::format("a: ${{FILE:{}/unix}}\nb: ${{FILE:{}/crlf}}\n", dir.string(), dir.string()));
+    auto cfg = Load(fmt::format("a: ${{FILE:{}/unix}}\nb: ${{FILE:{}/crlf}}\n", dir.string(), dir.string()));
     CHECK(Str(cfg, "a") == "s3cr3t"); // 末尾换行去掉
     CHECK(Str(cfg, "b") == "pw");
 
@@ -491,7 +492,7 @@ void TestFilePlaceholder()
 void TestOnlyEffectiveValuesAreExpanded()
 {
     ::unsetenv("BREEZE_T_UNSET_PW");
-    const auto dir = fs::temp_directory_path() / std::format("breeze_config_eff_{}", ::getpid());
+    const auto dir = fs::temp_directory_path() / fmt::format("breeze_config_eff_{}", ::getpid());
     fs::remove_all(dir);
     const auto base = WriteTemp(dir, "base.yaml", "pw: ${ENV:BREEZE_T_UNSET_PW}\nkeep: 1\n");
     const auto over = WriteTemp(dir, "over.yaml", "pw: literal\n");

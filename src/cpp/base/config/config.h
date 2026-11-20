@@ -22,7 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <expected>
-#include <format>
+#include <fmt/format.h>
 #include <functional>
 #include <initializer_list>
 #include <limits>
@@ -115,7 +115,7 @@ struct ConfigTraits<T>
             if (!v)
                 return std::unexpected(v.error());
             if (*v < static_cast<std::int64_t>(lo) || *v > static_cast<std::int64_t>(hi))
-                return std::unexpected(n.Error(std::format(
+                return std::unexpected(n.Error(fmt::format(
                     "{} 超出范围 [{}, {}]", *v, static_cast<std::int64_t>(lo), static_cast<std::int64_t>(hi))));
             out = static_cast<T>(*v);
         }
@@ -125,7 +125,7 @@ struct ConfigTraits<T>
             if (!v)
                 return std::unexpected(v.error());
             if (*v > static_cast<std::uint64_t>(hi))
-                return std::unexpected(n.Error(std::format("{} 超出范围 [0, {}]", *v, static_cast<std::uint64_t>(hi))));
+                return std::unexpected(n.Error(fmt::format("{} 超出范围 [0, {}]", *v, static_cast<std::uint64_t>(hi))));
             out = static_cast<T>(*v);
         }
         return {};
@@ -264,7 +264,7 @@ struct EnumTraits
             }
             allowed += (allowed.empty() ? "" : " | ") + name;
         }
-        return std::unexpected(n.Error(std::format("'{}' 不是有效值，可选: {}", *s, allowed)));
+        return std::unexpected(n.Error(fmt::format("'{}' 不是有效值，可选: {}", *s, allowed)));
     }
 
     static std::string Name(E v)
@@ -381,7 +381,7 @@ public:
         requires std::is_arithmetic_v<M>
     {
         checks_.push_back([lo, hi](const M& v) -> std::string
-                          { return (v < lo || v > hi) ? std::format("{} 超出范围 [{}, {}]", +v, +lo, +hi) : ""; });
+                          { return (v < lo || v > hi) ? fmt::format("{} 超出范围 [{}, {}]", +v, +lo, +hi) : ""; });
         return *this;
     }
 
@@ -417,7 +417,7 @@ public:
                 }
                 allowed += (allowed.empty() ? "" : " | ") + name;
             }
-            return std::unexpected(n.Error(std::format("'{}' 不是有效值，可选: {}", *s, allowed)));
+            return std::unexpected(n.Error(fmt::format("'{}' 不是有效值，可选: {}", *s, allowed)));
         };
         return *this;
     }
@@ -437,7 +437,7 @@ public:
                 return std::unexpected(s.error());
             auto v = fn(*s);
             if (!v)
-                return std::unexpected(n.Error(std::format("'{}' 不是有效值，可选: {}", *s, expected)));
+                return std::unexpected(n.Error(fmt::format("'{}' 不是有效值，可选: {}", *s, expected)));
             out = std::move(*v);
             return {};
         };
@@ -545,7 +545,7 @@ ConfigResult<void> BindStruct(const ConfigNode& node, T& out, const FieldTable<T
         if (!child.Valid())
         {
             if (f.required)
-                return std::unexpected(node.Error(std::format("缺少必填项 '{}'", f.key)));
+                return std::unexpected(node.Error(fmt::format("缺少必填项 '{}'", f.key)));
             continue;
         }
         if (auto r = f.read(child, out); !r)
@@ -703,11 +703,11 @@ std::string ConfigFlow(const T& v)
         if constexpr (requires { ConfigTraits<T>::Name(v); })
             return ConfigTraits<T>::Name(v);
         else
-            return std::format("{}", static_cast<std::underlying_type_t<T>>(v) + 0);
+            return fmt::format("{}", static_cast<std::underlying_type_t<T>>(v) + 0);
     }
     else
     {
-        return std::format("{}", +v);
+        return fmt::format("{}", +v);
     }
 }
 
@@ -870,7 +870,7 @@ public:
     {
         ConfigNode n = Root().Find(path);
         if (!n.Valid())
-            return std::unexpected(Root().Error(std::format("缺少配置段 '{}'", path)));
+            return std::unexpected(Root().Error(fmt::format("缺少配置段 '{}'", path)));
         T out{};
         if (auto r = ConfigTraits<T>::ReadInto(n, out); !r)
             return std::unexpected(r.error());

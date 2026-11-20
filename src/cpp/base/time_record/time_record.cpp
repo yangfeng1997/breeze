@@ -1,6 +1,6 @@
 #include "base/time_record/time_record.h"
 
-#include <format>
+#include <fmt/format.h>
 #include <utility>
 
 #include "base/logger/logger_macros.h"
@@ -27,7 +27,7 @@ TimeRecord::~TimeRecord()
         return;
     // 级别不够时 Log 自己会丢掉；这里只负责决定是 Info 还是 Warn
     CurrentLogger().Log(
-        slow_mode ? Level::Warn : Level::Info, loc_, std::format("timerecord: name:{} elapsed {}us", name_, us));
+        slow_mode ? Level::Warn : Level::Info, loc_, fmt::format("timerecord: name:{} elapsed {}us", name_, us));
 }
 
 } // namespace breeze

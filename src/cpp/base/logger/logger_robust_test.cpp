@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <fmt/format.h>
 #include <future>
 #include <string>
 #include <thread>
@@ -336,7 +337,7 @@ void TestSinkConcurrentRotation()
                 for (int i = 0; i < kPer; ++i)
                 {
                     const int k = seq.fetch_add(1);
-                    const std::string payload = std::format("m-{}", k);
+                    const std::string payload = fmt::format("m-{}", k);
                     spdlog::details::log_msg msg(
                         spdlog::source_loc{}, "x", spdlog::level::info, spdlog::string_view_t(payload));
                     msg.time = base + std::chrono::seconds(90) * k; // 2 万条 × 90 秒 ≈ 500 小时

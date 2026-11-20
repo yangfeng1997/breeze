@@ -6,7 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
-#include <format>
+#include <fmt/format.h>
 
 #ifdef __linux__
 #include <sys/prctl.h>
@@ -145,7 +145,7 @@ std::unique_ptr<Logger> Logger::Create(const LoggerConfig& cfg, std::string& err
             std::filesystem::create_directories(cfg.file.dir, ec);
             if (ec)
             {
-                err = std::format("创建日志目录 {} 失败: {}", cfg.file.dir, ec.message());
+                err = fmt::format("创建日志目录 {} 失败: {}", cfg.file.dir, ec.message());
                 return nullptr;
             }
             auto fileSink = std::make_shared<HourlyFileSinkMt>(

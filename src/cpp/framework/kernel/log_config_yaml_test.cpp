@@ -7,7 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
-#include <format>
+#include <fmt/format.h>
 #include <fstream>
 #include <sstream>
 
@@ -110,10 +110,10 @@ void TestTypoDetected()
 // 端到端：yaml → LoggerConfig → 真正能写日志的 Logger。
 void TestBuildsWorkingLogger()
 {
-    const auto dir = fs::temp_directory_path() / std::format("breeze_logcfg_test_{}", ::getpid());
+    const auto dir = fs::temp_directory_path() / fmt::format("breeze_logcfg_test_{}", ::getpid());
     fs::remove_all(dir);
     auto cfg =
-        Load(std::format("log:\n"
+        Load(fmt::format("log:\n"
                          "  name: fromyaml\n"
                          "  level: debug\n"
                          "  file: {{ dir: {} }}\n"

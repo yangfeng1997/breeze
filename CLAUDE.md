@@ -8,6 +8,8 @@
 游戏服务端（GameServer）。Go 1.25，module `project`，远端 `yangfeng1997/breeze`。
 `src/go/core/app` 是自研进程骨架，各 `*svr` 是它的消费者。
 
+C++ 侧**格式化一律用 `fmt::format`**（`fmt` 是 vcpkg 直接依赖），不用 `std::format`：libstdc++ 的实现比 fmt 慢，仓库里只保留一套格式化实现，`fmt::formatter` 是唯一的自定义格式化入口。
+
 ## 目录
 
 - `src/go/core/app` — 进程骨架：模块注册 → 拓扑排序 → 启动编排 → 事件驱动主循环。
@@ -32,7 +34,7 @@
   `base/timer` 是 `TimerWheel`（分层时间轮，O(1) 添加 / 取消 / 重置、空转跳过），**定时器要用单调时钟 `Now::SteadyMs()` 驱动，别用墙钟**，见 [docs/时间与定时器.md](docs/时间与定时器.md)；
   `base/metrics` 是 `MessageStats`（按消息 id / 名字统计条数与字节、周期写日志，**非线程安全，一线程一实例**，`Tick` 传单调时钟），见 [docs/指标统计.md](docs/指标统计.md)；
   `base/event` 是 `EventBus`（类型安全的**同步**发布 / 订阅，回调里可以随意订阅 / 退订 / `Clear` / 嵌套发布，非线程安全）与 `ScopedSubscription`，见 [docs/事件总线.md](docs/事件总线.md)；
-  `base/lua_binding` 是 Lua 5.5.1 绑定库（`breeze_lua_binding`，小型编译库 + 头文件模板，依赖 vcpkg 的 `lua`）：链式 `Class<T>` 构建器 + luakit 风格键值糖，默认冒号调用零分配，错误不抛 C++ 异常（两段式 trampoline + `std::expected<T, Error>`，核心可在 `-fno-exceptions` 下编译）；C++→Lua 默认 `lua_pcall`，`CallUnprotected` / `CallGlobalUnprotected` 是显式 `lua_call` 逃生门（报错会 longjmp，确认不报错才用）；可选 `breeze_lua_binding_ext`（table/string/os 工具）、`sandbox.h`（内存 / 指令 / 时间预算）、`coroutine.h`。debug / asan / tsan 预设经 vcpkg overlay 链接带 `LUA_USE_APICHECK` 的 Lua；debug、asan+ubsan、tsan、`-fno-exceptions` 下测试均通过（全仓库统一 C++26）。**`Reference`/`LuaTable`/`LuaFunction` 必须在创建它的线程析构，异步线程只传 ID、不传 Reference；库不实现跨线程释放队列；它们不可拷贝，需要独立引用时用显式 `Clone()`。** **不属于绑定库的职责一律不做**：跨线程 Reference 队列、协程超时定时器、sandbox/coroutine 的 hook 复用器、C++ 栈采集、二进制 codec 都归框架/运行时/诊断库。绑定层设计与实测见 [docs/Lua绑定库设计.md](docs/Lua绑定库设计.md)；框架层（`LuaModule` / `AsyncWorkerModule` / worker 类型 / 文件级热更）见 [docs/Lua脚本框架设计.md](docs/Lua脚本框架设计.md)；**框架层明确不做单进程多 Shard，扩容靠多进程/多服务实例。**
+  `base/lua_binding` 是 Lua 5.5.1 绑定库（`breeze_lua_binding`，小型编译库 + 头文件模板，依赖 vcpkg 的 `lua` 与 `fmt`）：链式 `Class<T>` 构建器 + luakit 风格键值糖，默认冒号调用零分配，错误不抛 C++ 异常（两段式 trampoline + `std::expected<T, Error>`，核心可在 `-fno-exceptions` 下编译）；C++→Lua 默认 `lua_pcall`，`CallUnprotected` / `CallGlobalUnprotected` 是显式 `lua_call` 逃生门（报错会 longjmp，确认不报错才用）；可选 `breeze_lua_binding_ext`（table/string/os 工具）、`sandbox.h`（内存 / 指令 / 时间预算）、`coroutine.h`。debug / asan / tsan 预设经 vcpkg overlay 链接带 `LUA_USE_APICHECK` 的 Lua；debug、asan+ubsan、tsan、`-fno-exceptions` 下测试均通过（全仓库统一 C++26）。**`Reference`/`LuaTable`/`LuaFunction` 必须在创建它的线程析构，异步线程只传 ID、不传 Reference；库不实现跨线程释放队列；它们不可拷贝，需要独立引用时用显式 `Clone()`。** **不属于绑定库的职责一律不做**：跨线程 Reference 队列、协程超时定时器、sandbox/coroutine 的 hook 复用器、C++ 栈采集、二进制 codec 都归框架/运行时/诊断库。绑定层设计与实测见 [docs/Lua绑定库设计.md](docs/Lua绑定库设计.md)；框架层（`LuaModule` / `AsyncWorkerModule` / worker 类型 / 文件级热更）见 [docs/Lua脚本框架设计.md](docs/Lua脚本框架设计.md)；**框架层明确不做单进程多 Shard，扩容靠多进程/多服务实例。**
   `base/container` 是 `FlatHashMap` / `FlatHashSet`（Swiss table）与 `LinkedHashMap` / `LinkedHashSet`（保持插入顺序，可当 LRU），
   **插入可能让迭代器 / 引用失效、元素的移动构造必须 noexcept、`at()` 找不到键就 abort**，见 [docs/基础容器库.md](docs/基础容器库.md)；
   这几个库的 **tsan 同样没在本机跑过**，容器 bench 默认不构建：`cmake --preset release -DBREEZE_BUILD_CONTAINER_BENCH=ON`；

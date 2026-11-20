@@ -9,7 +9,7 @@
 // 这样 base 层不依赖 framework 的 logger，framework 以后可以把它们接过去。
 
 #include <atomic>
-#include <format>
+#include <fmt/format.h>
 #include <string>
 #include <string_view>
 
@@ -27,8 +27,8 @@ void LogMessage(std::string_view message) noexcept;
 
 // 冷路径专用：只在错误/日志里格式化，热路径不要调用。
 template <class... Args>
-std::string Format(std::format_string<Args...> fmt, Args&&... args) {
-    return std::format(fmt, std::forward<Args>(args)...);
+std::string Format(fmt::format_string<Args...> f, Args&&... args) {
+    return fmt::format(f, std::forward<Args>(args)...);
 }
 
 }  // namespace breeze::lua_binding

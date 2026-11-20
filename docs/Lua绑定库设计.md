@@ -2,7 +2,7 @@
 
 `breeze::lua_binding`：Lua 5.5.1 的 C++ 绑定库。小型编译库（`breeze_lua_binding`）加头文件模板；链式 `Class<T>` 构建器为主，luakit 风格键值列表是同一个构建器上的糖衣；默认冒号调用零分配；错误不依赖 C++ 异常（两段式 trampoline + `std::expected<T, Error>`）；可选 `breeze_lua_binding_ext`（table / string / os 工具）、`sandbox.h`（内存 / 指令 / 时间预算）、`coroutine.h`。
 
-依赖 vcpkg 的 `lua` 端口（5.5.1，按 C 编译）。**C++26 为基线**（仓库根 `CMakeLists.txt` 设 `CMAKE_CXX_STANDARD 26`，`breeze_lua_binding` 也以 `target_compile_features(... cxx_std_26)` 声明）；不需要网络库，Linux 与 Windows（MSYS2 g++ 16）都能构建。
+依赖 vcpkg 的 `lua` 端口（5.5.1，按 C 编译）与 `fmt`（`check.h` 的断言 / 日志格式化）。**C++26 为基线**（仓库根 `CMakeLists.txt` 设 `CMAKE_CXX_STANDARD 26`，`breeze_lua_binding` 也以 `target_compile_features(... cxx_std_26)` 声明）；不需要网络库，Linux 与 Windows（MSYS2 g++ 16）都能构建。
 
 C++26 下可用的 `std::expected`、`std::move_only_function`、`std::to_underlying`、`std::unreachable` 等（多数从 C++23 起就有），breeze::lua_binding **没有为了用而用**：错误类型直接用标准的 `std::expected<T, Error>`（不再自造 Result），内部也不依赖 `std::move_only_function`。升级标准只是为了不再为低版本兼容性做取舍。
 

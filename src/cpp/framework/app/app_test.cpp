@@ -9,7 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
-#include <format>
+#include <fmt/format.h>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -302,7 +302,7 @@ void TestNotifyFromThreads()
 
 int main()
 {
-    const auto dir = std::filesystem::temp_directory_path() / std::format("breeze_app_test_{}", ::getpid());
+    const auto dir = std::filesystem::temp_directory_path() / fmt::format("breeze_app_test_{}", ::getpid());
     std::filesystem::remove_all(dir);
     LoggerConfig cfg;
     cfg.file.dir = dir.string();

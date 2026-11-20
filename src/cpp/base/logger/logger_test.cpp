@@ -14,7 +14,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
-#include <format>
+#include <fmt/format.h>
 #include <fstream>
 #include <set>
 #include <sstream>
@@ -42,7 +42,7 @@ namespace
 
 fs::path TempDir(const char* tag)
 {
-    auto p = fs::temp_directory_path() / std::format("breeze_logger_test_{}_{}", ::getpid(), tag);
+    auto p = fs::temp_directory_path() / fmt::format("breeze_logger_test_{}_{}", ::getpid(), tag);
     fs::remove_all(p);
     return p;
 }
@@ -173,7 +173,7 @@ void TestSizeSegmentsAndHourlyCap()
     {
         HourlyFileSinkMt sink(dir, "t", 0, kMax, kSegs);
         for (int i = 0; i < kFed; ++i)
-            Feed(sink, At(2026, 10, 26, 12, 0), std::format("m-{:04}", i));
+            Feed(sink, At(2026, 10, 26, 12, 0), fmt::format("m-{:04}", i));
         CHECK(fs::read_symlink(dir / "t.log") == "t.2026-10-26_12.2.log"); // 封顶后仍指向最后一段
         Feed(sink, At(2026, 10, 26, 13, 0), "next-hour");
     }
@@ -194,7 +194,7 @@ void TestSizeSegmentsAndHourlyCap()
 
     const int dropped = kFed - 9;
     const auto next = ReadAll(dir / "t.2026-10-26_13.log");
-    CHECK(Has(next, std::format("共丢弃 {} 条", dropped)));
+    CHECK(Has(next, fmt::format("共丢弃 {} 条", dropped)));
     CHECK(Has(next, "next-hour")); // 下个小时恢复
     CHECK(fs::read_symlink(dir / "t.log") == "t.2026-10-26_13.log");
     fs::remove_all(dir);

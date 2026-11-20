@@ -5,6 +5,7 @@
 #include <charconv>
 #include <cstdlib>
 #include <filesystem>
+#include <fmt/format.h>
 #include <fstream>
 #include <set>
 #include <sstream>
@@ -61,7 +62,7 @@ std::string JoinPath(const std::string& base, std::string_view key)
     return base.empty() ? std::string(key) : base + "." + std::string(key);
 }
 
-std::string IndexPath(const std::string& base, std::size_t i) { return std::format("{}[{}]", base, i); }
+std::string IndexPath(const std::string& base, std::size_t i) { return fmt::format("{}[{}]", base, i); }
 
 std::string_view KindName(const YAML::Node& n)
 {
@@ -194,7 +195,7 @@ std::string ExpandScalar(const std::string& s, ExpandCtx& c)
             }
             if (!IsEnvName(rest))
             {
-                c.Fail(std::format("环境变量名 '{}' 不合法", rest));
+                c.Fail(fmt::format("环境变量名 '{}' 不合法", rest));
             }
             else if (const char* v = std::getenv(rest.c_str()))
             {
@@ -206,7 +207,7 @@ std::string ExpandScalar(const std::string& s, ExpandCtx& c)
             }
             else
             {
-                c.Fail(std::format("环境变量 '{}' 未设置", rest));
+                c.Fail(fmt::format("环境变量 '{}' 未设置", rest));
             }
         }
         else if (body.starts_with("FILE:"))
@@ -215,7 +216,7 @@ std::string ExpandScalar(const std::string& s, ExpandCtx& c)
             std::ifstream in(path, std::ios::binary);
             if (path.empty() || !in)
             {
-                c.Fail(std::format("无法读取文件 '{}'", path));
+                c.Fail(fmt::format("无法读取文件 '{}'", path));
             }
             else
             {
@@ -231,7 +232,7 @@ std::string ExpandScalar(const std::string& s, ExpandCtx& c)
         }
         else
         {
-            c.Fail(std::format(
+            c.Fail(fmt::format(
                 "未替换的占位符 '${{{}}}'：模板变量应在生成配置时替换，运行时只认 ${{ENV:...}} 与 ${{FILE:...}}",
                 body));
         }
@@ -278,7 +279,7 @@ ConfigError Combine(std::vector<ConfigError> errs)
 {
     if (errs.size() == 1)
         return std::move(errs[0]);
-    std::string msg = std::format("共 {} 处错误:", errs.size());
+    std::string msg = fmt::format("共 {} 处错误:", errs.size());
     for (const auto& e : errs)
         msg += "\n  " + e.Format();
     ConfigError out;
@@ -291,7 +292,7 @@ std::optional<ConfigError> Absorb(detail::ConfigState& st, std::size_t fileIdx, 
     if (tree.IsNull())
         return std::nullopt; // 空文件当空表
     if (!tree.IsMap())
-        return ConfigError{st.files[fileIdx], 1, "", std::format("顶层必须是映射，实际是{}", KindName(tree))};
+        return ConfigError{st.files[fileIdx], 1, "", fmt::format("顶层必须是映射，实际是{}", KindName(tree))};
     RecordOrigins(tree, "", fileIdx, st.origin);
     Merge(st.root, tree);
     return std::nullopt;
@@ -311,7 +312,7 @@ std::string ConfigError::Format() const
 {
     std::string out;
     if (!file.empty())
-        out += file + (line > 0 ? std::format(":{}", line) : "") + ": ";
+        out += file + (line > 0 ? fmt::format(":{}", line) : "") + ": ";
     if (!path.empty())
         out += path + ": ";
     return out + message;
@@ -406,7 +407,7 @@ ConfigError ConfigNode::Error(std::string message) const
 ConfigResult<std::string> ConfigNode::AsString() const
 {
     if (!IsScalar())
-        return std::unexpected(Error(std::format("期望字符串，实际是{}", impl_ ? KindName(impl_->node) : "不存在")));
+        return std::unexpected(Error(fmt::format("期望字符串，实际是{}", impl_ ? KindName(impl_->node) : "不存在")));
     return impl_->node.Scalar();
 }
 
@@ -421,7 +422,7 @@ template <class N>
 ConfigResult<N> ParseNumber(const ConfigNode& n, std::string_view kind)
 {
     if (!n.IsScalar())
-        return std::unexpected(n.Error(std::format("期望{}，实际是{}", kind, ActualKind(n))));
+        return std::unexpected(n.Error(fmt::format("期望{}，实际是{}", kind, ActualKind(n))));
     auto s = n.AsString();
     if (!s)
         return std::unexpected(s.error());
@@ -430,9 +431,9 @@ ConfigResult<N> ParseNumber(const ConfigNode& n, std::string_view kind)
     const char* e = b + s->size();
     const auto [p, ec] = std::from_chars(b, e, v);
     if (s->empty() || p != e || ec == std::errc::invalid_argument)
-        return std::unexpected(n.Error(std::format("期望{}，实际 '{}'", kind, *s)));
+        return std::unexpected(n.Error(fmt::format("期望{}，实际 '{}'", kind, *s)));
     if (ec == std::errc::result_out_of_range)
-        return std::unexpected(n.Error(std::format("数值 '{}' 超出范围", *s)));
+        return std::unexpected(n.Error(fmt::format("数值 '{}' 超出范围", *s)));
     return v;
 }
 } // namespace
@@ -440,13 +441,13 @@ ConfigResult<N> ParseNumber(const ConfigNode& n, std::string_view kind)
 ConfigResult<bool> ConfigNode::AsBool() const
 {
     if (!IsScalar())
-        return std::unexpected(Error(std::format("期望 true 或 false，实际是{}", ActualKind(*this))));
+        return std::unexpected(Error(fmt::format("期望 true 或 false，实际是{}", ActualKind(*this))));
     const std::string& s = impl_->node.Scalar();
     if (s == "true")
         return true;
     if (s == "false")
         return false;
-    return std::unexpected(Error(std::format("期望 true 或 false，实际 '{}'", s)));
+    return std::unexpected(Error(fmt::format("期望 true 或 false，实际 '{}'", s)));
 }
 
 ConfigResult<std::int64_t> ConfigNode::AsInt64() const { return ParseNumber<std::int64_t>(*this, "整数"); }

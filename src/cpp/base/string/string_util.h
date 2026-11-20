@@ -7,8 +7,8 @@
 //   UTF-8 多字节序列的字节都 >= 0x80，原样保留。
 // - 数字解析是严格的：整串必须恰好是一个数，不跳空白、不认前导 '+'（同 std::from_chars），要宽松先 Trim。
 //   失败返回 nullopt，不抛异常；浮点的 inf / nan 一律视为失败（配置里出现它们几乎一定是笔误）。
-// - 已有标准库等价物的不重复提供：starts_with / ends_with / contains 用 std::string_view 的成员，格式化用 std::format
-//   （容器、tuple 也能直接 {} 打印）。
+// - 已有等价物的不重复提供：starts_with / ends_with / contains 用 std::string_view 的成员，格式化用 fmt::format
+//   （容器、pair、tuple 要另加 <fmt/ranges.h>，这里不替业务决定）。
 
 #pragma once
 

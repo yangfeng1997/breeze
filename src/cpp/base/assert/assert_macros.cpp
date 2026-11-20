@@ -1,6 +1,6 @@
 #include "base/assert/assert_macros.h"
 
-#include <format>
+#include <fmt/format.h>
 #include <string>
 
 #include "base/backtrace/backtrace.h"
@@ -29,7 +29,7 @@ void AssertAbort(std::source_location loc, const char* expr)
 {
     // Fatal 先排空日志队列再直写 abort；多行文本放进同一条消息，不会被别的线程的日志切开。
     CurrentLogger().Fatal(
-        loc, std::format("ASSERT failed: ({})\n  at {}\n  backtrace:\n{}", expr, loc.function_name(), Stack()));
+        loc, fmt::format("ASSERT failed: ({})\n  at {}\n  backtrace:\n{}", expr, loc.function_name(), Stack()));
 }
 
 void AssertReport(std::atomic<std::uint32_t>& hits, std::source_location loc, const char* expr)
@@ -43,7 +43,7 @@ void AssertReport(std::atomic<std::uint32_t>& hits, std::source_location loc, co
         loc.file_name(),
         static_cast<int>(loc.line()),
         loc.function_name(),
-        std::format(
+        fmt::format(
             "ASSERT failed: ({}) 本调用点第 {} 次失败（只在 2 的幂次记录）\n  backtrace:\n{}", expr, n, Stack()));
 }
 
