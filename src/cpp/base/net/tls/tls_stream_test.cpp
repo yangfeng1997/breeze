@@ -7,6 +7,7 @@
 // 无测试框架依赖：失败即 abort。
 
 #include <arpa/inet.h>
+#include <malloc.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <openssl/ssl.h>
@@ -523,6 +524,76 @@ void TestBatchWithOversizePayloadOverTls()
     }
 }
 
+// 惰性加密的收益（方案 §13-3）：同一块 payload 发给很多"不读"的连接时，每条连接积压的是**共享的明文帧**加上层内至多一个预算
+// （64KB）的密文，而不是每连接一份完整的密文拷贝——积压的堆占用与 payload 总量无关，只随连接数 × 层内预算增长。
+// 16 条连接各收 3 × 8MB：若改成"Send 时立即加密"，每条连接要多持有（24MB − 内核缓冲吸收的 4～10MB）的密文，合计 200MB 以上；
+// 现在实测只有几 MB。glibc 的 mallinfo2；消毒器下 malloc 被替换，数字没有意义，跳过。
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define BREEZE_TLS_NO_BACKLOG_PROBE 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#define BREEZE_TLS_NO_BACKLOG_PROBE 1
+#endif
+#endif
+
+void TestBroadcastBacklogMemoryIsBounded()
+{
+#ifdef BREEZE_TLS_NO_BACKLOG_PROBE
+    return;
+#else
+    const LeakCheck leak;
+    TlsServer s(MustServer(ServerOpts(P().server)));
+    s.rec.on_message = nullptr;
+    TlsClientSide cs;
+    constexpr int kN = 16;
+    constexpr int kRepeat = 3;
+    constexpr std::size_t kPayload = 8u << 20;
+    const auto heap = [] { const auto m = ::mallinfo2(); return m.uordblks + m.hblkhd; }; // 非 mmap + mmap 的在用字节
+
+    std::vector<std::unique_ptr<StreamClient>> clients;
+    const auto cctx = MustClient(ClientOpts(P().ca));
+    for (int i = 0; i < kN; ++i)
+    {
+        clients.push_back(std::make_unique<StreamClient>(cs.group, s.ep(), TlsClientSide::Options(cctx), FastPolicy(), cs.rec, cs.codec));
+        CHECK(clients.back()->Start() == 0);
+    }
+    std::vector<ConnectionHandle> server_handles;
+    for (int i = 0; i < kN; ++i)
+    {
+        cs.rec.WaitConnected(static_cast<std::size_t>(i));
+        server_handles.push_back(s.rec.WaitConnected(static_cast<std::size_t>(i)));
+    }
+    for (auto& c : clients)
+        c->handle().PauseRead(); // 客户端不读：内核缓冲填满之后，服务端只能积压
+    CHECK(WaitUntil([&] { return cs.group.GetStats().paused_connections == static_cast<std::uint64_t>(kN); }));
+
+    SharedBuffer shared = SharedBuffer::Create(kPayload); // 先分配好：不计入增长
+    std::memset(shared.MutableBytes().data(), 'q', kPayload);
+    const std::size_t before = heap();
+    for (int r = 0; r < kRepeat; ++r)
+        for (const ConnectionHandle h : server_handles)
+            CHECK(h.Send(shared) == SendResult::Ok);
+    CHECK(WaitUntil([&] { return s.stats().messages_out == static_cast<std::uint64_t>(kN * kRepeat); }, 60s));
+    // 等 IO 线程把能写的都写完（内核缓冲吸收、层里补满预算）：bytes_out 连续 300ms 不再变化
+    std::uint64_t last = 0;
+    int stable = 0;
+    while (stable < 3)
+    {
+        std::this_thread::sleep_for(100ms);
+        const std::uint64_t now = s.stats().bytes_out;
+        stable = now == last ? stable + 1 : 0;
+        last = now;
+    }
+    const std::size_t growth = heap() - before;
+    const std::size_t total_backlog = static_cast<std::size_t>(kN) * kRepeat * kPayload;
+    std::fprintf(stderr, "[内存] %d 条不读的 TLS 连接各积压 %d × %zuMB：服务端堆增长 %.1fMB（总 payload %zuMB，已写进内核 %.0fMB）\n",
+                 kN, kRepeat, kPayload >> 20, static_cast<double>(growth) / (1 << 20), total_backlog >> 20,
+                 static_cast<double>(last) / (1 << 20));
+    CHECK(growth < (32u << 20)); // 预期 ≈ 连接数 × 64KB 层内预算 + 帧结构 ≈ 几 MB；"每连接一份密文"会超过 200MB
+    clients.clear();
+#endif
+}
+
 // 很多连接同时握手、收发、断开（服务端 2 个 IO 线程）。
 void TestManyConcurrentConnections()
 {
@@ -794,6 +865,7 @@ int main()
     RUN(TestCrossThreadSendOverTls);
     RUN(TestBatchedSendsOverTls);
     RUN(TestBatchWithOversizePayloadOverTls);
+    RUN(TestBroadcastBacklogMemoryIsBounded);
     RUN(TestManyConcurrentConnections);
     RUN(TestCertificateReload);
     RUN(TestInteropOpenSslClient);
