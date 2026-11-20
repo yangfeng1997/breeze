@@ -30,7 +30,7 @@
 #include "base/net/agent/envelope.h"
 #include "base/net/agent/route_table.h"
 #include "base/net/connection/connection_handler_interface.h"
-#include "base/net/shm/shm_channel_server.h"
+#include "base/net/agent/shm/shm_channel_server.h"
 
 namespace breeze::agent
 {

@@ -49,14 +49,15 @@ PUBLIC_HEADERS = {
     NET + "stream/reconnect_policy.h",
     NET + "stream/stream_client.h",
     NET + "stream/stream_server.h",
-    # agent/、shm/：Sidecar 的同机通道。信封与路由表是业务要直接用的（构造信封、给 Agent 配路由）；
-    # AgentClientOptions 里的传输方式枚举在 shm_protocol.h；其余（通道服务端 / 客户端、ShmConnection、路由器实现）是内部件
+    # agent/：Sidecar 的同机通道。信封与路由表是业务要直接用的（构造信封、给 Agent 配路由）；
+    # AgentClientOptions 里的传输方式枚举在 agent/shm/shm_protocol.h；其余（通道服务端 / 客户端、ShmConnection、路由器实现）是内部件。
+    # agent/shm/ 是 Agent 的传输层（breeze_net_shm），与信封 / 路由（breeze_net_agent）分两个库。
     NET + "agent/agent_client.h",
     NET + "agent/agent_router.h",
     NET + "agent/agent_server.h",
     NET + "agent/envelope.h",
     NET + "agent/route_table.h",
-    NET + "shm/shm_protocol.h",
+    NET + "agent/shm/shm_protocol.h",
     # tcp/、uds/、rudp/：端点、选项、服务端、客户端
     NET + "tcp/tcp_client.h",
     NET + "tcp/tcp_endpoint.h",

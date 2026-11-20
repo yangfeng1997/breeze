@@ -535,17 +535,19 @@ if(BREEZE_BUILD_NET)
   target_compile_options(breeze_net_rudp PRIVATE -Wall -Wextra)
   breeze_apply_log_level(breeze_net_rudp)
 
-  # 共享内存通道的握手与服务端 / 客户端（base/shm 的网络一侧，设计见 docs/共享内存IPC设计.md §6.1）：单独一个库，
-  # 不用共享内存的使用方（只用 TCP / UDS）不背这个依赖。UDS 传 fd 的封装（stream/internal/fd_passing）是通用的，在 breeze_net 里。
+  # 共享内存通道的握手与服务端 / 客户端（base/shm 的网络一侧，放在 agent/shm/，设计见 docs/共享内存IPC设计.md §6.1）：
+  # 单独一个库，不用共享内存的使用方（只用 TCP / UDS）不背这个依赖。
+  # UDS 传 fd 的封装（stream/internal/fd_passing）是通用的，在 breeze_net 里。
   add_library(breeze_net_shm
-    ${NET_DIR}/shm/shm_protocol.cpp
-    ${NET_DIR}/shm/shm_channel_server.cpp
-    ${NET_DIR}/shm/shm_channel_client.cpp)
+    ${NET_DIR}/agent/shm/shm_protocol.cpp
+    ${NET_DIR}/agent/shm/shm_channel_server.cpp
+    ${NET_DIR}/agent/shm/shm_channel_client.cpp)
   target_link_libraries(breeze_net_shm PUBLIC breeze_net breeze_shm PRIVATE breeze_logger)
   target_compile_options(breeze_net_shm PRIVATE -Wall -Wextra)
   breeze_apply_log_level(breeze_net_shm)
 
   # Agent 的消息信封、路由表与路由器（设计见 docs/共享内存IPC设计.md §4 / §10）。
+  # 传输层（握手、ShmChannelServer / ShmChannelClient）在同目录的 shm/ 下，单独编成 breeze_net_shm。
   add_library(breeze_net_agent
     ${NET_DIR}/agent/envelope.cpp
     ${NET_DIR}/agent/route_table.cpp
@@ -891,7 +893,7 @@ if(BREEZE_BUILD_NET)
 
   # 共享内存通道的握手与服务端 / 客户端。fd_passing_test 测通用的 UDS 传 fd（在 breeze_net 里）。
   breeze_net_test(fd_passing_test DIR stream/internal)
-  breeze_net_test(shm_protocol_test DIR shm LIB breeze_net_shm)
+  breeze_net_test(shm_protocol_test DIR agent/shm LIB breeze_net_shm)
   breeze_net_test(shm_channel_test DIR testing LIB breeze_net_shm)
   breeze_net_test(shm_retention_test DIR testing LIB breeze_net_shm)
   breeze_net_test(envelope_test DIR agent LIB breeze_net_agent)

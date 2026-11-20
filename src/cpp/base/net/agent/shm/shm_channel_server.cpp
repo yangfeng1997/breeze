@@ -1,4 +1,4 @@
-#include "base/net/shm/shm_channel_server.h"
+#include "base/net/agent/shm/shm_channel_server.h"
 
 #include <sys/epoll.h>
 #include <sys/socket.h>
@@ -19,7 +19,7 @@
 #include "base/logger/logger.h"
 #include "base/logger/logger_macros.h"
 #include "base/net/loop/group_access.h"
-#include "base/net/shm/shm_protocol.h"
+#include "base/net/agent/shm/shm_protocol.h"
 #include "base/net/stream/internal/acceptor.h"
 #include "base/net/stream/internal/fd_passing.h"
 #include "base/net/stream/internal/stream_connection.h"

@@ -1,4 +1,4 @@
-#include "base/net/shm/shm_channel_client.h"
+#include "base/net/agent/shm/shm_channel_client.h"
 
 #include <poll.h>
 #include <sys/socket.h>
@@ -16,7 +16,7 @@
 #include <type_traits>
 #include <utility>
 
-#include "base/net/shm/shm_protocol.h"
+#include "base/net/agent/shm/shm_protocol.h"
 #include "base/net/stream/internal/fd_passing.h"
 #include "base/net/stream/internal/stream_socket.h"
 

@@ -18,7 +18,7 @@
 #include "base/net/connection/net_server_interface.h"
 #include "base/net/endpoint/endpoint.h"
 #include "base/net/loop/event_loop_group.h"
-#include "base/net/shm/shm_channel_server.h"
+#include "base/net/agent/shm/shm_channel_server.h"
 
 namespace breeze::agent
 {

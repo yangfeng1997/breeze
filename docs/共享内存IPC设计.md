@@ -196,7 +196,7 @@ Agent ── Accept{ resumed, app_epoch, agent_epoch, 两条环的容量与偏�
 Agent ── Reject{ 原因 } ──▶ App
 ```
 
-**实现（线格式 v2，`base/net/shm/shm_protocol.h`）**：Accept 与 Reject 合成一条定长的 `Reply`（80 字节）：`result == 0` 即 Accept；Attach 新建 / 恢复时随这条消息用
+**实现（线格式 v2，`base/net/agent/shm/shm_protocol.h`）**：Accept 与 Reject 合成一条定长的 `Reply`（80 字节）：`result == 0` 即 Accept；Attach 新建 / 恢复时随这条消息用
 `SCM_RIGHTS` 附上 `[memfd, tx_efd, rx_efd]`，Reattach 的 Accept 不带 fd（App 手里本来就有）；否则 `result` 是 errno（Reject），不带 fd。Hello 是 112 字节，
 握手之后 App → Agent 还有 16 字节的定长 `Control`（§6.6）。两端同机，结构按本机字节序与布局直接收发，头里有魔数（字节序列 `BSHM`）与版本，改了任何字段就升版本（现在是 2）。
 `busid` 是定长 64 字节的字符串，字符集 `[A-Za-z0-9._:@-]`、1 到 63 个字符。
@@ -619,8 +619,8 @@ UDS / 链路的帧没有入队时刻，排队时间记 0）→ `PatchForForward`
 `shm_mirror_map`（镜像映射）、`shm_ring`（`RingProducer` / `RingConsumer`：批量发布与释放、`inflight` 标记与崩溃接手、睡眠协议）、
 `shm_channel`（`ShmChannel::Create` / `Attach`，含对端 fd 的全套校验）；CMake 目标 `breeze_shm`，只在 Linux 构建。
 `src/cpp/base/net/` 里新增：`stream/internal/fd_passing`（UDS 上 `SCM_RIGHTS` 传 fd 的通用封装，在 `breeze_net` 里）、
-`shm/shm_protocol`（握手线格式）、`shm/shm_channel_server`（`ShmChannelServer`：Agent 一侧，握手 + 准入 + 配额 + 探活 + 替调用方跑 Tx 环的唤醒协议）、
-`shm/shm_channel_client`（`ShmChannelClient`：App 一侧，阻塞的 `Connect` + `liveness_fd()` / `AgentGone()`）；CMake 目标 `breeze_net_shm`（单独一个库，照 rudp 的先例）。
+`agent/shm/shm_protocol`（握手线格式）、`agent/shm/shm_channel_server`（`ShmChannelServer`：Agent 一侧，握手 + 准入 + 配额 + 探活 + 替调用方跑 Tx 环的唤醒协议）、
+`agent/shm/shm_channel_client`（`ShmChannelClient`：App 一侧，阻塞的 `Connect` + `liveness_fd()` / `AgentGone()`）；CMake 目标 `breeze_net_shm`（单独一个库，照 rudp 的先例）。
 **范围**：`Attach`（新建 / 保留期内恢复 / `discard_retained` 重建）、`Reattach`、保留计时器与 `Detached`、控制消息 `PrepareRestart` / `Bye`、`Superseded()` 都已实现（§6.2 / §6.5 / §6.6）；
 `ShmChannelServer` 的全部通道、握手与回调都在 accept 所在的那一个 loop 上（容量上限是一个 IO 线程）。
 
@@ -640,7 +640,7 @@ include 在 main 分支上目前是与同目录其它库一致的扁平写法；
 
 - **`base/shm/`（新）**：纯数据结构，**不依赖 `EventLoop`**——memfd 封装（含封印）、镜像映射、单向 SPSC 环、通道头与控制块、唤醒协议里的睡眠标志与 eventfd 的收发。eventfd 的 fd 暴露出来，谁的事件循环都能挂。
 - **UDS 传 fd**（已实现）：`sendmsg` / `recvmsg` + `SCM_RIGHTS` 的小封装。`IConnection` 带不了 fd，所以握手用 `Acceptor` 接出裸 fd，自己管会话，不走 `IConnection`。
-- **`ShmChannelServer` / `ShmChannelClient`（已实现，放在 `base/net/shm/`，库 `breeze_net_shm`）**：握手、传输协商、通道状态机、保留计时器、控制消息（§6.6）、接入 `EventLoop`。因为依赖 `EventLoop` 与 UDS，更靠近 `base/net`。不起额外线程（§6.6 的控制线程只有做 `Probe` / `Abort` 时才需要）。
+- **`ShmChannelServer` / `ShmChannelClient`（已实现，放在 `base/net/agent/shm/`，库 `breeze_net_shm`）**：握手、传输协商、通道状态机、保留计时器、控制消息（§6.6）、接入 `EventLoop`。因为依赖 `EventLoop` 与 UDS，更靠近 `base/net`。不起额外线程（§6.6 的控制线程只有做 `Probe` / `Abort` 时才需要）。
 - **分层**：遵守 `tools/check_includes.py` 的规则（`base/` 不能依赖 `framework/`）；include 从 `src/cpp` 起算。
 - **与 `framework/app` / `framework/net` 的关系**：**已经接进 `NetModule`**（`AddAgentClient` / `AddAgentServer`）：App 侧 Rx 的 eventfd 挂在 `NetModule` 的 IO 线程上，消息经 `MainLoopExecutor` 回投主循环，业务看到的是一条普通的 `IConnection`（§11）；
   没有走"让主循环线程直接当 Tx 环的生产者 / Rx 环的消费者"的路——那样 App → Agent 能少一次线程切换，但要把共享内存的唤醒挂进主循环、业务线程之外的发送也得汇到主循环，改动面大，等有基准证明值得再做。`framework/app` 的自检线程（§6.4）仍然没有。

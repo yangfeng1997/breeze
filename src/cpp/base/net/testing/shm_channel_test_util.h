@@ -30,9 +30,9 @@
 #include <vector>
 
 #include "base/net/loop/group_access.h"
-#include "base/net/shm/shm_channel_client.h"
-#include "base/net/shm/shm_channel_server.h"
-#include "base/net/shm/shm_protocol.h"
+#include "base/net/agent/shm/shm_channel_client.h"
+#include "base/net/agent/shm/shm_channel_server.h"
+#include "base/net/agent/shm/shm_protocol.h"
 #include "base/net/stream/internal/fd_passing.h"
 #include "base/net/testing/net_test_util.h"
 #include "base/shm/shm_memfd.h"

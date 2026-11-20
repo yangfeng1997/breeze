@@ -40,7 +40,7 @@
 #include "base/net/endpoint/endpoint.h"
 #include "base/net/endpoint/peer_info.h"
 #include "base/net/loop/event_loop_group.h"
-#include "base/net/shm/shm_protocol.h"
+#include "base/net/agent/shm/shm_protocol.h"
 #include "base/shm/shm_channel.h"
 #include "base/shm/shm_defs.h"
 #include "base/shm/shm_ring.h"

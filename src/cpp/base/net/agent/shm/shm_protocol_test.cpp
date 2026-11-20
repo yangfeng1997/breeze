@@ -1,7 +1,7 @@
 // 握手线格式：通道名规则、Hello 的校验、Reply 头的校验。
 // 无测试框架依赖：失败即 abort。
 
-#include "base/net/shm/shm_protocol.h"
+#include "base/net/agent/shm/shm_protocol.h"
 
 #include <cerrno>
 #include <cstdio>

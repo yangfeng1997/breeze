@@ -37,7 +37,7 @@
 #include "base/net/connection/net_client_interface.h"
 #include "base/net/endpoint/endpoint.h"
 #include "base/net/loop/event_loop_group.h"
-#include "base/net/shm/shm_protocol.h"
+#include "base/net/agent/shm/shm_protocol.h"
 #include "base/net/stream/reconnect_policy.h"
 #include "base/shm/shm_channel.h"
 
