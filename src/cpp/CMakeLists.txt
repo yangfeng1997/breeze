@@ -1069,6 +1069,13 @@ if(BREEZE_BUILD_BENCH AND BREEZE_BUILD_NET)
 
   add_executable(net_bench bench/net_bench.cpp)
   target_link_libraries(net_bench PRIVATE breeze_net breeze_net_rudp breeze_net_module breeze_logger muduo_bench)
+  # tls / ws / wss 传输：证书在进程内现造（testing/tls_test_util.h 用 BoringSSL），所以 bench 也链 OpenSSL。
+  if(BREEZE_BUILD_NET_TLS)
+    target_link_libraries(net_bench PRIVATE breeze_net_tls OpenSSL::SSL OpenSSL::Crypto)
+  else()
+    # 没有 TLS 的构建里 tls / ws / wss 走桩：编译时就去掉那三种传输（见 net_bench.cpp 的 BREEZE_BENCH_SECURE）。
+    target_compile_definitions(net_bench PRIVATE BREEZE_BENCH_NO_TLS=1)
+  endif()
   target_compile_definitions(net_bench PRIVATE BREEZE_BENCH_MUDUO=1)
   target_compile_options(net_bench PRIVATE -Wall -Wextra)
 endif()

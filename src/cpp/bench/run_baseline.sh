@@ -3,6 +3,7 @@
 #   tcp：raw / muduo / breeze / breeze-fixed / breeze-mainloop；uds：raw / breeze / breeze-fixed / breeze-mainloop；
 #   udp：raw-udp（裸 UDP 回显，UDP 的上限）/ rudp（本库，flush_on_send）/ rudp-mainloop（同 rudp，经主循环）/ rudp-batched（本库默认的批量配置）。
 # TRANSPORTS 选传输（默认 "tcp uds udp"）；udp 与 tcp 都跑时，汇总里多一张 TCP 与 UDP 的对照表。
+# tls / ws / wss 只有 breeze 一个实现（需要 BREEZE_BUILD_NET_TLS=ON），例：TRANSPORTS="tls wss" bench/run_baseline.sh
 # 主矩阵之外还有一组"会话多、活跃少"（SCALE=1，默认开）：10000 条连接已建立、只有 64 条 ping-pong，
 # 测空闲会话对活跃连接的拖累（rudp 每 10ms 一拍的定时器要走遍所有会话，TCP 的空闲连接不占 CPU）。
 # UDP 没有背压：连接数一多，服务端接收缓冲（内核封顶约 416KB）装不下，多出来的请求被丢、靠重传补，
@@ -32,6 +33,7 @@ impls_for() {
     tcp) echo raw muduo breeze breeze-fixed breeze-mainloop ;;
     uds) echo raw breeze breeze-fixed breeze-mainloop ;;
     udp) echo raw-udp rudp rudp-mainloop rudp-batched ;;
+    tls|ws|wss) echo breeze ;;
   esac
 }
 
@@ -93,9 +95,12 @@ SPECS = {
     "tcp": (["raw", "muduo", "breeze", "breeze-fixed", "breeze-mainloop"], "raw", "breeze"),
     "uds": (["raw", "breeze", "breeze-fixed", "breeze-mainloop"], "raw", "breeze"),
     "udp": (["raw-udp", "rudp", "rudp-mainloop", "rudp-batched"], "raw-udp", "rudp"),
+    "tls": (["breeze"], "breeze", "breeze"),
+    "ws": (["breeze"], "breeze", "breeze"),
+    "wss": (["breeze"], "breeze", "breeze"),
 }
 present = {k[0] for k in rows}
-for transport in ("tcp", "uds", "udp"):
+for transport in ("tcp", "uds", "udp", "tls", "ws", "wss"):
     if transport not in present:
         continue
     impls, base_impl, cpu_impl = SPECS[transport]
