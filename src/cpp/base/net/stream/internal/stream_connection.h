@@ -159,6 +159,11 @@ protected:
 
     // 从 data 开头起把能解的帧都解出来，返回消耗的字节数。data 必须是连接自己的可写缓冲（codec 会在原地改写完整帧）。
     std::size_t DecodeAll(std::span<std::byte> data);
+    // DecodeAll 的 always_inline 版本，定义在 stream_connection.cpp，只有那里的 PlainStreamConnection::HandleRead 用
+    // （明文读路径不多一次调用；见定义处的说明）。别的编译单元用上面的 DecodeAll。
+    [[gnu::always_inline]] inline std::size_t DecodeAllInline(std::span<std::byte> data);
+    // codec 返回的 Consumed 没有推进（used 为 0 或超出）：记日志并按协议错误关闭。冷路径，见 DecodeAll 里的说明。
+    void CloseOnBadConsumed(std::size_t used, std::size_t avail);
     void SetWriteInterest(bool want);
     void ApplyInterest();
     void ShutdownWrite();
@@ -184,6 +189,7 @@ protected:
         void HandshakeDone() override { c_.HandshakeSourceDone(Flag::CodecHandshaking); }
         void CloseAfterFlush(CloseReason reason, int code) override { c_.CloseAfterFlush(reason, code); }
         void SetContext(std::unique_ptr<ConnectionContext> ctx) override { c_.SetContext(std::move(ctx)); }
+        const PeerInfo& peer() const noexcept override { return c_.peer_; }
 
     private:
         StreamConnection& c_;

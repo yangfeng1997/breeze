@@ -490,6 +490,9 @@ if(BREEZE_BUILD_NET)
   add_library(breeze_net
     ${NET_DIR}/endpoint/endpoint.cpp
     ${NET_DIR}/codec/length_prefix_codec.cpp
+    ${NET_DIR}/ws/ws_codec.cpp
+    ${NET_DIR}/ws/internal/http_upgrade.cpp
+    ${NET_DIR}/ws/internal/ws_frame.cpp
     ${NET_DIR}/connection/connection_handle.cpp
     ${NET_DIR}/loop/event_loop_group.cpp
     ${NET_DIR}/loop/connection_table.cpp
@@ -518,7 +521,9 @@ if(BREEZE_BUILD_NET)
     ${NET_DIR}/rudp/rudp_endpoint.cpp)
   # breeze_queue 是 PUBLIC：event_loop.h 里有 MpscQueue；breeze_buffer 同理：公开头里有 SharedBuffer / Buffer；
   # breeze_thread：event_loop_thread.h 里有 Thread，测试与 bench 要用。
-  target_link_libraries(breeze_net PUBLIC Threads::Threads breeze_queue breeze_buffer breeze_thread PRIVATE breeze_logger)
+  # breeze_string / breeze_random / breeze_hash：WebSocket 的 UTF-8 / base64 / 掩码键 / SHA-1，不出现在公开头里。
+  target_link_libraries(breeze_net PUBLIC Threads::Threads breeze_queue breeze_buffer breeze_thread
+                        PRIVATE breeze_logger breeze_string breeze_random breeze_hash)
   target_compile_options(breeze_net PRIVATE -Wall -Wextra)
   breeze_apply_log_level(breeze_net)
 
@@ -780,6 +785,22 @@ target_link_libraries(string_util_test PRIVATE breeze_string)
 target_compile_options(string_util_test PRIVATE -Wall -Wextra)
 add_test(NAME string_util_test COMMAND string_util_test)
 
+add_executable(utf8_test ${STRING_DIR}/utf8_test.cpp)
+target_link_libraries(utf8_test PRIVATE breeze_string)
+target_compile_options(utf8_test PRIVATE -Wall -Wextra)
+add_test(NAME utf8_test COMMAND utf8_test)
+
+add_executable(sha1_test ${HASH_DIR}/sha1_test.cpp)
+target_link_libraries(sha1_test PRIVATE breeze_hash)
+target_compile_options(sha1_test PRIVATE -Wall -Wextra)
+add_test(NAME sha1_test COMMAND sha1_test)
+
+# base64 的测试里用 SHA-1 复算 RFC 6455 的握手例子，所以多链 breeze_hash。
+add_executable(base64_test ${STRING_DIR}/base64_test.cpp)
+target_link_libraries(base64_test PRIVATE breeze_string breeze_hash)
+target_compile_options(base64_test PRIVATE -Wall -Wextra)
+add_test(NAME base64_test COMMAND base64_test)
+
 add_executable(buffer_test ${BUFFER_DIR}/buffer_test.cpp)
 target_link_libraries(buffer_test PRIVATE breeze_buffer)
 target_compile_options(buffer_test PRIVATE -Wall -Wextra)
@@ -862,6 +883,10 @@ if(BREEZE_BUILD_NET)
 
   breeze_net_test(endpoint_test DIR endpoint)
   breeze_net_test(codec_test DIR codec)
+  breeze_net_test(ws_codec_test DIR ws)
+  breeze_net_test(ws_server_test DIR ws)
+  breeze_net_test(ws_frame_test DIR ws/internal)
+  breeze_net_test(http_upgrade_test DIR ws/internal)
   breeze_net_test(unique_fd_test DIR socket)
   breeze_net_test(event_loop_test DIR loop)
   breeze_net_test(connection_table_test DIR loop)

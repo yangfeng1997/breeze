@@ -295,8 +295,16 @@ void PlainStreamConnection::OnEvents(std::uint32_t events)
 
 // ---- 读：水平触发，每次就绪只 read 一次 ----
 
+[[gnu::cold]] [[gnu::noinline]] void StreamConnection::CloseOnBadConsumed(std::size_t used, std::size_t avail)
+{
+    LOG_ERROR("codec 返回 Consumed 但 used={}（可用 {}），关闭连接", used, avail);
+    CloseWith(CloseReason::ProtocolError, 0);
+}
+
 // 从 data 开头起把能解的帧都解出来，返回消耗的字节数。一次解一帧：两帧之间要检查连接是否已经在回调里被关闭。
-std::size_t StreamConnection::DecodeAll(std::span<std::byte> data)
+// always_inline：明文读路径（PlainStreamConnection::HandleRead）要把它摊开在自己里面，不多一次调用。不靠编译器的启发式——
+// 它在 Consumed 分支加了几条指令之后就不再内联了（反汇编对比抓到的）。分层连接在另一个编译单元，走下面的 DecodeAll 包装。
+[[gnu::always_inline]] inline std::size_t StreamConnection::DecodeAllInline(std::span<std::byte> data)
 {
     std::size_t total = 0;
     std::uint64_t messages = 0;
@@ -316,6 +324,15 @@ std::size_t StreamConnection::DecodeAll(std::span<std::byte> data)
         }
         if (r == DecodeResult::Consumed)
         {
+            // Consumed 必须推进：used == 0 会让这个循环永远转下去，卡死整条 IO 线程。codec 违约就当协议错误。
+            // 处理放在 cold + noinline 的小函数里（日志格式化不进热函数）。
+            // 一次比较同时判 used == 0 与 used 超出：used - 1 无符号回绕，0 变成最大值。
+            const std::size_t avail = data.size() - total;
+            if (used - 1 >= avail) [[unlikely]]
+            {
+                CloseOnBadConsumed(used, avail);
+                break;
+            }
             total += used; // 握手 / 控制帧 / 非末尾分片：消耗了字节但没有消息，不计数
             continue;
         }
@@ -326,6 +343,8 @@ std::size_t StreamConnection::DecodeAll(std::span<std::byte> data)
     LoopStats::Bump(loop_.stats().messages_in, messages); // 每次 read 记一次，不是每条消息一次
     return total;
 }
+
+std::size_t StreamConnection::DecodeAll(std::span<std::byte> data) { return DecodeAllInline(data); }
 
 void PlainStreamConnection::HandleRead()
 {
@@ -357,7 +376,7 @@ void PlainStreamConnection::HandleRead()
     if (in_.ReadableBytes() == 0)
     {
         // 常见路径：没有遗留的半帧，直接从线程本地缓冲分帧，不碰每连接的缓冲；只有尾部的半个帧才拷进去。
-        const std::size_t used = DecodeAll(fresh);
+        const std::size_t used = DecodeAllInline(fresh);
         if (used < fresh.size() && state_ != State::Disconnected)
             in_.Append(fresh.subspan(used));
         return;
@@ -365,7 +384,7 @@ void PlainStreamConnection::HandleRead()
 
     // 上次留下了半个帧：拼上新数据再解。回调看到的视图在 in_ 里，回调期间 in_ 不会被改动（Send 不碰它）。
     in_.Append(fresh);
-    in_.Consume(DecodeAll(in_.ReadableMut()));
+    in_.Consume(DecodeAllInline(in_.ReadableMut()));
     if (in_.ReadableBytes() == 0 && in_.Capacity() > kShrinkAbove)
         in_.ShrinkIfEmpty(0);
 }

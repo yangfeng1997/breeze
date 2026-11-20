@@ -13,6 +13,7 @@
 
 #include "base/net/connection/connection_context.h"
 #include "base/net/connection/connection_handler_interface.h"
+#include "base/net/endpoint/peer_info.h"
 
 namespace breeze
 {
@@ -37,6 +38,9 @@ public:
 
     // 给连接装上每连接用户数据（语义同 IConnection::SetContext）。例：WebSocket 升级回调的产物。
     virtual void SetContext(std::unique_ptr<ConnectionContext> ctx) = 0;
+
+    // 对端信息（与 IConnection::peer 同一份）。例：WebSocket 升级回调要据此做按 IP 的拒绝；客户端没填 Host 时取对端地址。
+    virtual const PeerInfo& peer() const noexcept = 0;
 };
 
 } // namespace breeze

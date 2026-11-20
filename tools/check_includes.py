@@ -43,6 +43,9 @@ PUBLIC_HEADERS = {
     NET + "codec/codec_host_interface.h",
     NET + "codec/frame_codec_interface.h",
     NET + "codec/length_prefix_codec.h",
+    # ws/：WebSocket 的 codec 工厂与选项（internal/ 是实现，不公开）
+    NET + "ws/ws_codec.h",
+    NET + "ws/ws_options.h",
     # loop/：EventLoopGroup 与统计（EventLoop 本身不是公开类型）
     NET + "loop/event_loop_group.h",
     NET + "loop/net_stats.h",
