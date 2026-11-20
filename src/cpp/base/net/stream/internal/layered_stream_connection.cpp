@@ -109,12 +109,35 @@ void LayeredStreamConnection::HandleLayerStatus(LayerStatus st)
                 HandleWrite();
             return;
         case LayerStatus::PeerShutdown:
-            CloseWith(PeerCloseReason(), 0); // 对端发来了关闭通知：与读到 EOF 同样处理
+            // 对端发来了关闭通知（TLS 的 close_notify）：按 RFC 回一个自己的再关，对端据此知道是正常结束而不是被截断；
+            // 之后与读到 EOF 同样处理。
+            (void)layer_->Shutdown();
+            FlushWireBestEffort();
+            CloseWith(PeerCloseReason(), 0);
             return;
         case LayerStatus::Error:
             LOG_DEBUG("stream layer error {} code={}", handle_.ToString(), layer_->error_code());
+            // 层出错时往往已经在发送缓冲里放了 TLS 的致命 alert：尽力写出去再关，让对端知道为什么被拒，而不是只看到 EOF
+            // （对端据此给出 TlsError 而不是 PeerClosed，日志里也有原因）。
+            FlushWireBestEffort();
             CloseWith(CloseReason::TlsError, 0); // 层的底层错误码只进日志，不放进 sys_errno
             return;
+    }
+}
+
+// 关闭之前尽力把层里待发的字节写出去一次（TLS 的 alert / close_notify）：不排队、不等待、不因写失败再关一次。
+void LayeredStreamConnection::FlushWireBestEffort()
+{
+    while (state_ != State::Disconnected)
+    {
+        const std::span<const std::byte> wire = layer_->PendingWire();
+        if (wire.empty())
+            return;
+        const ssize_t n = ::send(fd_.get(), wire.data(), wire.size(), MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (n <= 0)
+            return;
+        LoopStats::Bump(loop_.stats().bytes_out, static_cast<std::uint64_t>(n));
+        layer_->ConsumeWire(static_cast<std::size_t>(n));
     }
 }
 

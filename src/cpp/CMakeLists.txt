@@ -541,6 +541,21 @@ if(BREEZE_BUILD_NET)
   target_compile_options(breeze_net_rudp PRIVATE -Wall -Wextra)
   breeze_apply_log_level(breeze_net_rudp)
 
+  # TLS（BoringSSL）单独一个库：BoringSSL 只在这里 PRIVATE 链接，不用 TLS 的使用方不背这个依赖；breeze_net 里没有任何 TLS 类型，
+  # 它只认 IStreamLayer 接口（stream/stream_layer_interface.h）。公开头（tls_options.h / tls_context.h）也不含 openssl 的头文件。
+  # BREEZE_BUILD_NET_TLS=OFF 时整个库与它的测试都不建（vcpkg 里的 boringssl 仍会被装，拆成 feature 见方案 §2，P3 做）。
+  option(BREEZE_BUILD_NET_TLS "构建 breeze_net_tls（BoringSSL 实现的 TLS 层）" ON)
+  if(BREEZE_BUILD_NET_TLS)
+    find_package(OpenSSL CONFIG REQUIRED) # vcpkg 的 boringssl 提供 OpenSSL::SSL / OpenSSL::Crypto
+    add_library(breeze_net_tls
+      ${NET_DIR}/tls/tls_context.cpp
+      ${NET_DIR}/tls/internal/tls_layer.cpp
+      ${NET_DIR}/tls/internal/tls_bio.cpp)
+    target_link_libraries(breeze_net_tls PUBLIC breeze_net PRIVATE OpenSSL::SSL OpenSSL::Crypto breeze_logger)
+    target_compile_options(breeze_net_tls PRIVATE -Wall -Wextra)
+    breeze_apply_log_level(breeze_net_tls)
+  endif()
+
   # 共享内存通道的握手与服务端 / 客户端（base/shm 的网络一侧，放在 agent/shm/，设计见 docs/共享内存IPC设计.md §6.1）：
   # 单独一个库，不用共享内存的使用方（只用 TCP / UDS）不背这个依赖。
   # UDS 传 fd 的封装（stream/internal/fd_passing）是通用的，在 breeze_net 里。
@@ -885,6 +900,15 @@ if(BREEZE_BUILD_NET)
   breeze_net_test(codec_test DIR codec)
   breeze_net_test(ws_codec_test DIR ws)
   breeze_net_test(ws_server_test DIR ws)
+
+  # TLS 的测试：直接用 BoringSSL 造测试证书（testing/tls_test_util.h），所以测试自己也链 OpenSSL::SSL / Crypto。
+  if(BREEZE_BUILD_NET_TLS)
+    breeze_net_test(tls_layer_test DIR tls/internal LIB breeze_net_tls)
+    breeze_net_test(tls_stream_test DIR tls LIB breeze_net_tls)
+    foreach(t tls_layer_test tls_stream_test)
+      target_link_libraries(${t} PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    endforeach()
+  endif()
 
   # libFuzzer 目标（默认不构建，需要 clang）：-DBREEZE_BUILD_FUZZ=ON，并用 -DBREEZE_SANITIZE=fuzzer-no-link,address,undefined
   # 配置整个构建，让被测的库代码也被插桩；目标本身链 -fsanitize=fuzzer（自带 main）。用法见各文件头注释。

@@ -43,6 +43,9 @@ PUBLIC_HEADERS = {
     NET + "codec/codec_host_interface.h",
     NET + "codec/frame_codec_interface.h",
     NET + "codec/length_prefix_codec.h",
+    # tls/：TLS 的上下文与选项（internal/ 是实现，不公开；公开头里没有 openssl 的头文件）
+    NET + "tls/tls_context.h",
+    NET + "tls/tls_options.h",
     # ws/：WebSocket 的 codec 工厂与选项（internal/ 是实现，不公开）
     NET + "ws/ws_codec.h",
     NET + "ws/ws_options.h",

@@ -64,6 +64,8 @@ private:
     void EncryptQueued();
     // 把层里的待发字节写进 socket；写不完就注册 EPOLLOUT。
     void FlushWire();
+    // 关闭之前尽力写一次（层出错时的致命 alert、对端 close_notify 的回应）：写不出去就算了，不排队、不注册 EPOLLOUT。
+    void FlushWireBestEffort();
 
     std::unique_ptr<IStreamLayer> layer_;
     const bool encodes_payload_;
