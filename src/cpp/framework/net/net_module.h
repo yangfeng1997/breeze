@@ -75,7 +75,7 @@ struct NetModuleOptions
     // ---- tls:// / wss:// ----
     // 证书路径来自 net.tls（也可在代码里直接给）。Init 时按它建一次上下文：cert_chain_file 非空建服务端上下文，
     // server_name 非空建客户端上下文；建失败 Init 就失败。端点用了 TLS 却没有对应上下文，AddServer / AddClient 就报错。
-    TlsSetup tls;
+    TlsCredentialsOptions tls;
     // ---- ws:// / wss:// ----
     // 帧选项；端点的路径（"ws://host:port/game" 里的 /game）覆盖 ws_server.path / ws_client.path。
     WsServerOptions ws_server;

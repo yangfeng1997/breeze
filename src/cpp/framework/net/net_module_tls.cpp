@@ -9,7 +9,7 @@ namespace breeze
 namespace
 {
 
-std::shared_ptr<const TlsContext> BuildServer(const TlsSetup& s, std::string& error)
+std::shared_ptr<const TlsContext> BuildServer(const TlsCredentialsOptions& s, std::string& error)
 {
     TlsServerOptions o;
     o.cert_chain.file = s.cert_chain_file;
@@ -21,7 +21,7 @@ std::shared_ptr<const TlsContext> BuildServer(const TlsSetup& s, std::string& er
     return TlsContext::CreateServer(o, error);
 }
 
-std::shared_ptr<const TlsContext> BuildClient(const TlsSetup& s, std::string& error)
+std::shared_ptr<const TlsContext> BuildClient(const TlsCredentialsOptions& s, std::string& error)
 {
     TlsClientOptions o;
     o.server_name = s.server_name;
@@ -36,7 +36,7 @@ std::shared_ptr<const TlsContext> BuildClient(const TlsSetup& s, std::string& er
 class Reloadable final : public ReloadableTlsLayer
 {
 public:
-    using Build = std::shared_ptr<const TlsContext> (*)(const TlsSetup&, std::string&);
+    using Build = std::shared_ptr<const TlsContext> (*)(const TlsCredentialsOptions&, std::string&);
 
     Reloadable(std::shared_ptr<const TlsContext> initial, Build build)
         : holder_(std::move(initial))
@@ -46,7 +46,7 @@ public:
 
     std::unique_ptr<IStreamLayer> Create(LayerRole role) const override { return holder_.Create(role); }
 
-    bool Reload(const TlsSetup& setup, std::string& error) override
+    bool Reload(const TlsCredentialsOptions& setup, std::string& error) override
     {
         auto next = build_(setup, error);
         if (!next)
@@ -64,13 +64,13 @@ private:
 
 bool NetModuleHasTls() { return true; }
 
-std::shared_ptr<ReloadableTlsLayer> MakeTlsServerLayer(const TlsSetup& s, std::string& error)
+std::shared_ptr<ReloadableTlsLayer> MakeTlsServerLayer(const TlsCredentialsOptions& s, std::string& error)
 {
     auto ctx = BuildServer(s, error);
     return ctx ? std::make_shared<Reloadable>(std::move(ctx), &BuildServer) : nullptr;
 }
 
-std::shared_ptr<ReloadableTlsLayer> MakeTlsClientLayer(const TlsSetup& s, std::string& error)
+std::shared_ptr<ReloadableTlsLayer> MakeTlsClientLayer(const TlsCredentialsOptions& s, std::string& error)
 {
     auto ctx = BuildClient(s, error);
     return ctx ? std::make_shared<Reloadable>(std::move(ctx), &BuildClient) : nullptr;

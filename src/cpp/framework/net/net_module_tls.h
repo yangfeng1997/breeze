@@ -18,7 +18,9 @@ namespace breeze
 {
 
 // 对应 config/schema/net.proto 的 TlsConfig（NetModule 负责搬运，不做别的解释）。
-struct TlsSetup
+// 名字对齐 gRPC 的 `grpc_tls_credentials_options`：这里是**用户面的凭据配置**（证书 / 私钥 / CA / 校验名），
+// 不是 SSL_CTX 本身；建上下文在 net_module_tls.cpp 里（只在链接了 breeze_net_tls 的构建里存在）。
+struct TlsCredentialsOptions
 {
     std::string cert_chain_file;
     std::string private_key_file;
@@ -34,14 +36,14 @@ struct TlsSetup
 class ReloadableTlsLayer : public IStreamLayerFactory
 {
 public:
-    virtual bool Reload(const TlsSetup& setup, std::string& error) = 0;
+    virtual bool Reload(const TlsCredentialsOptions& setup, std::string& error) = 0;
 };
 
 // 这个构建里有没有 TLS（BREEZE_BUILD_NET_TLS）。没有时 tls:// / wss:// 端点要在装配阶段就报错。
 bool NetModuleHasTls();
 
 // 失败返回空，error 是原因（文件打不开、证书与私钥不配对、verify_peer 却没有 server_name ……）。
-std::shared_ptr<ReloadableTlsLayer> MakeTlsServerLayer(const TlsSetup& setup, std::string& error);
-std::shared_ptr<ReloadableTlsLayer> MakeTlsClientLayer(const TlsSetup& setup, std::string& error);
+std::shared_ptr<ReloadableTlsLayer> MakeTlsServerLayer(const TlsCredentialsOptions& setup, std::string& error);
+std::shared_ptr<ReloadableTlsLayer> MakeTlsClientLayer(const TlsCredentialsOptions& setup, std::string& error);
 
 } // namespace breeze
