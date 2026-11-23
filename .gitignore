@@ -6,6 +6,9 @@
 # 生成代码（src/go/gen、src/cpp/gen）
 /src/*/gen/
 
+# Rust 构建产物；Cargo.lock 保留进版本库
+/src/rust/target/
+
 # Python 字节码（tools/configgen 的测试会产生）
 __pycache__/
 

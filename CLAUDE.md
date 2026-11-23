@@ -17,6 +17,7 @@ C++ 侧**格式化一律用 `fmt::format`**（`fmt` 是 vcpkg 直接依赖），
 - `src/go/server/*svr` — 服务进程，`main` 只做装配，实现放 `internal/`。
   `go.mod` 在 `src/go/`，import 路径不带 `src/go` 前缀（`project/core/app`）；
   Go 命令要在 `src/go/` 下跑，或用 `go -C src/go ...`
+- `src/rust` — Rust 侧，Cargo 项目；使用最新 stable 工具链与 Edition 2024，依赖 `redis`（Tokio 异步 Cluster）/ `etcd-client` / `tokio`。`Cargo.lock` 进版本库；构建产物在 `src/rust/target/`，不进版本库。环境与更新命令见 [src/rust/README.md](src/rust/README.md)。
 - `src/cpp` — C++ 侧，`CMakeLists.txt` 在此。**所有 `#include` 都从 `src/cpp` 起算**（`#include "base/net/endpoint/endpoint.h"`），`src/cpp` 是唯一的 include 根，各库不配自己的 include 目录，扁平名编译不过。目录不拦，**include 约定由 `tools/check_includes.py` 守着**（`includes_test`）：`base/` 不能 include `framework/`；net 之外的非测试代码只许 include net 的公开头清单（`PUBLIC_HEADERS`），新增公开头要加进清单。`framework/app` 对照 Go 版
   `src/go/core/app` 实现，语义以后者的 CLAUDE.md 为准。
   `base/queue` 是 SPSC/MPSC 无锁队列（包 moodycamel，公开 API 不暴露其类型），网络库的底座；**`PeakApprox` 是近似下界**（首次与每 1024 次批量出队才用 `size_approx` 采样，其余用取出条数，**别改成每次都采**：它要遍历生产者 / 全部块，随队列深度增长，会让消费者越慢越积压，对照实验见 [docs/Actor与线程模型设计.md](docs/Actor与线程模型设计.md) §9）；批量出队一次取 256 条左右最快，长寿生产线程要用 `ProducerToken`；
