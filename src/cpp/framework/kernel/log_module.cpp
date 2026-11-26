@@ -18,14 +18,15 @@ std::expected<void, Error> LogModule::Init()
     return {};
 }
 
-LogModule::~LogModule()
+LogModule::~LogModule() { Shutdown(); }
+
+void LogModule::Shutdown()
 {
     if (!logger_)
         return;
     Logger* mine = logger_.get();
     g_default_logger.compare_exchange_strong(mine, nullptr, std::memory_order_acq_rel);
-    // logger_ 随后析构，~Logger 会 Shutdown 排空队列。
-    // 等 Module 有了 Shutdown 阶段，这里改成：先撤销，再显式 logger_->Shutdown()。
+    logger_->Shutdown();
 }
 
 } // namespace breeze

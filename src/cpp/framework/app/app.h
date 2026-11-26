@@ -1,10 +1,6 @@
-// 服务进程骨架 App：模块注册 → 拓扑排序 → 启动编排 → 事件驱动主循环。
-// 对照 src/go/core/app，语义以其 CLAUDE.md 为准。
-//
-// **只管启动，不管停机**：没有 Stop/Shutdown、没有信号处理、启动失败不回滚。
-// Run 阻塞在调用方的 stop_token 上，token 结束即返回，之后的收尾全是调用方的事。
-//
-// 与 Go 版唯一的实质差别是析构 —— 见 ~App。
+// 服务进程骨架 App：模块注册 → 拓扑排序 → 启动 → 主循环 → Stop → Shutdown。
+// 启动与主循环对照 src/go/core/app；C++ 额外提供两段同步停机，见 Run。
+// 不处理信号，启动失败不回滚，析构不隐式调用生命周期。
 
 #pragma once
 
@@ -31,10 +27,19 @@ namespace breeze
 
 enum class Lifecycle : std::uint8_t
 {
-    New,     // 已创建，未 Build
-    Built,   // Build 完成
-    Inited,  // Init 完成
-    Started, // Start 完成 —— 终态
+    New,
+    Building,
+    Built,
+    Initializing,
+    Inited,
+    Starting,
+    Started,
+    Running,
+    Stopping,
+    Stopped,
+    ShuttingDown,
+    Shutdown,
+    Failed, // 启动失败，不可继续推进或重试；见 lifecycle.cpp
 };
 
 std::string_view ToString(Lifecycle s) noexcept;
@@ -57,8 +62,8 @@ public:
 
     const std::string& Name() const noexcept { return name_; }
 
-    // 进程级 token，Run 返回时（或 ~App，若从未 Run）才 request_stop —— 比模块的线程活得短。
-    // 只表示"进程正在退出"，不承载剩余时间，模块不得依赖它完成自身清理。
+    // Stop 调模块前发出；启动失败则在 Run 返回时发出，析构也会兜底发出。
+    // 只表示“进程正在退出”，不承载剩余时间；线程应在 Stop 中完成 join。
     std::stop_token StopToken() const noexcept { return stop_.get_token(); }
 
     // 登记模块工厂，调用顺序即注册序。Build 之后调用抛 std::logic_error（编程错误）。
@@ -80,9 +85,15 @@ public:
     std::expected<void, Error> Init();
     std::expected<void, Error> Start();
 
-    // Build → Init → Start → 主循环。返回错误只表示启动阶段失败，框架不做任何收尾。
-    // 主循环跑在**调用方线程**上，不另起线程：返回后 Tick/Wake 与调用方的收尾在时间上
-    // 不可能重叠，mu_ 的用法才不用改。
+    // 手动编排时在 Start 成功后调用，两段均幂等且按拓扑逆序；Shutdown 要求先 Stop。
+    // 生命周期方法只能在同一线程串行调用，不得从模块回调重入；运行中退出用 Run 的外部 token。
+    // 模块 Stop/Shutdown 不得抛异常。两段期间 GetModule 仍可用。
+    std::expected<void, Error> Stop();
+    std::expected<void, Error> Shutdown();
+
+    // Build → Init → Start → 主循环 → Stop → Shutdown，全程在调用方线程执行。
+    // 外部 token 结束后先退出主循环再同步收尾；启动失败不回滚，返回错误。
+    // 收尾期间不再 Tick/Wake，不提供异步排空或超时预算。
     std::expected<void, Error> Run(std::stop_token st);
 
 private:

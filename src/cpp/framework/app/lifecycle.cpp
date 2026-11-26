@@ -2,6 +2,7 @@
 // 启动阶段只有"往前走"一种状态推进，不维护逐模块账本；补偿代码只在失败时跑一次，
 // 永远缺真实执行路径，与其维护不如把"失败就退出"说清楚。
 
+#include "base/defer/defer.h"
 #include "base/logger/logger_macros.h"
 #include "framework/app/app.h"
 
@@ -31,15 +32,26 @@ std::expected<void, Error> App::Init()
         std::unique_lock lk(mu_);
         if (state_ != Lifecycle::Built)
             return StateErr("init", state_, Lifecycle::Built);
-        state_ = Lifecycle::Inited;
         mods = Snapshot(modules_);
+        state_ = Lifecycle::Initializing;
     }
+    const auto fail = MakeDefer(
+        [this]
+        {
+            std::unique_lock lk(mu_);
+            if (state_ == Lifecycle::Initializing)
+                state_ = Lifecycle::Failed;
+        });
 
     for (Module* m : mods)
     {
         if (auto r = m->Init(); !r)
             return ModuleErr("init", m->Name(), r.error());
         LOG_INFO("module inited app={} module={}", name_, m->Name());
+    }
+    {
+        std::unique_lock lk(mu_);
+        state_ = Lifecycle::Inited;
     }
     return {};
 }
@@ -53,15 +65,78 @@ std::expected<void, Error> App::Start()
         std::unique_lock lk(mu_);
         if (state_ != Lifecycle::Inited)
             return StateErr("start", state_, Lifecycle::Inited);
-        state_ = Lifecycle::Started;
         mods = Snapshot(modules_);
+        state_ = Lifecycle::Starting;
     }
+    const auto fail = MakeDefer(
+        [this]
+        {
+            std::unique_lock lk(mu_);
+            if (state_ == Lifecycle::Starting)
+                state_ = Lifecycle::Failed;
+        });
 
     for (Module* m : mods)
     {
         if (auto r = m->Start(); !r)
             return ModuleErr("start", m->Name(), r.error());
         LOG_INFO("module started app={} module={}", name_, m->Name());
+    }
+    {
+        std::unique_lock lk(mu_);
+        state_ = Lifecycle::Started;
+    }
+    return {};
+}
+
+std::expected<void, Error> App::Stop()
+{
+    std::vector<Module*> mods;
+    {
+        std::unique_lock lk(mu_);
+        if (state_ == Lifecycle::Stopped || state_ == Lifecycle::Shutdown)
+            return {};
+        if (state_ != Lifecycle::Started)
+            return StateErr("stop", state_, Lifecycle::Started);
+        mods = Snapshot(modules_);
+        state_ = Lifecycle::Stopping;
+    }
+
+    // 先广播再逐模块 join，避免依赖 token 的工作线程阻塞 Stop。
+    stop_.request_stop();
+    for (auto it = mods.rbegin(); it != mods.rend(); ++it)
+    {
+        (*it)->Stop();
+        LOG_INFO("module stopped app={} module={}", name_, (*it)->Name());
+    }
+    {
+        std::unique_lock lk(mu_);
+        state_ = Lifecycle::Stopped;
+    }
+    return {};
+}
+
+std::expected<void, Error> App::Shutdown()
+{
+    std::vector<Module*> mods;
+    {
+        std::unique_lock lk(mu_);
+        if (state_ == Lifecycle::Shutdown)
+            return {};
+        if (state_ != Lifecycle::Stopped)
+            return StateErr("shutdown", state_, Lifecycle::Stopped);
+        mods = Snapshot(modules_);
+        state_ = Lifecycle::ShuttingDown;
+    }
+
+    for (auto it = mods.rbegin(); it != mods.rend(); ++it)
+    {
+        (*it)->Shutdown();
+        LOG_INFO("module shutdown app={} module={}", name_, (*it)->Name());
+    }
+    {
+        std::unique_lock lk(mu_);
+        state_ = Lifecycle::Shutdown;
     }
     return {};
 }

@@ -188,17 +188,15 @@ private:
     const IFrameCodecFactory& f_;
 };
 
-// 在独立线程里跑 App::Run（它就是"主循环线程"），Run 返回之后在同一个线程上做收尾（NetModule::Shutdown 要求在这个线程上调用）。
+// Run 的线程同时完成主循环与停机，保证 SPSC 消费者不变。
 struct Runner
 {
-    explicit Runner(App& app, std::function<void()> epilogue = {})
+    explicit Runner(App& app)
         : thread(
-              [this, &app, epilogue = std::move(epilogue)]
+              [this, &app]
               {
                   tid.store(std::this_thread::get_id());
                   result = app.Run(stop.get_token());
-                  if (epilogue)
-                      epilogue();
                   done = true;
               })
     {
@@ -230,14 +228,7 @@ void TestAgentWithTwoApps()
 
     // Agent
     App agent_app("agent");
-    NetModule* agent_net = nullptr;
-    agent_app.RegisterModule(
-        [&](App& a)
-        {
-            auto m = std::make_unique<NetModule>(a, Options());
-            agent_net = m.get();
-            return m;
-        });
+    agent_app.RegisterModule([](App& a) { return std::make_unique<NetModule>(a, Options()); });
     AgentModule* am = nullptr;
     agent_app.RegisterModule(
         [&](App& a)
@@ -246,7 +237,7 @@ void TestAgentWithTwoApps()
             am = m.get();
             return m;
         });
-    Runner agent_run(agent_app, [&] { agent_net->Shutdown(); });
+    Runner agent_run(agent_app);
     CHECK(WaitUntil([&] { return am != nullptr && am->ready.load(); }));
 
     // App1：默认配置（启用共享内存）。App2：配置关掉共享内存，只用 UDS。
@@ -259,21 +250,8 @@ void TestAgentWithTwoApps()
     o2.agent.endpoint = agent_uri;
     o2.agent.shm_enabled = false;
     App app1("app1"), app2("app2");
-    NetModule *net1 = nullptr, *net2 = nullptr;
-    app1.RegisterModule(
-        [&](App& a)
-        {
-            auto m = std::make_unique<NetModule>(a, o1);
-            net1 = m.get();
-            return m;
-        });
-    app2.RegisterModule(
-        [&](App& a)
-        {
-            auto m = std::make_unique<NetModule>(a, o2);
-            net2 = m.get();
-            return m;
-        });
+    app1.RegisterModule([&](App& a) { return std::make_unique<NetModule>(a, o1); });
+    app2.RegisterModule([&](App& a) { return std::make_unique<NetModule>(a, o2); });
     AppModule* m1 = nullptr;
     AppModule* m2 = nullptr;
     app1.RegisterModule(
@@ -290,8 +268,8 @@ void TestAgentWithTwoApps()
             m2 = m.get();
             return m;
         });
-    Runner run1(app1, [&] { net1->Shutdown(); });
-    Runner run2(app2, [&] { net2->Shutdown(); });
+    Runner run1(app1);
+    Runner run2(app2);
     CHECK(WaitUntil([&] { return m1 != nullptr && m1->client != nullptr && m2 != nullptr && m2->client != nullptr; }));
     // 对业务透明，但底下走的传输不同：App1 共享内存，App2 仅 UDS。
     CHECK(WaitUntil([&] { return m1->client->link() == AgentClient::Link::kShm; }));
@@ -302,15 +280,18 @@ void TestAgentWithTwoApps()
     biz2.hook = [&](ConnectionHandle h, const std::string& msg)
     {
         EnvelopeHead req{};
-        CHECK(ParseEnvelope(std::span(reinterpret_cast<const std::byte*>(msg.data()), msg.size()), req) == EnvStatus::kOk);
-        const std::string resp = MakeEnvelope(EnvType::kResponse, kApp2, req.src, req.seq, "pong:" + msg.substr(sizeof(req)));
+        CHECK(ParseEnvelope(std::span(reinterpret_cast<const std::byte*>(msg.data()), msg.size()), req) ==
+              EnvStatus::kOk);
+        const std::string resp =
+            MakeEnvelope(EnvType::kResponse, kApp2, req.src, req.seq, "pong:" + msg.substr(sizeof(req)));
         CHECK(h.Send(SharedBuffer::CopyFrom(std::span(reinterpret_cast<const std::byte*>(resp.data()), resp.size()))) ==
               SendResult::Ok);
     };
     for (std::uint64_t seq = 1; seq <= 20; ++seq)
     {
         const std::string req = MakeEnvelope(EnvType::kRequest, kApp1, kApp2, seq, "ping" + std::to_string(seq));
-        CHECK(m1->client->Send(SharedBuffer::CopyFrom(std::span(reinterpret_cast<const std::byte*>(req.data()), req.size()))) ==
+        CHECK(m1->client->Send(
+                  SharedBuffer::CopyFrom(std::span(reinterpret_cast<const std::byte*>(req.data()), req.size()))) ==
               SendResult::Ok); // 经 INetClient::Send：任意线程
     }
     CHECK(WaitUntil([&] { return biz2.messages() == 20 && biz1.messages() == 20; }));
@@ -319,9 +300,11 @@ void TestAgentWithTwoApps()
         EnvelopeHead h{};
         const std::string r = biz1.message(i);
         CHECK(ParseEnvelope(std::span(reinterpret_cast<const std::byte*>(r.data()), r.size()), h) == EnvStatus::kOk);
-        CHECK(h.type == static_cast<std::uint8_t>(EnvType::kResponse) && h.src == kApp2 && h.dst == kApp1 && h.seq == i + 1);
+        CHECK(h.type == static_cast<std::uint8_t>(EnvType::kResponse) && h.src == kApp2 && h.dst == kApp1 &&
+              h.seq == i + 1);
         CHECK(r.substr(sizeof(h)) == "pong:ping" + std::to_string(i + 1)); // 保序、内容原样
-        CHECK(h.hops == 1 && h.remaining_ms > 4000 && h.remaining_ms <= 5000); // 回包是新消息，hops 从 0 起，经 Agent 一跳
+        CHECK(h.hops == 1 && h.remaining_ms > 4000 &&
+              h.remaining_ms <= 5000); // 回包是新消息，hops 从 0 起，经 Agent 一跳
     }
     // 业务回调都在各自 App 的主循环线程上（共享内存的连接也一样）。
     CHECK(biz1.threads().size() == 1 && biz1.threads()[0] == run1.tid.load());
@@ -340,7 +323,7 @@ void TestAgentWithTwoApps()
     CHECK(am->server->shm_stats().uds_channels == 1 && am->server->shm_stats().open_channels == 2);
     CHECK(m1->client->stats().tx_messages == 20 && m1->client->stats().rx_messages == 20);
 
-    // 停机：先停 App；各自的 Run 线程在 Run 返回之后调 NetModule::Shutdown（由 main 负责，必须在主循环线程上）。
+    // 先停 App 再停 Agent；各自的 Run 在原线程完成网络排空。
     run1.Stop();
     run2.Stop();
     agent_run.Stop();
@@ -352,12 +335,14 @@ void TestConfigMapsToOptions()
 {
     config::NetConfig c;
     NetModuleOptions o = NetModuleOptionsFrom(c);
-    CHECK(o.agent.endpoint == "unix:///run/breeze/agent.sock" && o.agent.shm_enabled && o.agent.ring_capacity == 0); // 默认值
+    CHECK(o.agent.endpoint == "unix:///run/breeze/agent.sock" && o.agent.shm_enabled &&
+          o.agent.ring_capacity == 0); // 默认值
     c.agentEndpoint = "unix-abstract://my-agent";
     c.agentShmEnabled = false;
     c.agentShmRingMb = 4;
     o = NetModuleOptionsFrom(c);
-    CHECK(o.agent.endpoint == "unix-abstract://my-agent" && !o.agent.shm_enabled && o.agent.ring_capacity == (4ULL << 20));
+    CHECK(o.agent.endpoint == "unix-abstract://my-agent" && !o.agent.shm_enabled &&
+          o.agent.ring_capacity == (4ULL << 20));
 }
 
 // 装配参数的错误：在模块 Init 里返回，App::Run 立刻带着原因返回。

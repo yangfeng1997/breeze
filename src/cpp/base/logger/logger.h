@@ -177,7 +177,7 @@ private:
     std::atomic<bool> closed_{false};
 };
 
-// 默认 logger。**只许 LogModule 写**：Init 登记，析构时用 compare_exchange 撤销（只撤销自己的）。
+// 默认 logger。**只许 LogModule 写**：Init 登记，Shutdown / 析构时用 compare_exchange 撤销（只撤销自己的）。
 // 用原子是因为框架不强制"Init 先于任何线程"，违反时不该是静默的未定义行为；x86 上读取无额外开销。
 inline std::atomic<Logger*> g_default_logger{nullptr};
 

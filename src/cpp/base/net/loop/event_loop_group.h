@@ -24,8 +24,8 @@ class EventLoop;
 
 struct EventLoopGroupOptions
 {
-    std::uint32_t io_threads = 1;                    // 1 到 256
-    std::uint32_t max_connections_per_loop = 65536;  // 1 到 2^20；每个 loop 的连接表按它预分配（每槽 64 字节）
+    std::uint32_t io_threads = 1;                   // 1 到 256
+    std::uint32_t max_connections_per_loop = 65536; // 1 到 2^20；每个 loop 的连接表按它预分配（每槽 64 字节）
 };
 
 class EventLoopGroup
@@ -43,10 +43,10 @@ public:
 
     // 停机：拒绝新的 Start；各 loop 停掉自己的 Acceptor / Connector（StreamServer / StreamClient 经停机钩子），
     // 对所有连接 CloseGracefully，等连接表变空或到 deadline，到点强关；然后停 loop、join 线程。
-    // 此间连接的 OnClosed 照常在 IO 线程回调，Shutdown 返回之后不再有任何回调；本 group 的句柄此后解析不到（Send 返回 Closed）。
-    // App 只管启动不管停机，所以这条由网络库自己提供（调用方在 Run 返回之后调它）。
-    // 对没有成功 Start 的对象、以及重复调用都是安全的空操作。deadline 为 0 = 不等，直接强关。
-    // idle 非空时，等待期间调用方线程每轮调它一次（返回 true = 做了事，不睡直接再来）：框架层借它在停机期间继续消费事件——
+    // 此间 OnClosed 照常在 IO 线程回调；返回后不再回调，本 group 的句柄 Send 返回 Closed。
+    // framework/net 的 NetModule::Stop 在 App 主循环退出后调用它并排空业务事件。
+    // 未成功 Start 及重复调用均为空操作；deadline 为 0 则直接强关。
+    // idle 非空时，调用方线程等待期间每轮调一次（返回 true 则立即重试），用于继续消费事件：
     // 连接进入优雅关闭后暂停读就不再生效，主线程若只阻塞等着，对端灌进来的数据会无界堆在事件队列里。
     void Shutdown(std::chrono::milliseconds deadline, std::move_only_function<bool()> idle = {});
 
@@ -81,7 +81,7 @@ private:
 
     EventLoopGroupOptions options_;
     std::atomic<State> state_{State::Idle}; // 主线程写，IO 线程（回调里的 Start）也会读
-    std::uint32_t id_ = 0; // 在 GroupRegistry 里的编号
+    std::uint32_t id_ = 0;                  // 在 GroupRegistry 里的编号
     std::vector<std::unique_ptr<Worker>> workers_;
 };
 

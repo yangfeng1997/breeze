@@ -1,8 +1,9 @@
 #include "framework/net/net_module.h"
 
+#include <fmt/format.h>
+
 #include <cerrno>
 #include <cstring>
-#include <fmt/format.h>
 #include <optional>
 
 #include "base/logger/logger_macros.h"
@@ -15,7 +16,8 @@ namespace breeze
 namespace
 {
 
-// 带 scheme 的端点：scheme 由这里剥掉，剩下的交给 Endpoint::Parse。tls:// = TCP + TLS 层；ws:// / wss:// = TCP +（可选 TLS）
+// 带 scheme 的端点：scheme 由这里剥掉，剩下的交给 Endpoint::Parse。tls:// = TCP + TLS 层；ws:// / wss:// = TCP +（可选
+// TLS）
 // + WebSocket codec，路径写在 URL 里。
 struct ParsedEndpoint
 {
@@ -100,7 +102,8 @@ NetModuleOptions NetModuleOptionsFrom(const config::NetConfig& c)
     o.tls.min_version_13 = c.tls.minVersion == config::TlsVersionConfig::Tls13;
     o.ws_server.max_header_bytes = c.ws.maxHeaderBytes;
     o.ws_server.max_message_bytes = c.ws.maxMessageBytes;
-    o.ws_server.message_type = c.ws.messageType == config::WsMessageTypeConfig::Text ? WsMessageType::Text : WsMessageType::Binary;
+    o.ws_server.message_type =
+        c.ws.messageType == config::WsMessageTypeConfig::Text ? WsMessageType::Text : WsMessageType::Binary;
     o.ws_server.validate_utf8 = c.ws.validateUtf8;
     o.ws_server.allowed_origins.assign(c.ws.allowedOrigins.begin(), c.ws.allowedOrigins.end());
     o.ws_client.host.clear(); // 端点里的 authority 才是 Host
@@ -150,14 +153,16 @@ std::expected<void, Error> NetModule::Init()
         std::string err;
         tls_server_ = MakeTlsServerLayer(options_.tls, err);
         if (!tls_server_)
-            return Fail(Errc::Module, fmt::format("net: TLS 服务端上下文创建失败（{}）：{}", options_.tls.cert_chain_file, err));
+            return Fail(Errc::Module,
+                        fmt::format("net: TLS 服务端上下文创建失败（{}）：{}", options_.tls.cert_chain_file, err));
     }
     if (!options_.tls.server_name.empty())
     {
         std::string err;
         tls_client_ = MakeTlsClientLayer(options_.tls, err);
         if (!tls_client_)
-            return Fail(Errc::Module, fmt::format("net: TLS 客户端上下文创建失败（{}）：{}", options_.tls.server_name, err));
+            return Fail(Errc::Module,
+                        fmt::format("net: TLS 客户端上下文创建失败（{}）：{}", options_.tls.server_name, err));
     }
     executor_.SetLimits(options_.inbound);
     group_ = std::make_unique<EventLoopGroup>(options_.group);
@@ -194,8 +199,9 @@ std::expected<INetServer*, Error> NetModule::AddServer(std::string_view endpoint
     if (!parsed)
         return std::unexpected(parsed.error());
     if (!parsed->ws)
-        return Fail(Errc::Module,
-                    fmt::format("net: 端点 '{}' 不带分帧，AddServer 需要 codec 工厂；只有 ws:// / wss:// 可以不给", endpoint));
+        return Fail(
+            Errc::Module,
+            fmt::format("net: 端点 '{}' 不带分帧，AddServer 需要 codec 工厂；只有 ws:// / wss:// 可以不给", endpoint));
     // 端点里的路径优先于选项里的。
     WsServerOptions wo = options_.ws_server;
     wo.path = parsed->ws_path;
@@ -207,9 +213,11 @@ std::expected<INetServer*, Error> NetModule::AddServer(std::string_view endpoint
         if (!options.tls)
             options.tls = tls_server_;
         if (!options.tls)
-            return Fail(Errc::Module,
-                        fmt::format("net: 端点 '{}' 是 wss://，但没有 TLS 服务端上下文（net.tls.cert_chain_file / private_key_file）",
-                                    endpoint));
+            return Fail(
+                Errc::Module,
+                fmt::format(
+                    "net: 端点 '{}' 是 wss://，但没有 TLS 服务端上下文（net.tls.cert_chain_file / private_key_file）",
+                    endpoint));
     }
     return AddServer(parsed->base.ToString(), handler, f, std::move(options));
 }
@@ -235,13 +243,18 @@ std::expected<INetServer*, Error> NetModule::AddServer(std::string_view endpoint
     if (!parsed)
         return std::unexpected(parsed.error());
     if (parsed->ws)
-        return Fail(Errc::Module,
-                    fmt::format("net: 端点 '{}' 是 ws:// / wss://，自带分帧，不要再给 codec 工厂（用不带工厂的 AddServer）", endpoint));
+        return Fail(
+            Errc::Module,
+            fmt::format("net: 端点 '{}' 是 ws:// / wss://，自带分帧，不要再给 codec 工厂（用不带工厂的 AddServer）",
+                        endpoint));
     if (parsed->tls && !options.tls)
         options.tls = tls_server_;
     if (parsed->tls && !options.tls)
-        return Fail(Errc::Module,
-                    fmt::format("net: 端点 '{}' 是 tls://，但没有 TLS 服务端上下文（net.tls.cert_chain_file / private_key_file）", endpoint));
+        return Fail(
+            Errc::Module,
+            fmt::format(
+                "net: 端点 '{}' 是 tls://，但没有 TLS 服务端上下文（net.tls.cert_chain_file / private_key_file）",
+                endpoint));
     const auto& ep = parsed->base;
     if (const auto udp = RUdpEndpoint::From(ep))
     {
@@ -262,10 +275,10 @@ std::expected<INetServer*, Error> NetModule::AddServer(std::string_view endpoint
 }
 
 INetServer* NetModule::MakeStreamServer(const std::optional<TcpEndpoint>& tcp,
-                                       const std::optional<UdsEndpoint>& uds,
-                                       IConnectionHandler& handler,
-                                       const IFrameCodecFactory& factory,
-                                       StreamServerOptions options)
+                                        const std::optional<UdsEndpoint>& uds,
+                                        IConnectionHandler& handler,
+                                        const IFrameCodecFactory& factory,
+                                        StreamServerOptions options)
 {
     if (tcp)
     {
@@ -310,8 +323,9 @@ std::expected<INetClient*, Error> NetModule::AddClient(std::string_view endpoint
     if (!parsed)
         return std::unexpected(parsed.error());
     if (!parsed->ws)
-        return Fail(Errc::Module,
-                    fmt::format("net: 端点 '{}' 不带分帧，AddClient 需要 codec 工厂；只有 ws:// / wss:// 可以不给", endpoint));
+        return Fail(
+            Errc::Module,
+            fmt::format("net: 端点 '{}' 不带分帧，AddClient 需要 codec 工厂；只有 ws:// / wss:// 可以不给", endpoint));
     WsClientOptions wo = options_.ws_client;
     wo.path = parsed->ws_path;
     if (wo.host.empty() && parsed->base.IsIp())
@@ -327,8 +341,9 @@ std::expected<INetClient*, Error> NetModule::AddClient(std::string_view endpoint
         if (!options.tls)
             options.tls = tls_client_;
         if (!options.tls)
-            return Fail(Errc::Module,
-                        fmt::format("net: 端点 '{}' 是 wss://，但没有 TLS 客户端上下文（net.tls.server_name）", endpoint));
+            return Fail(
+                Errc::Module,
+                fmt::format("net: 端点 '{}' 是 wss://，但没有 TLS 客户端上下文（net.tls.server_name）", endpoint));
     }
     return AddClient(parsed->base.ToString(), handler, f, std::move(options), policy);
 }
@@ -355,12 +370,15 @@ std::expected<INetClient*, Error> NetModule::AddClient(std::string_view endpoint
     if (!parsed)
         return std::unexpected(parsed.error());
     if (parsed->ws)
-        return Fail(Errc::Module,
-                    fmt::format("net: 端点 '{}' 是 ws:// / wss://，自带分帧，不要再给 codec 工厂（用不带工厂的 AddClient）", endpoint));
+        return Fail(
+            Errc::Module,
+            fmt::format("net: 端点 '{}' 是 ws:// / wss://，自带分帧，不要再给 codec 工厂（用不带工厂的 AddClient）",
+                        endpoint));
     if (parsed->tls && !options.tls)
         options.tls = tls_client_;
     if (parsed->tls && !options.tls)
-        return Fail(Errc::Module, fmt::format("net: 端点 '{}' 是 tls://，但没有 TLS 客户端上下文（net.tls.server_name）", endpoint));
+        return Fail(Errc::Module,
+                    fmt::format("net: 端点 '{}' 是 tls://，但没有 TLS 客户端上下文（net.tls.server_name）", endpoint));
     const auto& ep = parsed->base;
     if (RUdpEndpoint::From(ep))
         return Fail(Errc::Module,
@@ -374,11 +392,11 @@ std::expected<INetClient*, Error> NetModule::AddClient(std::string_view endpoint
 }
 
 INetClient* NetModule::MakeStreamClient(const std::optional<TcpEndpoint>& tcp,
-                                       const std::optional<UdsEndpoint>& uds,
-                                       IConnectionHandler& handler,
-                                       const IFrameCodecFactory& factory,
-                                       StreamClientOptions options,
-                                       ReconnectPolicy policy)
+                                        const std::optional<UdsEndpoint>& uds,
+                                        IConnectionHandler& handler,
+                                        const IFrameCodecFactory& factory,
+                                        StreamClientOptions options,
+                                        ReconnectPolicy policy)
 {
     if (tcp)
     {
@@ -426,9 +444,11 @@ std::expected<agent::AgentClient*, Error> NetModule::AddAgentClient(std::string_
         return std::unexpected(r.error());
     const auto ep = Endpoint::Parse(endpoint);
     if (!ep || (ep->kind() != Endpoint::Kind::Unix && ep->kind() != Endpoint::Kind::UnixAbstract))
-        return Fail(Errc::Module,
-                    fmt::format("net: Agent 端点 '{}' 不合法（必须是 unix:///path 或 unix-abstract://name：fd 只能经 UDS 传递）",
-                                endpoint));
+        return Fail(
+            Errc::Module,
+            fmt::format(
+                "net: Agent 端点 '{}' 不合法（必须是 unix:///path 或 unix-abstract://name：fd 只能经 UDS 传递）",
+                endpoint));
     if (!shm::wire::IsValidBusId(options.busid))
         return Fail(Errc::Module,
                     fmt::format("net: Agent 通道名 '{}' 不合法（[A-Za-z0-9._:@-]，1 到 63 个字符）", options.busid));
@@ -459,13 +479,16 @@ std::expected<agent::AgentServer*, Error> NetModule::AddAgentServer(std::string_
     if (auto r = CheckPhase("AddAgentServer"); !r)
         return std::unexpected(r.error());
     if (options_.group.io_threads != 1)
-        return Fail(Errc::Module,
-                    fmt::format("net: AddAgentServer 要求 net.io_threads = 1（Agent 的路由器与路由表是单线程访问的），当前是 {}",
-                                options_.group.io_threads));
+        return Fail(
+            Errc::Module,
+            fmt::format(
+                "net: AddAgentServer 要求 net.io_threads = 1（Agent 的路由器与路由表是单线程访问的），当前是 {}",
+                options_.group.io_threads));
     const auto ep = Endpoint::Parse(endpoint);
     if (!ep || (ep->kind() != Endpoint::Kind::Unix && ep->kind() != Endpoint::Kind::UnixAbstract))
-        return Fail(Errc::Module,
-                    fmt::format("net: Agent 监听端点 '{}' 不合法（必须是 unix:///path 或 unix-abstract://name）", endpoint));
+        return Fail(
+            Errc::Module,
+            fmt::format("net: Agent 监听端点 '{}' 不合法（必须是 unix:///path 或 unix-abstract://name）", endpoint));
     auto server = std::make_unique<agent::AgentServer>(*group_, *ep, table, std::move(options));
     agent::AgentServer* raw = server.get();
     servers_.push_back(std::move(server));
@@ -473,8 +496,8 @@ std::expected<agent::AgentServer*, Error> NetModule::AddAgentServer(std::string_
 }
 
 std::expected<INetServer*, Error> NetModule::AddIoServer(std::string_view endpoint,
-                                                        IConnectionHandler& handler,
-                                                        const IFrameCodecFactory& factory)
+                                                         IConnectionHandler& handler,
+                                                         const IFrameCodecFactory& factory)
 {
     if (auto r = CheckPhase("AddIoServer"); !r)
         return std::unexpected(r.error());
@@ -482,14 +505,17 @@ std::expected<INetServer*, Error> NetModule::AddIoServer(std::string_view endpoi
     if (!parsed)
         return std::unexpected(parsed.error());
     if (parsed->ws)
-        return Fail(Errc::Module, fmt::format("net: 端点 '{}' 是 ws:// / wss://（AddIoServer 只收字节流：tcp:// / tls:// / unix://）", endpoint));
+        return Fail(Errc::Module,
+                    fmt::format("net: 端点 '{}' 是 ws:// / wss://（AddIoServer 只收字节流：tcp:// / tls:// / unix://）",
+                                endpoint));
     if (parsed->tls && !tls_server_)
         return Fail(Errc::Module, fmt::format("net: 端点 '{}' 是 tls://，但没有 TLS 服务端上下文", endpoint));
     const auto& ep = parsed->base;
     const auto tcp = TcpEndpoint::From(ep);
     const auto uds = tcp ? std::optional<UdsEndpoint>{} : UdsEndpoint::From(ep);
     if (!tcp && !uds)
-        return Fail(Errc::Module, fmt::format("net: 监听端点 '{}' 不是 tcp / unix（AddIoServer 不收 udp://）", endpoint));
+        return Fail(Errc::Module,
+                    fmt::format("net: 监听端点 '{}' 不是 tcp / unix（AddIoServer 不收 udp://）", endpoint));
     StreamServerOptions so;
     so.connection = options_.connection;
     so.tcp = options_.tcp;
@@ -508,14 +534,17 @@ std::expected<INetClient*, Error> NetModule::AddIoClient(std::string_view endpoi
     if (!parsed)
         return std::unexpected(parsed.error());
     if (parsed->ws)
-        return Fail(Errc::Module, fmt::format("net: 端点 '{}' 是 ws:// / wss://（AddIoClient 只收字节流：tcp:// / tls:// / unix://）", endpoint));
+        return Fail(Errc::Module,
+                    fmt::format("net: 端点 '{}' 是 ws:// / wss://（AddIoClient 只收字节流：tcp:// / tls:// / unix://）",
+                                endpoint));
     if (parsed->tls && !tls_client_)
         return Fail(Errc::Module, fmt::format("net: 端点 '{}' 是 tls://，但没有 TLS 客户端上下文", endpoint));
     const auto& ep = parsed->base;
     const auto tcp = TcpEndpoint::From(ep);
     const auto uds = tcp ? std::optional<UdsEndpoint>{} : UdsEndpoint::From(ep);
     if (!tcp && !uds)
-        return Fail(Errc::Module, fmt::format("net: 对端端点 '{}' 不是 tcp / unix（AddIoClient 不收 udp://）", endpoint));
+        return Fail(Errc::Module,
+                    fmt::format("net: 对端端点 '{}' 不是 tcp / unix（AddIoClient 不收 udp://）", endpoint));
     StreamClientOptions co;
     co.connection = options_.connection;
     co.tcp = options_.tcp;
@@ -649,7 +678,9 @@ std::expected<void, Error> NetModule::ReloadTls()
     return {};
 }
 
-void NetModule::Shutdown()
+void NetModule::Shutdown() { Stop(); }
+
+void NetModule::Stop()
 {
     if (phase_ != Phase::Started)
         return;

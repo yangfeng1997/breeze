@@ -10,9 +10,9 @@
 //   NetModule(app)           Init 时从 ConfigModule 读 `net` 段（config/schema/net.proto），DependsOn("config")
 //   NetModule(app, options)  直接给选项（测试，或不走配置的进程），不依赖 config
 //
-// **停机由 main 负责**：App 只管启动，Run 返回之后 main 要调 Shutdown()——group 优雅关闭，再把事件 Drain 到空，
-// 业务才看得到每条连接的 OnClosed（设计不变量 2）；之后才能销毁 App。没调 Shutdown 就销毁只做兜底：直接停 IO 线程，
-// 未消费的事件丢弃、不回调业务。
+// App 在主循环退出后调用 Stop：group 优雅关闭，再把事件 Drain 到空（含每条连接的 OnClosed）。
+// 业务 Stop 后仍须保留回调所需资源，到 Shutdown 才释放。直接销毁只做兜底：停 IO、丢弃未消费事件。
+// 见 TestShutdownDrainsEveryClosed。
 // 日志部署建议：网络库所在进程把日志 Overflow 配成 DropOldest——默认 Block，磁盘变慢会卡住 IO 线程。
 
 #pragma once
@@ -101,15 +101,14 @@ public:
     bool Wake() override;
 
     // 装配：Init 之后、Start 之前（通常在依赖 net 的模块的 Init 里）。endpoint 是 tcp://ip:port | tls://ip:port |
-    // ws://ip:port[/path] | wss://ip:port[/path] | unix:///path | unix-abstract://name | udp://ip:port（配置里直接写字符串）；
-    // 不合法返回错误并带上原字符串。**ws:// / wss:// 自带分帧**，用不带 codec 工厂的重载；给它工厂是错误（不静默忽略）。
-    // 返回的指针在模块存活期内有效。
-    // 之后经 INetClient::Send / ConnectionHandle 发送；handler 与 factory 要比 Shutdown 活得久。
-    // udp:// 的 AddServer 装配的是 rudp 服务端（用模块的 connection 与 rudp 默认选项；显式选项里只有 connection 与
-    // accept_filter 对它有意义），factory 对它被忽略：rudp 的消息自带边界，没有 codec。要签发票据就要拿到 RUdpServer，
-    // 用 AddRUdpServer（或对返回的 INetServer* 做 dynamic_cast）。
-    // AddClient 不收 udp://：rudp 客户端要凭票据握手，用 AddRUdpClient。
-    // 不带 codec 工厂：只收 ws:// / wss://（WebSocket 自带分帧，选项取 NetModuleOptions::ws_server）。
+    // ws://ip:port[/path] | wss://ip:port[/path] | unix:///path | unix-abstract://name |
+    // udp://ip:port（配置里直接写字符串）； 不合法返回错误并带上原字符串。**ws:// / wss:// 自带分帧**，用不带 codec
+    // 工厂的重载；给它工厂是错误（不静默忽略）。 返回的指针在模块存活期内有效。 之后经 INetClient::Send /
+    // ConnectionHandle 发送；handler 与 factory 要比 Shutdown 活得久。 udp:// 的 AddServer 装配的是 rudp
+    // 服务端（用模块的 connection 与 rudp 默认选项；显式选项里只有 connection 与 accept_filter 对它有意义），factory
+    // 对它被忽略：rudp 的消息自带边界，没有 codec。要签发票据就要拿到 RUdpServer， 用 AddRUdpServer（或对返回的
+    // INetServer* 做 dynamic_cast）。 AddClient 不收 udp://：rudp 客户端要凭票据握手，用 AddRUdpClient。 不带 codec
+    // 工厂：只收 ws:// / wss://（WebSocket 自带分帧，选项取 NetModuleOptions::ws_server）。
     std::expected<INetServer*, Error> AddServer(std::string_view endpoint, IMainLoopHandler& handler);
     std::expected<INetServer*, Error> AddServer(std::string_view endpoint,
                                                 IMainLoopHandler& handler,
@@ -139,10 +138,12 @@ public:
                                                 ReconnectPolicy policy);
 
     // ---- 本机 Agent（Sidecar）：设计见 docs/共享内存IPC设计.md ----
-    // App 一侧：连本机 Agent，握手时协商用共享内存（+ UDS 探活）还是仅 UDS（见 agent/agent_client.h），连上之后表现成一条普通连接，
-    // 业务回调照常经 IMainLoopHandler 在主循环线程上执行、经 ConnectionHandle 发送，共享内存与否对业务透明。随模块启动，断线自动重连 / Reattach。
-    // 第一个重载：端点、是否启用共享内存（net.agent_shm_enabled，关了就是仅 UDS）、环容量取 NetModuleOptions::agent（net.agent_*）；
-    // busid 是这个 App 在 Agent 上的通道名；factory 是仅 UDS（含退化）时数据通道的帧格式，要与 Agent 那边一致，要比 Shutdown 活得久。
+    // App 一侧：连本机 Agent，握手时协商用共享内存（+ UDS 探活）还是仅 UDS（见
+    // agent/agent_client.h），连上之后表现成一条普通连接， 业务回调照常经 IMainLoopHandler 在主循环线程上执行、经
+    // ConnectionHandle 发送，共享内存与否对业务透明。随模块启动，断线自动重连 / Reattach。
+    // 第一个重载：端点、是否启用共享内存（net.agent_shm_enabled，关了就是仅 UDS）、环容量取
+    // NetModuleOptions::agent（net.agent_*）； busid 是这个 App 在 Agent 上的通道名；factory 是仅
+    // UDS（含退化）时数据通道的帧格式，要与 Agent 那边一致，要比 Shutdown 活得久。
     // 第二个重载：全部自己给（options.codec 是帧格式）。端点必须是 UDS。
     std::expected<agent::AgentClient*, Error> AddAgentClient(std::string_view busid,
                                                              IMainLoopHandler& handler,
@@ -150,15 +151,17 @@ public:
     std::expected<agent::AgentClient*, Error> AddAgentClient(std::string_view endpoint,
                                                              IMainLoopHandler& handler,
                                                              agent::AgentClientOptions options);
-    // Agent 一侧：监听 UDS，App 经共享内存或仅 UDS 接入，消息由路由器在 IO 线程内转发（**不经主循环**，见 agent/agent_router.h）。
-    // **要求 net.io_threads = 1**（路由器与路由表是单线程访问的），否则返回错误。table 要比模块活得久，只在路由器所在的 loop 线程上访问。
-    // 第一个重载的连接选项取 NetModuleOptions::connection。返回的 AgentServer 里有路由器（router()）与统计。
+    // Agent 一侧：监听 UDS，App 经共享内存或仅 UDS 接入，消息由路由器在 IO 线程内转发（**不经主循环**，见
+    // agent/agent_router.h）。
+    // **要求 net.io_threads = 1**（路由器与路由表是单线程访问的），否则返回错误。table 要比模块活得久，只在路由器所在的
+    // loop 线程上访问。 第一个重载的连接选项取 NetModuleOptions::connection。返回的 AgentServer
+    // 里有路由器（router()）与统计。
     std::expected<agent::AgentServer*, Error> AddAgentServer(std::string_view endpoint, agent::RouteTable& table);
     std::expected<agent::AgentServer*, Error> AddAgentServer(std::string_view endpoint,
                                                              agent::RouteTable& table,
                                                              agent::AgentServerOptions options);
-    // 回调直接在 IO 线程上执行（不回投主循环）的服务端 / 客户端：Agent 之间的转发链路用，handler 是 AgentServer::router()。
-    // 端点是 tcp:// 或 unix://（不收 udp://）。handler 与 factory 要比 Shutdown 活得久。
+    // 回调直接在 IO 线程上执行（不回投主循环）的服务端 / 客户端：Agent 之间的转发链路用，handler 是
+    // AgentServer::router()。 端点是 tcp:// 或 unix://（不收 udp://）。handler 与 factory 要比 Shutdown 活得久。
     std::expected<INetServer*, Error> AddIoServer(std::string_view endpoint,
                                                   IConnectionHandler& handler,
                                                   const IFrameCodecFactory& factory);
@@ -189,9 +192,10 @@ public:
     // 不做文件监听：什么时候重载由部署决定（信号、定时器、证书签发流程）。
     std::expected<void, Error> ReloadTls();
 
-    // main 在 App::Run 返回之后调：group 优雅关闭（到 shutdown_deadline 强关），再把事件 Drain 到空。
-    // 在主循环线程（调 Run 的线程）上调用。对没 Start 成功的、以及重复调用都是空操作。
-    void Shutdown();
+    // 在主循环线程上关闭并排空；Stop 完成后业务 Shutdown 才能安全释放 handler / factory。
+    void Stop() override;
+    // 保留直接调用的兼容性；没 Start 成功及重复调用都是空操作。
+    void Shutdown() override;
 
     const NetModuleOptions& options() const noexcept { return options_; }
     EventLoopGroup& group() { return *group_; }
@@ -208,18 +212,19 @@ private:
 
     std::expected<void, Error> CheckPhase(std::string_view what) const;
     void Rollback();
-    // 装配 TCP / UDS 的服务端 / 客户端（handler 已经按需包装过）。AddServer / AddIoServer 与 AddClient / AddIoClient 共用。
+    // 装配 TCP / UDS 的服务端 / 客户端（handler 已经按需包装过）。AddServer / AddIoServer 与 AddClient / AddIoClient
+    // 共用。
     INetServer* MakeStreamServer(const std::optional<TcpEndpoint>& tcp,
-                                const std::optional<UdsEndpoint>& uds,
-                                IConnectionHandler& handler,
-                                const IFrameCodecFactory& factory,
-                                StreamServerOptions options);
+                                 const std::optional<UdsEndpoint>& uds,
+                                 IConnectionHandler& handler,
+                                 const IFrameCodecFactory& factory,
+                                 StreamServerOptions options);
     INetClient* MakeStreamClient(const std::optional<TcpEndpoint>& tcp,
-                                const std::optional<UdsEndpoint>& uds,
-                                IConnectionHandler& handler,
-                                const IFrameCodecFactory& factory,
-                                StreamClientOptions options,
-                                ReconnectPolicy policy);
+                                 const std::optional<UdsEndpoint>& uds,
+                                 IConnectionHandler& handler,
+                                 const IFrameCodecFactory& factory,
+                                 StreamClientOptions options,
+                                 ReconnectPolicy policy);
 
     const bool from_config_;
     NetModuleOptions options_;
@@ -234,7 +239,8 @@ private:
     std::vector<std::unique_ptr<RUdpClient>> rudp_clients_; // 不随模块启动，见 AddRUdpClient
     // ws:// / wss:// 的 codec 工厂（每加一条端点建一个，与 server / client 活得一样久）。
     std::vector<std::unique_ptr<IFrameCodecFactory>> codec_factories_;
-    // tls:// / wss:// 用的上下文，Init 时按 NetModuleOptions::tls 建；之后指针本身不再变（ReloadTls 只换里面的上下文）。
+    // tls:// / wss:// 用的上下文，Init 时按 NetModuleOptions::tls 建；之后指针本身不再变（ReloadTls
+    // 只换里面的上下文）。
     std::shared_ptr<ReloadableTlsLayer> tls_server_;
     std::shared_ptr<ReloadableTlsLayer> tls_client_;
 };

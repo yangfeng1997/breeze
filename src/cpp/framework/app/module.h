@@ -44,6 +44,13 @@ public:
     // （见 lifecycle.cpp 的 Start，无回滚）。
     virtual std::expected<void, Error> Start() = 0;
 
+    // 两段均按拓扑逆序调用且不抛异常，见 App::Stop / Shutdown。
+    // Stop 停止主动任务并等待自有线程退出，但仍须接受依赖模块排空时的回调（如 NetModule::Stop）。
+    // Shutdown 才释放回调所需资源，此时所有模块已 Stop。
+    // 主循环已退出，不得等待需要 Tick/Wake 才能完成的任务。
+    virtual void Stop() {}
+    virtual void Shutdown() {}
+
     App& app() const noexcept { return app_; }
 
 private:

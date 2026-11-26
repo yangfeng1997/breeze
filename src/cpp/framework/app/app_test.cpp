@@ -2,6 +2,7 @@
 
 #include "framework/app/app.h"
 
+#include <fmt/format.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -9,7 +10,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
-#include <fmt/format.h>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -98,6 +98,8 @@ void TestLifecycleLogs(Logger& lg, const std::filesystem::path& dir)
         CHECK(app.Build());
         CHECK(app.Init());
         CHECK(app.Start());
+        CHECK(app.Stop());
+        CHECK(app.Shutdown());
     }
     lg.Flush();
 
@@ -108,6 +110,8 @@ void TestLifecycleLogs(Logger& lg, const std::filesystem::path& dir)
     CHECK(text.find("app built app=lifecycle-logs modules=1") != std::string::npos);
     CHECK(text.find("module inited app=lifecycle-logs module=a") != std::string::npos);
     CHECK(text.find("module started app=lifecycle-logs module=a") != std::string::npos);
+    CHECK(text.find("module stopped app=lifecycle-logs module=a") != std::string::npos);
+    CHECK(text.find("module shutdown app=lifecycle-logs module=a") != std::string::npos);
 }
 
 void TestBuildErrors()
@@ -153,6 +157,179 @@ void TestBuildErrors()
         }
         CHECK(threw);
     }
+}
+
+class LifecycleModule : public TestModule
+{
+public:
+    LifecycleModule(App& a, std::string name, std::vector<std::string_view> deps, std::vector<std::string>& events)
+        : TestModule(a, name, deps)
+        , name_(std::move(name))
+        , events_(events)
+    {
+    }
+    ~LifecycleModule() override { events_.push_back("destroy:" + name_); }
+    std::expected<void, Error> Init() override
+    {
+        events_.push_back("init:" + name_);
+        CHECK(app().Stop().error().code == Errc::Phase);
+        CHECK(app().Start().error().code == Errc::Phase);
+        return initErr ? Fail(Errc::Module, "init failed") : std::expected<void, Error>{};
+    }
+    std::expected<void, Error> Start() override
+    {
+        events_.push_back("start:" + name_);
+        CHECK(app().Stop().error().code == Errc::Phase);
+        return TestModule::Start();
+    }
+    void Stop() override
+    {
+        CHECK(app().StopToken().stop_requested());
+        CHECK(app().GetModule(Name()) == this);
+        CHECK(app().Stop().error().code == Errc::Phase);
+        CHECK(app().Shutdown().error().code == Errc::Phase);
+        CHECK(std::this_thread::get_id() == owner);
+        events_.push_back("stop:" + name_);
+    }
+    void Shutdown() override
+    {
+        CHECK(app().GetModule(Name()) == this);
+        CHECK(app().Shutdown().error().code == Errc::Phase);
+        CHECK(std::this_thread::get_id() == owner);
+        events_.push_back("shutdown:" + name_);
+    }
+    bool initErr = false;
+    std::thread::id owner = std::this_thread::get_id();
+
+private:
+    std::string name_;
+    std::vector<std::string>& events_;
+};
+
+void TestStopAndShutdown()
+{
+    std::vector<std::string> events;
+    {
+        App app("lifecycle");
+        app.RegisterModule(
+            [&](App& a)
+            { return std::make_unique<LifecycleModule>(a, "biz", std::vector<std::string_view>{"net"}, events); });
+        app.RegisterModule(
+            [&](App& a)
+            { return std::make_unique<LifecycleModule>(a, "net", std::vector<std::string_view>{}, events); });
+        CHECK(app.Stop().error().code == Errc::Phase);
+        CHECK(app.Shutdown().error().code == Errc::Phase);
+        CHECK(app.Build());
+        CHECK(app.Stop().error().code == Errc::Phase);
+        CHECK(app.Init());
+        CHECK(app.Stop().error().code == Errc::Phase);
+        CHECK(app.Start());
+        CHECK(app.Shutdown().error().code == Errc::Phase);
+        CHECK(!app.StopToken().stop_requested());
+        CHECK(app.Stop());
+        CHECK(app.Stop());
+        CHECK(app.Shutdown());
+        CHECK(app.Shutdown());
+        CHECK(app.Stop());
+        CHECK(app.Start().error().code == Errc::Phase);
+        CHECK((events == std::vector<std::string>{"init:net",
+                                                  "init:biz",
+                                                  "start:net",
+                                                  "start:biz",
+                                                  "stop:biz",
+                                                  "stop:net",
+                                                  "shutdown:biz",
+                                                  "shutdown:net"}));
+    }
+    CHECK(events[events.size() - 2] == "destroy:biz");
+    CHECK(events.back() == "destroy:net");
+}
+
+void TestRunStopsAndJoinsWorker()
+{
+    std::vector<std::string> events;
+    App app("run-lifecycle");
+    struct Worker : LifecycleModule, IWaker
+    {
+        Worker(App& a, std::vector<std::string>& events, std::stop_source& external)
+            : LifecycleModule(a, "worker", {}, events)
+            , external_(external)
+        {
+        }
+        std::expected<void, Error> Start() override
+        {
+            CHECK(LifecycleModule::Start());
+            thread_ = std::jthread(
+                [token = app().StopToken()]
+                {
+                    std::mutex mu;
+                    std::condition_variable_any cv;
+                    std::unique_lock lk(mu);
+                    cv.wait(lk, token, [] { return false; });
+                });
+            app().Notify();
+            return {};
+        }
+        bool Wake() override
+        {
+            CHECK(app().Stop().error().code == Errc::Phase);
+            CHECK(app().Shutdown().error().code == Errc::Phase);
+            external_.request_stop();
+            return false;
+        }
+        void Stop() override
+        {
+            LifecycleModule::Stop();
+            thread_.join();
+            joined = true;
+        }
+        void Shutdown() override
+        {
+            CHECK(joined);
+            LifecycleModule::Shutdown();
+        }
+        bool joined = false;
+        std::stop_source& external_;
+        std::jthread thread_;
+    };
+    std::stop_source external;
+    app.RegisterModule([&](App& a) { return std::make_unique<Worker>(a, events, external); });
+    CHECK(app.Run(external.get_token()));
+    CHECK((events == std::vector<std::string>{"init:worker", "start:worker", "stop:worker", "shutdown:worker"}));
+    CHECK(app.Stop());
+    CHECK(app.Shutdown());
+}
+
+void TestFailureDoesNotStopOrShutdown()
+{
+    for (const bool failInit : {true, false})
+    {
+        std::vector<std::string> events;
+        App app("failed-lifecycle");
+        app.RegisterModule(
+            [&](App& a)
+            { return std::make_unique<LifecycleModule>(a, "good", std::vector<std::string_view>{}, events); });
+        app.RegisterModule(
+            [&](App& a)
+            {
+                auto m = std::make_unique<LifecycleModule>(a, "bad", std::vector<std::string_view>{}, events);
+                m->initErr = failInit;
+                m->startErr_ = !failInit;
+                return m;
+            });
+        std::stop_source ss;
+        CHECK(!app.Run(ss.get_token()));
+        CHECK(app.StopToken().stop_requested());
+        CHECK(app.Init().error().code == Errc::Phase);
+        CHECK(app.Start().error().code == Errc::Phase);
+        CHECK(app.Stop().error().code == Errc::Phase);
+        CHECK(app.Shutdown().error().code == Errc::Phase);
+        CHECK(events.size() == (failInit ? 2 : 4));
+    }
+    App badBuild("bad-build");
+    badBuild.RegisterModule(Make("bad", {"missing"}));
+    CHECK(!badBuild.Build());
+    CHECK(badBuild.Build().error().code == Errc::Phase);
 }
 
 // 返回错误的 Start 之后的模块不再被启动，且不回滚前面的。
@@ -320,6 +497,9 @@ int main()
     TestLifecycleLogs(*lg, dir);
     TestBuildErrors();
     TestStartFailure();
+    TestStopAndShutdown();
+    TestRunStopsAndJoinsWorker();
+    TestFailureDoesNotStopOrShutdown();
     TestTickCount();
     TestWakeBacklog();
     TestNotifyFromThreads();

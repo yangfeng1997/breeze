@@ -3,12 +3,14 @@
 
 #include "framework/app/app.h"
 
-#include <algorithm>
 #include <fmt/format.h>
+
+#include <algorithm>
 #include <map>
 #include <ranges>
 #include <stdexcept>
 
+#include "base/defer/defer.h"
 #include "base/logger/logger_macros.h"
 
 namespace breeze
@@ -112,12 +114,30 @@ std::string_view ToString(Lifecycle s) noexcept
     {
         case Lifecycle::New:
             return "new";
+        case Lifecycle::Building:
+            return "building";
         case Lifecycle::Built:
             return "built";
+        case Lifecycle::Initializing:
+            return "initializing";
         case Lifecycle::Inited:
             return "inited";
+        case Lifecycle::Starting:
+            return "starting";
         case Lifecycle::Started:
             return "started";
+        case Lifecycle::Running:
+            return "running";
+        case Lifecycle::Stopping:
+            return "stopping";
+        case Lifecycle::Stopped:
+            return "stopped";
+        case Lifecycle::ShuttingDown:
+            return "shutting_down";
+        case Lifecycle::Shutdown:
+            return "shutdown";
+        case Lifecycle::Failed:
+            return "failed";
     }
     return "unknown";
 }
@@ -187,7 +207,15 @@ std::expected<void, Error> App::Build()
             return Fail(Errc::EmptyName, fmt::format("{}", Describe(Errc::EmptyName)));
         // 工厂是 move-only 的，整批取走；Build 失败后 App 不可重试（与“启动失败不回滚”一致）。
         factories = std::move(factories_);
+        state_ = Lifecycle::Building;
     }
+    const auto fail = MakeDefer(
+        [this]
+        {
+            std::unique_lock lk(mu_);
+            if (state_ == Lifecycle::Building)
+                state_ = Lifecycle::Failed;
+        });
 
     // 工厂在锁外调用：工厂里可能回调 App，持锁会重入
     std::vector<std::unique_ptr<Module>> built;
@@ -274,8 +302,18 @@ std::expected<void, Error> App::Run(std::stop_token st)
     if (auto r = Start(); !r)
         return r;
 
+    {
+        std::unique_lock lk(mu_);
+        state_ = Lifecycle::Running;
+    }
     RunLoop(std::move(st));
-    return {};
+    {
+        std::unique_lock lk(mu_);
+        state_ = Lifecycle::Started;
+    }
+    if (auto r = Stop(); !r)
+        return r;
+    return Shutdown();
 }
 
 } // namespace breeze

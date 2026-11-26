@@ -155,6 +155,12 @@ public:
         return {};
     }
 
+    void Shutdown() override
+    {
+        CHECK(!net_->group().running());
+        CHECK(!net_->Wake()); // 全部 Stop 完成后，不应再有网络事件交给业务
+    }
+
     bool ready() const { return ready_.load(std::memory_order_acquire); }
     const Endpoint& bound() const { return bound_; }
     NetModule* net() const { return net_; }
@@ -579,7 +585,8 @@ void TestModuleDefaultTcpOptionsReachSockets()
     CheckTcpOptions(client_fd, 57, 13, 4, 29000);
 }
 
-// NetModuleOptions::connection 是 AddServer / AddClient 不另给选项时的默认：服务端 accept 的与客户端发起的连接都得到它。
+// NetModuleOptions::connection 是 AddServer / AddClient 不另给选项时的默认：服务端 accept
+// 的与客户端发起的连接都得到它。
 void TestModuleDefaultConnectionOptionsReach(const std::string& listen)
 {
     const LeakCheck leak;
@@ -817,7 +824,7 @@ void TestExplicitClientConnectionAndTcpOptionsReach(const std::string& listen)
     CHECK(client_biz.closed_list()[0].second == CloseReason::IdleTimeout);
 }
 
-// ---- 停机：Run 返回之后 main 调 Shutdown，业务看到每条连接的 OnClosed ----
+// ---- 停机：Run 内自动 Stop / Shutdown，返回前交付每条连接的 OnClosed ----
 
 void TestShutdownDrainsEveryClosed()
 {
@@ -833,8 +840,7 @@ void TestShutdownDrainsEveryClosed()
             bm = m.get();
             return m;
         });
-    // 与生产一致：本线程（相当于 main）既跑 App::Run 又在它返回之后调 Shutdown——事件队列是
-    // SPSC，消费者必须是同一个线程。 客户端的交互放到另一个线程，做完请求停止。
+    // Run 在同一线程完成主循环和网络排空（SPSC 消费者固定）；客户端在另一个线程请求停止。
     std::stop_source ss;
     std::vector<std::unique_ptr<TestClient>> clients;
     std::size_t closed_before_shutdown = SIZE_MAX;
@@ -851,7 +857,7 @@ void TestShutdownDrainsEveryClosed()
             }
             CHECK(biz.connected() == 3);
             closed_before_shutdown = biz.closed();
-            ss.request_stop(); // Run 返回：主循环不再 Drain
+            ss.request_stop(); // 主循环退出，Run 随即开始同步停机
         });
     const auto r = app.Run(ss.get_token());
     driver.join();
@@ -860,8 +866,9 @@ void TestShutdownDrainsEveryClosed()
 
     auto* net = app.GetModule<NetModule>("net");
     CHECK(net != nullptr);
-    net->Shutdown(); // group 优雅关闭，再把事件 Drain 到空
-    CHECK(biz.closed() == 3);
+    CHECK(biz.closed() == 3); // Run 已完成网络排空
+    CHECK(app.Stop());
+    CHECK(app.Shutdown());
     for (const auto& [h, reason] : biz.closed_list())
         CHECK(reason == CloseReason::LocalClose);
     CHECK(!net->group().running());
@@ -898,6 +905,7 @@ void TestShutdownKeepsDrainingWhileWaiting()
         });
     constexpr int kLate = 50;
     std::stop_source ss;
+    std::chrono::steady_clock::time_point stop_requested;
     std::thread driver(
         [&]
         {
@@ -905,7 +913,8 @@ void TestShutdownKeepsDrainingWhileWaiting()
             TestClient c(bm->bound());
             c.SendFrame("hi");
             CHECK(WaitUntil([&] { return biz.messages() == 1; }));
-            ss.request_stop();                                         // Run 返回，main 随即调 Shutdown
+            stop_requested = std::chrono::steady_clock::now();
+            ss.request_stop();                                         // Run 随即进入 NetModule::Stop
             CHECK(WaitUntil([&] { return !net->group().running(); })); // 停机开始：服务端的连接进入优雅关闭
             for (int i = 0; i < kLate; ++i)
                 c.SendFrame("late" + std::to_string(i));
@@ -914,10 +923,9 @@ void TestShutdownKeepsDrainingWhileWaiting()
         });
     const auto r = app.Run(ss.get_token());
     CHECK(r);
-    const auto t0 = std::chrono::steady_clock::now();
-    net->Shutdown();
-    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    const auto returned = std::chrono::steady_clock::now();
     driver.join(); // 客户端随之析构、关闭
+    const auto elapsed = returned - stop_requested;
     CHECK(biz.messages() == 1 + kLate);
     CHECK(biz.closed() == 1);
     CHECK(elapsed < 1800ms); // 没有等到 shutdown_deadline（2s）被强关
@@ -994,9 +1002,11 @@ void TestAssemblyErrors()
     // ws:// / wss:// 自带分帧：带了工厂是错误；不带工厂时只认它们
     {
         const auto ws_with_factory = net->AddServer("ws://127.0.0.1:0", biz, factory);
-        CHECK(!ws_with_factory && ws_with_factory.error().code == Errc::Module && Has(ws_with_factory.error().msg, "自带分帧"));
+        CHECK(!ws_with_factory && ws_with_factory.error().code == Errc::Module &&
+              Has(ws_with_factory.error().msg, "自带分帧"));
         const auto tcp_no_factory = net->AddServer("tcp://127.0.0.1:0", biz);
-        CHECK(!tcp_no_factory && tcp_no_factory.error().code == Errc::Module && Has(tcp_no_factory.error().msg, "codec 工厂"));
+        CHECK(!tcp_no_factory && tcp_no_factory.error().code == Errc::Module &&
+              Has(tcp_no_factory.error().msg, "codec 工厂"));
         CHECK(net->AddServer("ws://127.0.0.1:0", biz)); // ws 可以不给工厂
 
         const auto client_ws_factory = net->AddClient("ws://127.0.0.1:9", biz, factory);
@@ -1045,7 +1055,11 @@ void TestWsThroughModule()
     App cli("net-ws-client");
     cli.RegisterModule([](App& a) { return std::make_unique<NetModule>(a, SmallOptions()); });
     cli.RegisterModule(
-        [&](App& a) { return std::make_unique<WsClientModule>(a, cbiz, "ws://127.0.0.1:" + std::to_string(sm->bound().port()) + "/game"); });
+        [&](App& a)
+        {
+            return std::make_unique<WsClientModule>(
+                a, cbiz, "ws://127.0.0.1:" + std::to_string(sm->bound().port()) + "/game");
+        });
     Runner crun(cli);
     CHECK(WaitUntil([&] { return cbiz.connected() == 1 && sbiz.connected() == 1; }));
 
@@ -1058,7 +1072,11 @@ void TestWsThroughModule()
     App bad("net-ws-wrong-path");
     bad.RegisterModule([](App& a) { return std::make_unique<NetModule>(a, SmallOptions()); });
     bad.RegisterModule(
-        [&](App& a) { return std::make_unique<WsClientModule>(a, wrong, "ws://127.0.0.1:" + std::to_string(sm->bound().port()) + "/other"); });
+        [&](App& a)
+        {
+            return std::make_unique<WsClientModule>(
+                a, wrong, "ws://127.0.0.1:" + std::to_string(sm->bound().port()) + "/other");
+        });
     Runner brun(bad);
     std::this_thread::sleep_for(300ms);
     CHECK(wrong.connected() == 0 && wrong.messages() == 0);
@@ -1125,7 +1143,11 @@ void TestWssThroughModule()
     App cli("net-wss-client");
     cli.RegisterModule([&](App& a) { return std::make_unique<NetModule>(a, copts); });
     cli.RegisterModule(
-        [&](App& a) { return std::make_unique<WsClientModule>(a, cbiz, "wss://127.0.0.1:" + std::to_string(sm->bound().port()) + "/game"); });
+        [&](App& a)
+        {
+            return std::make_unique<WsClientModule>(
+                a, cbiz, "wss://127.0.0.1:" + std::to_string(sm->bound().port()) + "/game");
+        });
     Runner crun(cli);
     CHECK(WaitUntil([&] { return cbiz.connected() == 1 && sbiz.connected() == 1; }));
     CHECK(cbiz.first_connected().Send(Buf("ping-over-wss")) == SendResult::Ok);
@@ -1150,8 +1172,9 @@ struct WssClientApp
                 net = m.get();
                 return m;
             });
-        app.RegisterModule([this, port](App& a)
-                           { return std::make_unique<WsClientModule>(a, biz, "wss://127.0.0.1:" + std::to_string(port) + "/game"); });
+        app.RegisterModule(
+            [this, port](App& a)
+            { return std::make_unique<WsClientModule>(a, biz, "wss://127.0.0.1:" + std::to_string(port) + "/game"); });
         run = std::make_unique<Runner>(app);
     }
     Biz biz; // 声明顺序 = 析构的反序：先停 Runner，再销毁 App，最后才是 biz
@@ -1240,7 +1263,8 @@ void TestWssReloadTls()
     CHECK(WaitUntil([&] { return handshake_failed() > failed_before; }));
     CHECK(trusting_old.biz.connected() == 0 && sbiz.connected() == 3);
 
-    // 4. 客户端一侧：把第一个客户端的 CA 文件换成 other CA 并重载；服务端关掉它的连接，它自动重连时用新上下文，才连得上新证书
+    // 4. 客户端一侧：把第一个客户端的 CA 文件换成 other CA
+    // 并重载；服务端关掉它的连接，它自动重连时用新上下文，才连得上新证书
     write("ca-live.pem", pki.other_ca.cert_pem);
     CHECK(first.net != nullptr && first.net->ReloadTls());
     sbiz.first_connected().Close();

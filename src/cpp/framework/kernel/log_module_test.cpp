@@ -2,12 +2,12 @@
 
 #include "framework/kernel/log_module.h"
 
+#include <fmt/format.h>
 #include <unistd.h>
 
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
-#include <fmt/format.h>
 #include <fstream>
 #include <memory>
 #include <sstream>
@@ -75,6 +75,8 @@ public:
         return {};
     }
     std::expected<void, Error> Start() override { return {}; }
+    void Stop() override { LOG_INFO("probe-stop"); }
+    void Shutdown() override { LOG_INFO("probe-shutdown"); }
 
 private:
     bool* ready_;
@@ -105,6 +107,13 @@ void TestRegisteredFirstInitsFirst()
         CHECK(app.Start());
         CHECK(g_default_logger.load());
         LOG_INFO("while-running {}", 1);
+        CHECK(app.Stop());
+        CHECK(g_default_logger.load());
+        CHECK(app.Shutdown());
+        CHECK(!g_default_logger.load());
+        CHECK(Has(ReadAll(dir / "svc.log"), "probe-stop"));
+        CHECK(Has(ReadAll(dir / "svc.log"), "probe-shutdown"));
+        CHECK(app.Shutdown());
     }
     CHECK(ready);
 
@@ -169,6 +178,10 @@ void TestDestroyOlderAppKeepsNewerLogger()
     Logger* l2 = g_default_logger.load();
     CHECK(l1 && l2 && l1 != l2);
 
+    CHECK(app1->Start());
+    CHECK(app1->Stop());
+    CHECK(app1->Shutdown());
+    CHECK(g_default_logger.load() == l2); // 旧 App 的显式停机不能撤掉新 logger
     app1.reset();
     CHECK(g_default_logger.load() == l2); // 没被 app1 的析构撤掉
     LOG_INFO("still-two");

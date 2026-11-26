@@ -27,15 +27,17 @@
 //   不显式 bind：本机内核上 bind(端口 0) 每次约 10ms 且随数量线性变慢，只 connect 让内核自动绑定则是瞬时的
 //   （临时端口范围约 28k，够 10k 连接）。丢包（回环上只在服务端接收缓冲溢出时才会）
 //   靠 100ms 无回包后重发（raw-udp）/ 驱动 KCP 重传（rudp）兜底。
-// TLS / WebSocket / wss（--transport tls|ws|wss，只支持 --impl breeze）：服务端是 production 的 StreamServer（1 个 IO 线程）
+// TLS / WebSocket / wss（--transport tls|ws|wss，只支持 --impl breeze）：服务端是 production 的 StreamServer（1 个 IO
+// 线程）
 // + TLS 层 / WebSocket codec；客户端是本库的 StreamClient（每条连接一个，回包在 IO 线程里直接发下一条）。
 // 证书在进程内现造（ECDSA P-256，主机名 server.test），客户端验同一个 CA。数字里含 TLS 记录层 / WebSocket 分帧 +
 // StreamServer 组管理的成本，与 breeze（裸 LoopServer + LengthPrefix）对照看。这三种传输不支持 --mem-probe
-//（每条服务端 TLS 连接的内存见 tls_layer_test 的 TestIdleServerLayerMemory）。
+// （每条服务端 TLS 连接的内存见 tls_layer_test 的 TestIdleServerLayerMemory）。
 // 内存探测：--mem-probe N（--impl 任意）：建 N 条空闲连接，报告服务端进程 RSS 的增量 / N（见 MemProbe）。
 //
 // 压测方式：每条连接闭环 ping-pong（发一帧、等完整回包、再发下一帧），预热后计时。
-// 用法：net_bench --impl raw|raw-iov|muduo|breeze|breeze-copy|breeze-fixed|breeze-mainloop --transport tcp|uds|tls|ws|wss
+// 用法：net_bench --impl raw|raw-iov|muduo|breeze|breeze-copy|breeze-fixed|breeze-mainloop --transport
+// tcp|uds|tls|ws|wss
 // --size 64 --conns 64
 //                 [--duration 3] [--warmup 1] [--client-threads 4] [--server-cpu 2] [--client-cpus 4,6,8,10]
 //                 [--mainloop-cpu 12]   breeze-mainloop / rudp-mainloop 的主循环线程绑哪个核（IO 线程用 --server-cpu）
@@ -465,14 +467,14 @@ private:
 //   tls   TLS 层 + LengthPrefixCodec（线格式与 tcp 相同）
 //   ws    WebSocket codec（一条消息一帧，不分片）
 //   wss   TLS + WebSocket codec
-// 服务端证书在进程内现造（与 tls_layer_test 同一套 CA，ECDSA P-256，主机名 server.test）；客户端信任同一个 CA 并校验证书。
-// 数字里包含 TLS 记录层 / WebSocket 分帧 + StreamServer 组管理的成本，不是 raw 基线；与 breeze 的差就是这一层。
+// 服务端证书在进程内现造（与 tls_layer_test 同一套 CA，ECDSA P-256，主机名 server.test）；客户端信任同一个 CA
+// 并校验证书。 数字里包含 TLS 记录层 / WebSocket 分帧 + StreamServer 组管理的成本，不是 raw 基线；与 breeze
+// 的差就是这一层。
 
 struct BenchPki
 {
     TestCert ca = MakeCert({.cn = "Bench CA", .is_ca = true});
-    TestCert server =
-        MakeCert({.cn = "server.test", .dns = {"server.test"}, .issuer = &ca});
+    TestCert server = MakeCert({.cn = "server.test", .dns = {"server.test"}, .issuer = &ca});
 };
 
 const BenchPki& BenchCerts()
@@ -507,7 +509,11 @@ public:
 class SecureServer final : public EchoServer
 {
 public:
-    SecureServer(bool tls, bool ws) : tls_(tls), ws_(ws) {}
+    SecureServer(bool tls, bool ws)
+        : tls_(tls)
+        , ws_(ws)
+    {
+    }
 
     Endpoint Start(const Endpoint& ep, int cpu) override
     {
@@ -540,12 +546,13 @@ public:
         // IO 线程的 pthread 句柄：绑核与读它的 CPU 时间要用（EventLoop 不暴露句柄，从 loop 线程里取）。
         std::promise<pthread_t> ready;
         auto fut = ready.get_future();
-        GroupAccess::LoopAt(*group_, 0).Post(
-            [cpu, &ready]
-            {
-                PinTo(cpu);
-                ready.set_value(::pthread_self());
-            });
+        GroupAccess::LoopAt(*group_, 0)
+            .Post(
+                [cpu, &ready]
+                {
+                    PinTo(cpu);
+                    ready.set_value(::pthread_self());
+                });
         thread_ = fut.get();
         return server_->endpoint();
     }
@@ -627,11 +634,13 @@ class MainLoopServer final : public EchoServer
                 rudp_out_ = *s; // Start 里的 set_value 把它发布给压测线程
                 return {};
             }
-            // tls / ws / wss：把 tcp:// 换成对应的 scheme（NetModule 按 net.tls 的证书建上下文）；ws / wss 自带分帧，不给 codec 工厂。
+            // tls / ws / wss：把 tcp:// 换成对应的 scheme（NetModule 按 net.tls 的证书建上下文）；ws / wss
+            // 自带分帧，不给 codec 工厂。
             std::string url = listen_.ToString();
             if (scheme_ != "tcp")
                 url = scheme_ + url.substr(3);
-            auto s = (scheme_ == "ws" || scheme_ == "wss") ? net->AddServer(url, biz_) : net->AddServer(url, biz_, factory_);
+            auto s =
+                (scheme_ == "ws" || scheme_ == "wss") ? net->AddServer(url, biz_) : net->AddServer(url, biz_, factory_);
             if (!s)
                 return std::unexpected(s.error());
             server_ = *s;
@@ -656,7 +665,8 @@ class MainLoopServer final : public EchoServer
 
 public:
     // rudp = true：udp:// 端点（rudp 服务端，flush_on_send），业务照样在主循环线程上回显。
-    // scheme：tcp（端点原样用）| tls | ws | wss（tcp 端点换 scheme；证书写到临时目录，经 net.tls 的路径交给 NetModule）。
+    // scheme：tcp（端点原样用）| tls | ws | wss（tcp 端点换 scheme；证书写到临时目录，经 net.tls 的路径交给
+    // NetModule）。
     MainLoopServer(int mainloop_cpu, bool rudp, std::string scheme = "tcp")
         : mainloop_cpu_(mainloop_cpu)
         , rudp_(rudp)
@@ -668,7 +678,7 @@ public:
     {
         NetModuleOptions no;
         no.group = {1, g_table_slots}; // 连接表要装得下全部连接
-        no.rudp.flush_on_send = true; // 只对 udp:// 生效，与 rudp 一样用低延迟配置
+        no.rudp.flush_on_send = true;  // 只对 udp:// 生效，与 rudp 一样用低延迟配置
 #if !defined(BREEZE_BENCH_NO_TLS)
         if (scheme_ == "tls" || scheme_ == "wss")
         {
@@ -723,7 +733,7 @@ public:
     {
         stop_.request_stop();
         thread_.join();
-        // 压测客户端已经全部关闭：不排空，直接销毁（group 析构兜底停 IO 线程）。
+        // Run 已在主循环线程完成 Stop / Shutdown，此处只释放对象。
         app_.reset();
         if (!cert_dir_.empty())
         {
@@ -971,7 +981,10 @@ private:
     pthread_t io_thread_{};
 };
 
-std::unique_ptr<EchoServer> MakeServer(const std::string& impl, const std::string& transport, std::size_t size, int mainloop_cpu)
+std::unique_ptr<EchoServer> MakeServer(const std::string& impl,
+                                       const std::string& transport,
+                                       std::size_t size,
+                                       int mainloop_cpu)
 {
 #if !defined(BREEZE_BENCH_NO_TLS)
     if ((transport == "tls" || transport == "ws" || transport == "wss") && impl == "breeze-mainloop")
@@ -1138,7 +1151,8 @@ public:
                 if (!c.verified)
                 {
                     for (int k = 0; k < g_fanout; ++k)
-                        REQUIRE(std::memcmp(c.rbuf.data() + static_cast<std::size_t>(k) * frame_.size(), frame_.data(),
+                        REQUIRE(std::memcmp(c.rbuf.data() + static_cast<std::size_t>(k) * frame_.size(),
+                                            frame_.data(),
                                             frame_.size()) == 0);
                     c.verified = true;
                 }
@@ -1254,8 +1268,7 @@ public:
         }
         group_ = std::make_unique<EventLoopGroup>(EventLoopGroupOptions{1, g_table_slots});
         REQUIRE(group_->Start() == 0);
-        const IFrameCodecFactory& factory =
-            ws_ ? static_cast<const IFrameCodecFactory&>(*ws_factory_) : *lp_factory_;
+        const IFrameCodecFactory& factory = ws_ ? static_cast<const IFrameCodecFactory&>(*ws_factory_) : *lp_factory_;
         clients_.reserve(static_cast<std::size_t>(nconns_));
         handlers_.reserve(static_cast<std::size_t>(nconns_));
         handles_.assign(static_cast<std::size_t>(nconns_), ConnectionHandle{});
@@ -1349,7 +1362,11 @@ private:
     class Handler final : public IConnectionHandler
     {
     public:
-        Handler(SecureWorker& w, int i) : w_(w), i_(i) {}
+        Handler(SecureWorker& w, int i)
+            : w_(w)
+            , i_(i)
+        {
+        }
         void OnConnected(IConnection& c) noexcept override { w_.OnConnected(i_, c.handle()); }
         void OnMessage(IConnection&, std::span<const std::byte> msg) noexcept override { w_.OnReply(i_, msg); }
         void OnClosed(IConnection&, CloseReason, int) noexcept override { w_.OnClosed(i_); }
@@ -1387,7 +1404,8 @@ private:
         auto delay = conns_state_[static_cast<std::size_t>(i)].due - BenchClock::now();
         if (delay < std::chrono::nanoseconds::zero())
             delay = std::chrono::nanoseconds::zero();
-        loop_->RunAfter(std::chrono::duration_cast<std::chrono::steady_clock::duration>(delay), [this, i] { SendNext(i); });
+        loop_->RunAfter(std::chrono::duration_cast<std::chrono::steady_clock::duration>(delay),
+                        [this, i] { SendNext(i); });
     }
 
     Endpoint ep_;
@@ -1554,8 +1572,8 @@ private:
         UdpWorker* owner = nullptr;
         std::uint32_t index = 0;
         bool verified = false;
-        bool pending = false; // 有一条已发出、还没收到回包的请求（定速时连接大部分时间在等下一次发送，不是丢包）
-        BenchClock::time_point due;     // 定速时：下一次该发送的时刻
+        bool pending = false;       // 有一条已发出、还没收到回包的请求（定速时连接大部分时间在等下一次发送，不是丢包）
+        BenchClock::time_point due; // 定速时：下一次该发送的时刻
         BenchClock::time_point sent_at; // 这条消息第一次发出的时刻：延迟从这里算，丢包的等待也算进去
         BenchClock::time_point last_tx; // 最近一次（含重发）发出的时刻：决定什么时候重发
     };
@@ -1912,7 +1930,6 @@ int MemProbe(const BenchOptions& o, const Endpoint& ep, EchoServer& server, bool
     return 0;
 }
 
-
 // ---- 重连风暴（--storm N）----
 //
 // 量"跨 loop accept"这条路径占的比例：服务端是 production 的 StreamServer（g_io_threads 个 loop，accept 在 loop 0，
@@ -1936,8 +1953,8 @@ double ClosureAllocNs()
     {
         Captures c{&sink, &sink, UniqueFd{}, PeerInfo{}};
         // 与 EventLoop::Post 相同：lambda → move_only_function → make_unique<move_only_function>
-        auto task = std::make_unique<std::move_only_function<void()>>(
-            std::move_only_function<void()>([c = std::move(c), &sink]() mutable { sink += reinterpret_cast<std::uintptr_t>(c.self); }));
+        auto task = std::make_unique<std::move_only_function<void()>>(std::move_only_function<void()>(
+            [c = std::move(c), &sink]() mutable { sink += reinterpret_cast<std::uintptr_t>(c.self); }));
         asm volatile("" ::"r"(task.get()) : "memory");
     }
     const double ns = std::chrono::duration<double, std::nano>(BenchClock::now() - t0).count() / kIters;
@@ -2129,7 +2146,8 @@ int main(int argc, char** argv)
         Die("这个构建没有 TLS（BREEZE_BUILD_NET_TLS=OFF），--transport tls / ws / wss 不可用");
 #endif
     if (secure && o.impl != "breeze" && o.impl != "breeze-mainloop")
-        Die("--transport tls / ws / wss 只支持 --impl breeze（IO 线程回显）与 breeze-mainloop（经 NetModule 与主循环）");
+        Die("--transport tls / ws / wss 只支持 --impl breeze（IO 线程回显）与 breeze-mainloop（经 NetModule "
+            "与主循环）");
     if (secure && o.mem_probe > 0)
         Die("tls / ws / wss 的 --mem-probe 暂不支持：每条服务端 TLS 连接的内存见 tls_layer_test 的 "
             "TestIdleServerLayerMemory（实测约 3171 字节）");
