@@ -91,16 +91,34 @@ python3 -I - "$RAW" "$RAW_MEM" <<'EOF'
 import statistics, sys
 from collections import defaultdict
 
-rows = defaultdict(list)
+META_FIELDS = ("requested_backend", "server_backend", "client_backend", "reuse_port", "io_threads")
+
+def numeric_fields(kv):
+    out = {}
+    for k, v in kv.items():
+        try:
+            out[k] = float(v)
+        except ValueError:
+            pass
+    return out
+
+def metadata(kv):
+    # 只按已有元数据分组，保留旧后端证据，不推测缺失字段。
+    return tuple((k, kv[k]) for k in META_FIELDS if k in kv)
+
+row_groups = defaultdict(lambda: defaultdict(list))
 for line in open(sys.argv[1], encoding="utf-8"):
     kv = dict(p.split("=", 1) for p in line.split()[1:])
     load = round(int(kv["conns"]) * float(kv["rate"]) / 1000) * 1000  # 设定的总负载 msg/s（取整到千）
-    rows[(kv["transport"], kv["impl"], int(kv["conns"]), load)].append(
-        {k: float(v) for k, v in kv.items() if k not in ("impl", "transport")})
-mem = {}
+    row_groups[metadata(kv)][(kv["transport"], kv["impl"], int(kv["conns"]), load)].append(numeric_fields(kv))
+mem_groups = defaultdict(dict)
 for line in open(sys.argv[2], encoding="utf-8"):
     kv = dict(p.split("=", 1) for p in line.split()[1:])
-    mem[(kv["transport"], kv["impl"], int(kv["conns"]))] = kv
+    mem_groups[metadata(kv)][(kv["transport"], kv["impl"], int(kv["conns"]))] = kv
+
+def group_heading(group, groups):
+    if len(groups) > 1 or group:
+        print("**配置：" + (" · ".join(f"{k}={v}" for k, v in group) or "legacy") + "**\n")
 
 def med(key, field):
     vals = [r[field] for r in rows.get(key, []) if field in r]
@@ -115,72 +133,80 @@ def fmt_n(n):
     return f"{n:,}"
 
 print("### 1. 建连（建立 N 条连接的耗时 s；括号内是每秒建立的连接数，压测客户端每线程顺序 connect，是下限）\n")
-for t, name, impls, ns in SPECS:
-    print(f"**{name}**\n")
-    print("| 实现 | " + " | ".join(fmt_n(n) for n in ns) + " |")
-    print("|---|" + "---|" * len(ns))
-    for i in impls:
-        cells = []
-        for n in ns:
-            s = med((t, i, n, LOAD), "setup_s")
-            cells.append("—" if s is None else f"{s:.2f}（{n / s:,.0f}/s）")
-        print(f"| {i} | " + " | ".join(cells) + " |")
-    print()
+for group, rows in sorted(row_groups.items()):
+    group_heading(group, row_groups)
+    for t, name, impls, ns in SPECS:
+        print(f"**{name}**\n")
+        print("| 实现 | " + " | ".join(fmt_n(n) for n in ns) + " |")
+        print("|---|" + "---|" * len(ns))
+        for i in impls:
+            cells = []
+            for n in ns:
+                s = med((t, i, n, LOAD), "setup_s")
+                cells.append("—" if s is None else f"{s:.2f}（{n / s:,.0f}/s）")
+            print(f"| {i} | " + " | ".join(cells) + " |")
+        print()
 
 print("### 2. 每连接内存（B）与空闲 CPU（N 条空闲连接下服务端线程的 CPU）\n")
-for t, name, impls, ns in SPECS:
-    print(f"**{name}**\n")
-    print("| 实现 | " + " | ".join(fmt_n(n) for n in ns) + " |")
-    print("|---|" + "---|" * len(ns))
-    for i in impls:
-        cells = []
-        for n in ns:
-            m = mem.get((t, i, n))
-            cells.append("—" if m is None else f"{float(m['bytes_per_conn']):,.0f} B · {float(m['idle_cpu_pct']):.2f}%")
-        print(f"| {i} | " + " | ".join(cells) + " |")
-    print()
+for group, mem in sorted(mem_groups.items()):
+    group_heading(group, mem_groups)
+    for t, name, impls, ns in SPECS:
+        print(f"**{name}**\n")
+        print("| 实现 | " + " | ".join(fmt_n(n) for n in ns) + " |")
+        print("|---|" + "---|" * len(ns))
+        for i in impls:
+            cells = []
+            for n in ns:
+                m = mem.get((t, i, n))
+                cells.append("—" if m is None else f"{float(m['bytes_per_conn']):,.0f} B · {float(m['idle_cpu_pct']):.2f}%")
+            print(f"| {i} | " + " | ".join(cells) + " |")
+        print()
 
 print("### 3. 同一负载（总共 5 万 msg/s）下连接数的影响（p50 / p99 / p99.9 µs · 服务端 IO 线程 CPU，括号为主循环线程；实测吞吐不足 99% 或丢包时标注）\n")
-for t, name, impls, ns in SPECS:
-    print(f"**{name}**\n")
-    print("| 实现 | " + " | ".join(f"{fmt_n(n)} 连接 × {LOAD / n:g}/s" for n in ns) + " |")
-    print("|---|" + "---|" * len(ns))
-    for i in impls:
-        cells = []
-        for n in ns:
-            k = (t, i, n, LOAD)
-            if k not in rows:
-                cells.append("—")
-                continue
-            c, m = med(k, "srv_cpu_pct"), med(k, "main_cpu_pct")
-            tp, drops = med(k, "msgs_per_s"), med(k, "drops_per_s") or 0
-            s = f"{med(k, 'p50_us'):.0f} / {med(k, 'p99_us'):.0f} / {med(k, 'p999_us'):.0f} · {c:.0f}%"
-            if m is not None:
-                s += f"（{m:.0f}%）"
-            if tp < 0.99 * LOAD:
-                s += f"，**只达 {tp / LOAD * 100:.0f}%**"
-            if drops >= 10:
-                s += f"，丢包 {drops:,.0f}/s"
-            cells.append(s)
-        print(f"| {i} | " + " | ".join(cells) + " |")
-    print()
+for group, rows in sorted(row_groups.items()):
+    group_heading(group, row_groups)
+    for t, name, impls, ns in SPECS:
+        print(f"**{name}**\n")
+        print("| 实现 | " + " | ".join(f"{fmt_n(n)} 连接 × {LOAD / n:g}/s" for n in ns) + " |")
+        print("|---|" + "---|" * len(ns))
+        for i in impls:
+            cells = []
+            for n in ns:
+                k = (t, i, n, LOAD)
+                if k not in rows:
+                    cells.append("—")
+                    continue
+                c, m = med(k, "srv_cpu_pct"), med(k, "main_cpu_pct")
+                tp, drops = med(k, "msgs_per_s"), med(k, "drops_per_s") or 0
+                s = f"{med(k, 'p50_us'):.0f} / {med(k, 'p99_us'):.0f} / {med(k, 'p999_us'):.0f} · {c:.0f}%"
+                if m is not None:
+                    s += f"（{m:.0f}%）"
+                if tp < 0.99 * LOAD:
+                    s += f"，**只达 {tp / LOAD * 100:.0f}%**"
+                if drops >= 10:
+                    s += f"，丢包 {drops:,.0f}/s"
+                cells.append(s)
+            print(f"| {i} | " + " | ".join(cells) + " |")
+        print()
 
 print("### 4. 负载扫描（10000 条连接；p99 µs · 服务端 IO 线程 CPU；* = 实测吞吐不足设定的 99% 或 p99 > 5ms，即不达标）\n")
 loads = [25000, 50000, 75000, 100000, 125000, 150000, 200000]
-print("| 传输 | 实现 | " + " | ".join(f"{l // 1000}k msg/s" for l in loads) + " | 最高达标负载 |")
-print("|---|---|" + "---|" * (len(loads) + 1))
-for t, name, impls, _ in SPECS:
-    for i in impls:
-        cells, best = [], None
-        for l in loads:
-            k = (t, i, 10000, l)
-            if k not in rows:
-                cells.append("—")
-                continue
-            tp, p99, c = med(k, "msgs_per_s"), med(k, "p99_us"), med(k, "srv_cpu_pct")
-            ok = tp >= 0.99 * l and p99 <= 5000
-            if ok:
-                best = l
-            cells.append(f"{p99:.0f} · {c:.0f}%" + ("" if ok else "*"))
-        print(f"| {name} | {i} | " + " | ".join(cells) + f" | {'< 2.5 万' if best is None else f'{best // 1000}k'} |")
+for group, rows in sorted(row_groups.items()):
+    group_heading(group, row_groups)
+    print("| 传输 | 实现 | " + " | ".join(f"{l // 1000}k msg/s" for l in loads) + " | 最高达标负载 |")
+    print("|---|---|" + "---|" * (len(loads) + 1))
+    for t, name, impls, _ in SPECS:
+        for i in impls:
+            cells, best = [], None
+            for l in loads:
+                k = (t, i, 10000, l)
+                if k not in rows:
+                    cells.append("—")
+                    continue
+                tp, p99, c = med(k, "msgs_per_s"), med(k, "p99_us"), med(k, "srv_cpu_pct")
+                ok = tp >= 0.99 * l and p99 <= 5000
+                if ok:
+                    best = l
+                cells.append(f"{p99:.0f} · {c:.0f}%" + ("" if ok else "*"))
+            print(f"| {name} | {i} | " + " | ".join(cells) + f" | {'< 2.5 万' if best is None else f'{best // 1000}k'} |")
 EOF

@@ -151,6 +151,31 @@ void TestQuitFromAnotherThread()
     lt.Stop(); // 重复 Stop 是空操作
 }
 
+// MPSC 只保证每个生产者内部的顺序；另一个生产者的 Quit 不能跳过已排队且超过每轮预算的任务。
+void TestQuitDrainsOtherProducerBacklog()
+{
+    EventLoop loop;
+    CHECK(loop.Init() == 0);
+    constexpr int kTasks = 20000;
+    int executed = 0;
+    for (int i = 0; i < kTasks; ++i)
+        loop.Post([&] { ++executed; });
+    std::atomic<bool> posted{false};
+    std::atomic<bool> done{false};
+    std::thread quitter(
+        [&]
+        {
+            loop.Quit();
+            posted.store(true, std::memory_order_release);
+            CHECK(WaitUntil([&] { return done.load(std::memory_order_acquire); }));
+        });
+    CHECK(WaitUntil([&] { return posted.load(std::memory_order_acquire); }));
+    loop.Run();
+    done.store(true, std::memory_order_release);
+    quitter.join();
+    CHECK(executed == kTasks);
+}
+
 // ---- 定时器（假时钟，全在当前线程 RunOnce(0) 驱动，不依赖真实时间）----
 
 struct FakeClock
@@ -280,6 +305,7 @@ int main()
     TestWakeupStress();
     TestWakeupWhileSleeping();
     TestQuitFromAnotherThread();
+    TestQuitDrainsOtherProducerBacklog();
     TestTimersFireInOrderWhenDue();
     TestTimerCancel();
     TestTimerScheduledFromTimer();

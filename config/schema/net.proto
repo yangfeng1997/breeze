@@ -57,6 +57,10 @@ message NetConfig {
   TlsConfig tls = 17;
   // ---- WebSocket（ws:// 与 wss:// 端点；设计见 docs/网络库设计.md §4.17）----
   WsConfig ws = 18;
+
+  // ---- UDP 分流 ----
+  // rudp 服务端在每个 IO loop 上各绑定一个同端口的 UDP socket；启动后不能改变 shard 数。
+  bool rudp_reuse_port = 20 [(config.default) = "false"];
 }
 
 // 协议版本。生成的名字：tls12 / tls13。

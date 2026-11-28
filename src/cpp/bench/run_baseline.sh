@@ -76,12 +76,25 @@ python3 -I - "$RAW" <<'EOF'
 import re, statistics, sys
 from collections import defaultdict
 
-rows = defaultdict(list)
+META_FIELDS = ("requested_backend", "server_backend", "client_backend", "reuse_port", "io_threads")
+
+def numeric_fields(kv):
+    out = {}
+    for k, v in kv.items():
+        try:
+            out[k] = float(v)
+        except ValueError:
+            pass
+    return out
+
+groups = defaultdict(lambda: defaultdict(list))
 for line in open(sys.argv[1], encoding="utf-8"):
     kv = dict(p.split("=", 1) for p in line.split()[1:])
+    # 只按已有元数据分组，保留旧后端证据，不推测缺失字段。
+    group = tuple((k, kv[k]) for k in META_FIELDS if k in kv)
     # 没有 active 字段的旧结果：全部连接活跃
     key = (kv["transport"], int(kv["size"]), int(kv["conns"]), int(kv.get("active", kv["conns"])), kv["impl"])
-    rows[key].append({k: float(v) for k, v in kv.items() if k not in ("impl", "transport")})
+    groups[group][key].append(numeric_fields(kv))
 
 def med(key, field):
     vals = [r[field] for r in rows.get(key, []) if field in r]
@@ -99,73 +112,76 @@ SPECS = {
     "ws": (["breeze"], "breeze", "breeze"),
     "wss": (["breeze"], "breeze", "breeze"),
 }
-present = {k[0] for k in rows}
-for transport in ("tcp", "uds", "udp", "tls", "ws", "wss"):
-    if transport not in present:
-        continue
-    impls, base_impl, cpu_impl = SPECS[transport]
-    print(f"\n### {transport.upper()}（吞吐 msg/s，中位数；括号内为相对 {base_impl}；延迟 µs 为 p50 / p99）\n")
-    extra = " 丢包/s(rudp) |" if transport == "udp" else ""
-    print("| 消息 | 连接 | " + " | ".join(impls) + f" | 服务端 CPU({cpu_impl}) |{extra}")
-    print("|" + "---|" * (len(impls) + 3 + (1 if transport == "udp" else 0)))
-    for size in (64, 1024):
-        for conns in (1, 64, 10000):
-            base = med((transport, size, conns, conns, base_impl), "msgs_per_s")
-            cells = []
-            for impl in impls:
-                k = (transport, size, conns, conns, impl)
-                m = med(k, "msgs_per_s")
-                if m is None:
-                    cells.append("—")
-                    continue
-                rel = "" if impl == base_impl or not base else f"（{m / base * 100:.0f}%）"
-                cells.append(f"{m:,.0f}{rel}<br>{med(k, 'p50_us'):.0f} / {med(k, 'p99_us'):.0f}")
-            cpu = med((transport, size, conns, conns, cpu_impl), "srv_cpu_pct")
-            tail = ""
-            if transport == "udp":
-                d = med((transport, size, conns, conns, "rudp"), "drops_per_s")
-                tail = f" {'—' if d is None else f'{d:,.0f}'} |"
-            print(f"| {size}B | {conns} | " + " | ".join(cells) + f" | {'—' if cpu is None else f'{cpu:.0f}%'} |{tail}")
+for group, rows in sorted(groups.items()):
+    if len(groups) > 1 or group:
+        print("\n## 配置：" + (" · ".join(f"{k}={v}" for k, v in group) or "legacy") + "\n")
+    present = {k[0] for k in rows}
+    for transport in ("tcp", "uds", "udp", "tls", "ws", "wss"):
+        if transport not in present:
+            continue
+        impls, base_impl, cpu_impl = SPECS[transport]
+        print(f"\n### {transport.upper()}（吞吐 msg/s，中位数；括号内为相对 {base_impl}；延迟 µs 为 p50 / p99）\n")
+        extra = " 丢包/s(rudp) |" if transport == "udp" else ""
+        print("| 消息 | 连接 | " + " | ".join(impls) + f" | 服务端 CPU({cpu_impl}) |{extra}")
+        print("|" + "---|" * (len(impls) + 3 + (1 if transport == "udp" else 0)))
+        for size in (64, 1024):
+            for conns in (1, 64, 10000):
+                base = med((transport, size, conns, conns, base_impl), "msgs_per_s")
+                cells = []
+                for impl in impls:
+                    k = (transport, size, conns, conns, impl)
+                    m = med(k, "msgs_per_s")
+                    if m is None:
+                        cells.append("—")
+                        continue
+                    rel = "" if impl == base_impl or not base else f"（{m / base * 100:.0f}%）"
+                    cells.append(f"{m:,.0f}{rel}<br>{med(k, 'p50_us'):.0f} / {med(k, 'p99_us'):.0f}")
+                cpu = med((transport, size, conns, conns, cpu_impl), "srv_cpu_pct")
+                tail = ""
+                if transport == "udp":
+                    d = med((transport, size, conns, conns, "rudp"), "drops_per_s")
+                    tail = f" {'—' if d is None else f'{d:,.0f}'} |"
+                print(f"| {size}B | {conns} | " + " | ".join(cells) + f" | {'—' if cpu is None else f'{cpu:.0f}%'} |{tail}")
 
-scale = [k for k in rows if k[3] != k[2]]
-if scale:
-    print("\n### 会话多、活跃少：10000 条连接已建立，只有 64 条 ping-pong（吞吐 msg/s 中位数；变化是相对同传输同大小下 64 连接全活跃；延迟 µs 为 p50 / p99）\n")
-    print("| 消息 | 传输 | 实现 | 64 连接全活跃 | 10000 连接 / 64 活跃 | 变化 | 服务端 CPU |")
-    print("|---|---|---|---|---|---|---|")
-    for size in (64, 1024):
-        for transport, impls in (("tcp", ["raw", "muduo", "breeze"]), ("udp", ["raw-udp", "rudp"])):
-            for impl in impls:
-                a = (transport, size, 64, 64, impl)
-                b = (transport, size, 10000, 64, impl)
-                ma, mb = med(a, "msgs_per_s"), med(b, "msgs_per_s")
-                if mb is None:
-                    continue
-                chg = "—" if ma is None else f"{(mb / ma - 1) * 100:+.0f}%"
-                fa = "—" if ma is None else f"{ma:,.0f}<br>{med(a, 'p50_us'):.0f} / {med(a, 'p99_us'):.0f}"
-                fb = f"{mb:,.0f}<br>{med(b, 'p50_us'):.0f} / {med(b, 'p99_us'):.0f}"
-                cpu = med(b, "srv_cpu_pct")
-                print(f"| {size}B | {transport} | {impl} | {fa} | {fb} | {chg} | {cpu:.0f}% |")
+    scale = [k for k in rows if k[3] != k[2]]
+    if scale:
+        print("\n### 会话多、活跃少：10000 条连接已建立，只有 64 条 ping-pong（吞吐 msg/s 中位数；变化是相对同传输同大小下 64 连接全活跃；延迟 µs 为 p50 / p99）\n")
+        print("| 消息 | 传输 | 实现 | 64 连接全活跃 | 10000 连接 / 64 活跃 | 变化 | 服务端 CPU |")
+        print("|---|---|---|---|---|---|---|")
+        for size in (64, 1024):
+            for transport, impls in (("tcp", ["raw", "muduo", "breeze"]), ("udp", ["raw-udp", "rudp"])):
+                for impl in impls:
+                    a = (transport, size, 64, 64, impl)
+                    b = (transport, size, 10000, 64, impl)
+                    ma, mb = med(a, "msgs_per_s"), med(b, "msgs_per_s")
+                    if mb is None:
+                        continue
+                    chg = "—" if ma is None else f"{(mb / ma - 1) * 100:+.0f}%"
+                    fa = "—" if ma is None else f"{ma:,.0f}<br>{med(a, 'p50_us'):.0f} / {med(a, 'p99_us'):.0f}"
+                    fb = f"{mb:,.0f}<br>{med(b, 'p50_us'):.0f} / {med(b, 'p99_us'):.0f}"
+                    cpu = med(b, "srv_cpu_pct")
+                    print(f"| {size}B | {transport} | {impl} | {fa} | {fb} | {chg} | {cpu:.0f}% |")
 
-if "tcp" in present and "udp" in present:
-    print("\n### TCP 与 UDP 对照（rudp 相对 TCP 上的 muduo / breeze；吞吐 msg/s，中位数；延迟 µs 为 p50 / p99）\n")
-    print("| 消息 | 连接 | muduo(TCP) | breeze(TCP) | raw-udp | rudp | rudp / breeze | rudp / muduo | rudp-batched |")
-    print("|" + "---|" * 9)
-    for size in (64, 1024):
-        for conns in (1, 64, 10000):
-            def cell(transport, impl):
-                k = (transport, size, conns, conns, impl)
-                m = med(k, "msgs_per_s")
-                return None if m is None else (m, med(k, "p50_us"), med(k, "p99_us"))
-            mu, br, ru, rw, rb = cell("tcp", "muduo"), cell("tcp", "breeze"), cell("udp", "rudp"), cell("udp", "raw-udp"), cell("udp", "rudp-batched")
-            fmt = lambda c: "—" if c is None else f"{c[0]:,.0f}<br>{c[1]:.0f} / {c[2]:.0f}"
-            ratio = lambda a, b: "—" if a is None or b is None else f"{a[0] / b[0] * 100:.0f}%"
-            print(f"| {size}B | {conns} | {fmt(mu)} | {fmt(br)} | {fmt(rw)} | {fmt(ru)} | {ratio(ru, br)} | {ratio(ru, mu)} | {fmt(rb)} |")
+    if "tcp" in present and "udp" in present:
+        print("\n### TCP 与 UDP 对照（rudp 相对 TCP 上的 muduo / breeze；吞吐 msg/s，中位数；延迟 µs 为 p50 / p99）\n")
+        print("| 消息 | 连接 | muduo(TCP) | breeze(TCP) | raw-udp | rudp | rudp / breeze | rudp / muduo | rudp-batched |")
+        print("|" + "---|" * 9)
+        for size in (64, 1024):
+            for conns in (1, 64, 10000):
+                def cell(transport, impl):
+                    k = (transport, size, conns, conns, impl)
+                    m = med(k, "msgs_per_s")
+                    return None if m is None else (m, med(k, "p50_us"), med(k, "p99_us"))
+                mu, br, ru, rw, rb = cell("tcp", "muduo"), cell("tcp", "breeze"), cell("udp", "rudp"), cell("udp", "raw-udp"), cell("udp", "rudp-batched")
+                fmt = lambda c: "—" if c is None else f"{c[0]:,.0f}<br>{c[1]:.0f} / {c[2]:.0f}"
+                ratio = lambda a, b: "—" if a is None or b is None else f"{a[0] / b[0] * 100:.0f}%"
+                print(f"| {size}B | {conns} | {fmt(mu)} | {fmt(br)} | {fmt(rw)} | {fmt(ru)} | {ratio(ru, br)} | {ratio(ru, mu)} | {fmt(rb)} |")
 
-print("\n### 同一配置各次重复之间的波动（(最大-最小)/中位数，%）——差距小于它就不能下结论\n")
-worst = defaultdict(float)
-for key in rows:
-    worst[key[4]] = max(worst[key[4]], spread(key, "msgs_per_s"))
-print("| " + " | ".join(worst) + " |")
-print("|" + "---|" * len(worst))
-print("| " + " | ".join(f"最大 {v:.0f}%" for v in worst.values()) + " |")
+    print("\n### 同一配置各次重复之间的波动（(最大-最小)/中位数，%）——差距小于它就不能下结论\n")
+    worst = defaultdict(float)
+    for key in rows:
+        worst[key[4]] = max(worst[key[4]], spread(key, "msgs_per_s"))
+    print("| " + " | ".join(worst) + " |")
+    print("|" + "---|" * len(worst))
+    print("| " + " | ".join(f"最大 {v:.0f}%" for v in worst.values()) + " |")
 EOF

@@ -40,8 +40,8 @@ public:
     IConnection(const IConnection&) = delete;
     IConnection& operator=(const IConnection&) = delete;
 
-    // 发送一帧：帧头由本连接的 codec 生成，payload 不拷贝（同一块可以同时发给多条连接）。
-    // IO 线程内写队列为空时先直接写，写不完才入队并注册 EPOLLOUT；已有积压则排在后面，保序。
+    // 发送一帧：帧头由本连接的 codec 生成；Ok 表示库已接受，不保证对端收到。
+    // SharedBuffer 可跨连接共享；IO 线程内写队列为空时先直接写，写不完才入队并注册 EPOLLOUT，保序。
     virtual SendResult Send(SharedBuffer payload) = 0;
 
     // 视图版本：不拿走所有权，也不要求调用方先拷成 SharedBuffer。尽量直接从 payload
@@ -51,7 +51,8 @@ public:
     // Send，每条消息白白多一次分配与拷贝。已经有 SharedBuffer（要跨连接共享、要入队）时用上面那个。
     virtual SendResult Send(std::span<const std::byte> payload) = 0;
 
-    // 立即关闭。连接上不再有读写，OnClosed 在本轮分发之后回调（不在当前调用栈里），对象此后才销毁。
+    // 立即关闭，不等待发送队列排空；Send(Ok) 不承诺送达，需要排空时用 CloseGracefully。
+    // OnClosed 在本轮分发之后回调（不在当前调用栈里），对象此后才销毁。
     // 重复调用、对已关闭的连接调用都是空操作。
     virtual void Close() = 0;
 

@@ -45,7 +45,8 @@ public:
                                         const Endpoint& local,
                                         const RUdpOptions& options,
                                         IDatagramHandler& handler,
-                                        std::unique_ptr<UdpSocket>& out);
+                                        std::unique_ptr<UdpSocket>& out,
+                                        bool reuse_port = false);
     // 客户端：connect 到 peer（UDP 的 connect 只设默认对端，立即返回）。
     [[nodiscard]] static int OpenClient(EventLoop& loop,
                                         const Endpoint& peer,
@@ -87,7 +88,8 @@ private:
                     bool server,
                     const RUdpOptions& options,
                     IDatagramHandler& handler,
-                    std::unique_ptr<UdpSocket>& out);
+                    std::unique_ptr<UdpSocket>& out,
+                    bool reuse_port = false);
 
     void OnEvents(std::uint32_t events) override;
     // 读一批，返回收到的数据报个数；0 = 没有更多。

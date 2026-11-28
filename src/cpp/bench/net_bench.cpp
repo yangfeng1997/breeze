@@ -53,6 +53,8 @@
 //                 [--storm N]           重连风暴：N 个客户端线程不停 connect → RST 断开，量每次 accept 的服务端 CPU 与
 //                                       跨 loop 投递闭包的分配占比（--io-threads 是服务端 loop 数，默认 4）
 //                 [--fanout K]          breeze-mainloop：主循环对同一连接连续 Send K 条回复（量批内合并）
+//                 [--reuse-port true|false]       rudp 服务端的 SO_REUSEPORT，默认 false
+//                 [--io-threads N]                rudp 的 group 大小（默认 1）；storm 模式默认 4
 
 #include <poll.h>
 #include <sched.h>
@@ -158,8 +160,46 @@ struct BenchOptions
     int delay_ms = 0; // UDP：客户端侧给每个方向各加这么多毫秒的延迟（往返 = 2 倍），模拟有 RTT 的网络
     int active = 0;   // > 0：只让这么多条连接 ping-pong，其余连上之后空闲（测「会话多」对活跃连接的影响）
     double rate = 0;  // > 0：每条连接每秒发这么多条（定速负载）；0 = 闭环全速
+    bool reuse_port = false;
+    int io_threads = 1; // rudp：group 大小；reuse_port 关闭时只在一个 loop 收包
     std::vector<int> client_cpus;
 };
+
+bool ParseBool(const std::string& s)
+{
+    if (s == "true")
+        return true;
+    if (s == "false")
+        return false;
+    Die("--reuse-port 只能是 true 或 false");
+}
+
+std::uint64_t GroupIterations(EventLoopGroup& group)
+{
+    std::uint64_t total = 0;
+    for (std::size_t i = 0; i < GroupAccess::LoopCount(group); ++i)
+        total += GroupAccess::LoopAt(group, i).Iterations();
+    return total;
+}
+
+std::vector<pthread_t> PinGroup(EventLoopGroup& group, int cpu)
+{
+    std::vector<pthread_t> threads;
+    for (std::size_t i = 0; i < GroupAccess::LoopCount(group); ++i)
+    {
+        std::promise<pthread_t> ready;
+        auto future = ready.get_future();
+        GroupAccess::LoopAt(group, i).Post(
+            [cpu, &ready]
+            {
+                // --server-cpu 只指定一个核时，所有服务端 IO 线程共用它。
+                PinTo(cpu);
+                ready.set_value(::pthread_self());
+            });
+        threads.push_back(future.get());
+    }
+    return threads;
+}
 
 std::vector<int> ParseCpus(const std::string& s)
 {
@@ -216,6 +256,8 @@ public:
     virtual void Stop() = 0;
     // 服务端 IO 线程：读它的 CPU 时间，判断压测时它是否已经饱和（没饱和说明瓶颈在别处，比出来的不是服务端的差异）。
     virtual pthread_t ServerThread() = 0;
+    virtual std::vector<pthread_t> ServerThreads() { return {ServerThread()}; }
+    virtual std::uint64_t Connections() { return 0; }
     // 服务端 loop 已经跑过的轮数；没有"轮"概念的实现返回 0。
     virtual std::uint64_t Iterations() { return 0; }
     // 除 IO 线程之外还有第二个服务端线程（主循环）的实现返回它，否则 0：同样读它的 CPU 时间，看瓶颈在哪一个。
@@ -451,6 +493,7 @@ public:
     }
     void Stop() override { lt_.Stop(); }
     pthread_t ServerThread() override { return lt_.native_handle(); }
+    std::uint64_t Connections() override { return lt_.loop.ConnectionCount(); }
     std::uint64_t Iterations() override { return lt_.loop.Iterations(); }
 
 private:
@@ -564,6 +607,7 @@ public:
             group_->Shutdown(std::chrono::milliseconds::zero());
     }
     pthread_t ServerThread() override { return thread_; }
+    std::uint64_t Connections() override { return group_->GetStats().connections; }
     std::uint64_t Iterations() override { return group_ ? GroupAccess::LoopAt(*group_, 0).Iterations() : 0; }
 
 private:
@@ -626,6 +670,7 @@ class MainLoopServer final : public EchoServer
                 RUdpServerOptions so;
                 so.connection = net->options().connection;
                 so.rudp = net->options().rudp;
+                so.reuse_port = net->options().rudp_reuse_port;
                 so.max_pending_tickets = 1u << 18;
                 auto s = net->AddRUdpServer(*RUdpEndpoint::From(listen_), biz_, std::move(so));
                 if (!s)
@@ -667,18 +712,21 @@ public:
     // rudp = true：udp:// 端点（rudp 服务端，flush_on_send），业务照样在主循环线程上回显。
     // scheme：tcp（端点原样用）| tls | ws | wss（tcp 端点换 scheme；证书写到临时目录，经 net.tls 的路径交给
     // NetModule）。
-    MainLoopServer(int mainloop_cpu, bool rudp, std::string scheme = "tcp")
-        : mainloop_cpu_(mainloop_cpu)
+    MainLoopServer(const BenchOptions& options, bool rudp, std::string scheme = "tcp")
+        : mainloop_cpu_(options.mainloop_cpu)
         , rudp_(rudp)
         , scheme_(std::move(scheme))
+        , reuse_port_(options.reuse_port)
+        , io_threads_(rudp ? options.io_threads : 1)
     {
     }
 
     Endpoint Start(const Endpoint& ep, int cpu) override
     {
         NetModuleOptions no;
-        no.group = {1, g_table_slots}; // 连接表要装得下全部连接
-        no.rudp.flush_on_send = true;  // 只对 udp:// 生效，与 rudp 一样用低延迟配置
+        no.group = {static_cast<std::uint32_t>(io_threads_), g_table_slots};
+        no.rudp_reuse_port = reuse_port_;
+        no.rudp.flush_on_send = true; // 只对 udp:// 生效，与 rudp 一样用低延迟配置
 #if !defined(BREEZE_BENCH_NO_TLS)
         if (scheme_ == "tls" || scheme_ == "wss")
         {
@@ -718,15 +766,7 @@ public:
                     Die(result_.error().msg.c_str());
             });
         const Endpoint actual = bound.get(); // Run 失败时 Die 会退出进程，不会一直等
-        EventLoop& loop = GroupAccess::LoopAt(net_->group(), 0);
-        std::promise<pthread_t> io;
-        loop.Post(
-            [&io, cpu]
-            {
-                PinTo(cpu);
-                io.set_value(pthread_self());
-            });
-        io_thread_ = io.get_future().get();
+        io_threads_native_ = PinGroup(net_->group(), cpu);
         return actual;
     }
     void Stop() override
@@ -742,9 +782,11 @@ public:
             ::rmdir(cert_dir_.c_str());
         }
     }
-    pthread_t ServerThread() override { return io_thread_; }
+    pthread_t ServerThread() override { return io_threads_native_.front(); }
+    std::vector<pthread_t> ServerThreads() override { return io_threads_native_; }
     pthread_t ExtraThread() override { return thread_.native_handle(); }
-    std::uint64_t Iterations() override { return GroupAccess::LoopAt(net_->group(), 0).Iterations(); }
+    std::uint64_t Connections() override { return net_->group().GetStats().connections; }
+    std::uint64_t Iterations() override { return GroupIterations(net_->group()); }
     std::vector<RUdpTicket> IssueTickets(int n) override
     {
         REQUIRE(rudp_ && rudp_server_ != nullptr);
@@ -762,6 +804,8 @@ private:
     int mainloop_cpu_;
     bool rudp_;
     std::string scheme_;
+    bool reuse_port_;
+    int io_threads_;
     std::string cert_dir_; // tls / wss：证书临时目录（进程退出前由 Stop 清理）
     RUdpServer* rudp_server_ = nullptr;
     EchoBiz biz_;
@@ -770,7 +814,7 @@ private:
     std::stop_source stop_;
     std::expected<void, Error> result_;
     std::thread thread_;
-    pthread_t io_thread_{};
+    std::vector<pthread_t> io_threads_native_;
 };
 
 #ifdef BREEZE_BENCH_MUDUO
@@ -921,29 +965,25 @@ public:
 class RUdpBenchServer final : public EchoServer
 {
 public:
-    explicit RUdpBenchServer(bool flush_on_send)
+    RUdpBenchServer(bool flush_on_send, const BenchOptions& options)
         : flush_on_send_(flush_on_send)
+        , reuse_port_(options.reuse_port)
+        , io_threads_(options.io_threads)
     {
     }
 
     Endpoint Start(const Endpoint& ep, int cpu) override
     {
-        group_ = std::make_unique<EventLoopGroup>(EventLoopGroupOptions{1, g_table_slots}); // 连接表要装得下全部会话
+        group_ = std::make_unique<EventLoopGroup>(
+            EventLoopGroupOptions{static_cast<std::uint32_t>(io_threads_), g_table_slots});
         REQUIRE(group_->Start() == 0);
         RUdpServerOptions so;
+        so.reuse_port = reuse_port_;
         so.rudp.flush_on_send = flush_on_send_;
         so.max_pending_tickets = 1u << 18; // 10 万会话时要一次签发 10 万张票据，超过默认的 65536
         server_ = std::make_unique<RUdpServer>(*group_, *RUdpEndpoint::From(ep), std::move(so), handler_);
         REQUIRE(server_->Start() == 0);
-        EventLoop& loop = GroupAccess::LoopAt(*group_, 0);
-        std::promise<pthread_t> io;
-        loop.Post(
-            [&io, cpu]
-            {
-                PinTo(cpu);
-                io.set_value(pthread_self());
-            });
-        io_thread_ = io.get_future().get();
+        io_threads_native_ = PinGroup(*group_, cpu);
         return server_->endpoint();
     }
     void Stop() override
@@ -953,8 +993,10 @@ public:
         server_.reset();
         group_.reset();
     }
-    pthread_t ServerThread() override { return io_thread_; }
-    std::uint64_t Iterations() override { return GroupAccess::LoopAt(*group_, 0).Iterations(); }
+    pthread_t ServerThread() override { return io_threads_native_.front(); }
+    std::vector<pthread_t> ServerThreads() override { return io_threads_native_; }
+    std::uint64_t Connections() override { return group_->GetStats().connections; }
+    std::uint64_t Iterations() override { return GroupIterations(*group_); }
     std::uint64_t BytesIn() override { return group_->GetStats().bytes_in; }
     double MaxLoopLagUs() override
     {
@@ -975,20 +1017,21 @@ public:
 
 private:
     bool flush_on_send_;
+    bool reuse_port_;
+    int io_threads_;
     RUdpEchoHandler handler_;
     std::unique_ptr<EventLoopGroup> group_;
     std::unique_ptr<RUdpServer> server_;
-    pthread_t io_thread_{};
+    std::vector<pthread_t> io_threads_native_;
 };
 
-std::unique_ptr<EchoServer> MakeServer(const std::string& impl,
-                                       const std::string& transport,
-                                       std::size_t size,
-                                       int mainloop_cpu)
+std::unique_ptr<EchoServer> MakeServer(const BenchOptions& options)
 {
+    const auto& impl = options.impl;
+    const auto& transport = options.transport;
 #if !defined(BREEZE_BENCH_NO_TLS)
     if ((transport == "tls" || transport == "ws" || transport == "wss") && impl == "breeze-mainloop")
-        return std::make_unique<MainLoopServer>(mainloop_cpu, false, transport);
+        return std::make_unique<MainLoopServer>(options, false, transport);
     if (transport == "tls")
         return std::make_unique<SecureServer>(/*tls=*/true, /*ws=*/false);
     if (transport == "ws")
@@ -996,7 +1039,7 @@ std::unique_ptr<EchoServer> MakeServer(const std::string& impl,
     if (transport == "wss")
         return std::make_unique<SecureServer>(/*tls=*/true, /*ws=*/true);
 #endif
-    (void)impl;
+    (void)transport;
     if (impl.rfind("raw", 0) == 0 && impl != "raw-udp")
     {
         // raw | raw-iov | raw-iov+rdhup | raw-iov+cold | raw-iov+ptr | raw-iov+all（诊断变体，见 RawOptions）
@@ -1010,19 +1053,19 @@ std::unique_ptr<EchoServer> MakeServer(const std::string& impl,
     if (impl == "raw-udp")
         return std::make_unique<RawUdpServer>();
     if (impl == "rudp")
-        return std::make_unique<RUdpBenchServer>(true);
+        return std::make_unique<RUdpBenchServer>(true, options);
     if (impl == "rudp-batched")
-        return std::make_unique<RUdpBenchServer>(false);
+        return std::make_unique<RUdpBenchServer>(false, options);
     if (impl == "breeze")
         return std::make_unique<BreezeServer>(std::make_unique<BenchHandler>());
     if (impl == "breeze-copy")
         return std::make_unique<BreezeServer>(std::make_unique<CopyEchoHandler>());
     if (impl == "breeze-fixed")
-        return std::make_unique<BreezeServer>(std::make_unique<FixedReplyHandler>(size));
+        return std::make_unique<BreezeServer>(std::make_unique<FixedReplyHandler>(options.size));
     if (impl == "breeze-mainloop")
-        return std::make_unique<MainLoopServer>(mainloop_cpu, false);
+        return std::make_unique<MainLoopServer>(options, false);
     if (impl == "rudp-mainloop")
-        return std::make_unique<MainLoopServer>(mainloop_cpu, true);
+        return std::make_unique<MainLoopServer>(options, true);
 #ifdef BREEZE_BENCH_MUDUO
     if (impl == "muduo")
         return std::make_unique<MuduoServer>();
@@ -1035,7 +1078,9 @@ std::unique_ptr<EchoServer> MakeServer(const std::string& impl,
 struct WorkerResult
 {
     std::uint64_t msgs = 0;
-    std::vector<std::uint32_t> lat_ns;
+    std::uint64_t replied_connections = 0;
+    // 高连接饱和时RTT可能超过4.29秒，不能用32位纳秒截断尾延迟。
+    std::vector<std::uint64_t> lat_ns;
 };
 
 class WorkerBase
@@ -1089,7 +1134,14 @@ public:
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             REQUIRE(rc == 0 || rc == EINPROGRESS);
             pollfd p{c.fd.get(), POLLOUT, 0};
-            REQUIRE(::poll(&p, 1, 10000) > 0 && sock::GetSocketError(c.fd.get()) == 0);
+            const int ready = ::poll(&p, 1, 10000);
+            const int wait_error = ready < 0 ? errno : 0;
+            const int socket_error = sock::GetSocketError(c.fd.get());
+            if (ready <= 0 || socket_error != 0)
+                std::fprintf(stderr, "connect failed target=%s index=%d fd=%d poll=%d revents=%d errno=%d SO_ERROR=%d\n",
+                             target.ToString().c_str(), first_ + i, c.fd.get(), ready,
+                             static_cast<int>(p.revents), wait_error, socket_error);
+            REQUIRE(ready > 0 && socket_error == 0);
             if (target.kind() == Endpoint::Kind::Tcp)
                 (void)tcp::SetNoDelay(c.fd.get());
             c.rbuf.resize(frame_.size() * static_cast<std::size_t>(g_fanout));
@@ -1155,12 +1207,13 @@ public:
                                             frame_.data(),
                                             frame_.size()) == 0);
                     c.verified = true;
+                    ++result_.replied_connections;
                 }
                 if (measuring.load(std::memory_order_relaxed))
                 {
                     const auto lat =
                         std::chrono::duration_cast<std::chrono::nanoseconds>(BenchClock::now() - c.sent_at).count();
-                    result_.lat_ns.push_back(static_cast<std::uint32_t>(std::min<std::int64_t>(lat, UINT32_MAX)));
+                    result_.lat_ns.push_back(static_cast<std::uint64_t>(std::max<std::int64_t>(lat, 0)));
                     ++result_.msgs;
                 }
                 c.got = 0;
@@ -1341,12 +1394,14 @@ public:
         if (++c.got < g_fanout) // 服务端对每条请求回 g_fanout 条：等齐才算一次往返
             return;
         c.got = 0;
+        if (!c.verified)
+            ++result_.replied_connections;
         c.verified = true;
         if (measuring_ != nullptr && measuring_->load(std::memory_order_relaxed))
         {
             const auto lat =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(BenchClock::now() - c.sent_at).count();
-            result_.lat_ns.push_back(static_cast<std::uint32_t>(std::min<std::int64_t>(lat, UINT32_MAX)));
+            result_.lat_ns.push_back(static_cast<std::uint64_t>(std::max<std::int64_t>(lat, 0)));
             ++result_.msgs;
         }
         if (!paced_)
@@ -1672,12 +1727,13 @@ private:
         {
             REQUIRE(std::memcmp(reply.data(), payload_.data(), payload_.size()) == 0);
             c.verified = true;
+            ++result_.replied_connections;
         }
         if (measuring.load(std::memory_order_relaxed))
         {
             const auto lat =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(BenchClock::now() - c.sent_at).count();
-            result_.lat_ns.push_back(static_cast<std::uint32_t>(std::min<std::int64_t>(lat, UINT32_MAX)));
+            result_.lat_ns.push_back(static_cast<std::uint64_t>(std::max<std::int64_t>(lat, 0)));
             ++result_.msgs;
         }
         c.pending = false;
@@ -1832,7 +1888,15 @@ double ThreadCpuSeconds(pthread_t t)
     return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) * 1e-9;
 }
 
-double Percentile(const std::vector<std::uint32_t>& sorted, double p)
+double ServerCpuSeconds(EchoServer& server)
+{
+    double total = 0;
+    for (const pthread_t thread : server.ServerThreads())
+        total += ThreadCpuSeconds(thread);
+    return total;
+}
+
+double Percentile(const std::vector<std::uint64_t>& sorted, double p)
 {
     if (sorted.empty())
         return 0;
@@ -1910,19 +1974,21 @@ int MemProbe(const BenchOptions& o, const Endpoint& ep, EchoServer& server, bool
     std::this_thread::sleep_for(std::chrono::milliseconds(1000)); // 服务端 accept / 登记完
     const long after = RssKb();
     // 这些连接空闲着：服务端 IO 线程这 3 秒里还要用多少 CPU（rudp 每 10ms 一拍的定时器要走遍所有会话）
-    const double cpu0 = ThreadCpuSeconds(server.ServerThread());
+    const double cpu0 = ServerCpuSeconds(server);
     std::this_thread::sleep_for(std::chrono::seconds(3));
-    const double idle_cpu = (ThreadCpuSeconds(server.ServerThread()) - cpu0) / 3.0 * 100.0;
+    const double idle_cpu = (ServerCpuSeconds(server) - cpu0) / 3.0 * 100.0;
     std::printf(
         "MEM impl=%s transport=%s conns=%d rss_before_kb=%ld rss_after_kb=%ld bytes_per_conn=%.0f "
-        "idle_cpu_pct=%.2f\n",
+        "idle_cpu_pct=%.2f reuse_port=%s io_threads=%zu\n",
         o.impl.c_str(),
         o.transport.c_str(),
         o.mem_probe,
         before,
         after,
         static_cast<double>(after - before) * 1024.0 / o.mem_probe,
-        idle_cpu);
+        idle_cpu,
+        o.reuse_port ? "true" : "false",
+        server.ServerThreads().size());
     fds.clear();
     server.Stop();
     if (o.transport == "uds")
@@ -2095,7 +2161,9 @@ int main(int argc, char** argv)
         else if (a == "--storm")
             g_storm_threads = std::atoi(next().c_str());
         else if (a == "--io-threads")
-            g_io_threads = std::atoi(next().c_str());
+            o.io_threads = g_io_threads = std::atoi(next().c_str());
+        else if (a == "--reuse-port")
+            o.reuse_port = ParseBool(next());
         else if (a == "--mem-probe")
             o.mem_probe = std::atoi(next().c_str());
         else if (a == "--client-cpus")
@@ -2104,6 +2172,8 @@ int main(int argc, char** argv)
             Die("未知参数");
     }
     REQUIRE(o.conns >= 1 && o.client_threads >= 1 && o.size >= 1);
+    if (o.io_threads < 1 || o.io_threads > 256)
+        Die("--io-threads 要在 1 到 256 之间");
     if (o.transport == "udp" && std::max(o.conns, o.mem_probe) > kUdpMaxConns)
         Die("UDP 在本机最多约 2.5 万条连接（临时端口范围，见 kScaleThreshold 旁的注释）");
     o.client_threads = std::min(o.client_threads, o.conns);
@@ -2152,6 +2222,10 @@ int main(int argc, char** argv)
         Die("tls / ws / wss 的 --mem-probe 暂不支持：每条服务端 TLS 连接的内存见 tls_layer_test 的 "
             "TestIdleServerLayerMemory（实测约 3171 字节）");
 
+    if (o.reuse_port && (!kcp_impl || g_storm_threads > 0))
+        Die("--reuse-port true 只用于 rudp / rudp-batched / rudp-mainloop 的 UDP 服务端");
+    if (g_storm_threads == 0 && !kcp_impl && o.io_threads != 1)
+        Die("多 IO 线程只用于 rudp 服务端或 --storm；其它回显基线保持单线程");
     if (g_storm_threads > 0)
         return Storm(o);
     if (g_fanout < 1 || g_fanout > 32)
@@ -2160,8 +2234,9 @@ int main(int argc, char** argv)
         Die("--fanout 只配 --impl breeze-mainloop（要经 NetModule 的跨线程 Send），传输 tcp / uds / tls / ws / wss");
 
     g_table_slots = std::max(o.conns, o.mem_probe) > 60000 ? (1u << 17) : (1u << 16);
-    auto server = MakeServer(o.impl, o.transport, o.size, o.mainloop_cpu);
+    auto server = MakeServer(o);
     const Endpoint ep = server->Start(*listen_ep, o.server_cpu);
+    const std::size_t server_io_threads = server->ServerThreads().size();
     if (o.mem_probe > 0)
         return MemProbe(o, ep, *server, kcp_impl);
     std::vector<RUdpTicket> tickets;
@@ -2239,7 +2314,7 @@ int main(int argc, char** argv)
 
     go = true;
     std::this_thread::sleep_for(std::chrono::seconds(o.warmup_s));
-    const double cpu0 = ThreadCpuSeconds(server->ServerThread());
+    const double cpu0 = ServerCpuSeconds(*server);
     const bool has_extra = server->ExtraThread() != 0;
     const double extra0 = has_extra ? ThreadCpuSeconds(server->ExtraThread()) : 0.0;
     const std::uint64_t iter0 = server->Iterations();
@@ -2253,11 +2328,12 @@ int main(int argc, char** argv)
     std::this_thread::sleep_for(std::chrono::seconds(o.duration_s));
     measuring = false;
     const auto t1 = BenchClock::now();
-    const double cpu1 = ThreadCpuSeconds(server->ServerThread());
+    const double cpu1 = ServerCpuSeconds(*server);
     const double extra1 = has_extra ? ThreadCpuSeconds(server->ExtraThread()) : 0.0;
     const std::uint64_t iters = server->Iterations() - iter0;
     const std::uint64_t drops = UdpRcvbufErrors() - drops0;
     const std::uint64_t sdrops = o.transport == "udp" ? UdpSocketDrops(ep.port()) - sdrops0 : 0;
+    const std::uint64_t connected_at_end = server->Connections();
     const double max_lag_us = server->MaxLoopLagUs();
     const std::uint64_t rx_bytes = server->BytesIn() - bytes0;
     const std::uint64_t dgrams_in = UdpSnmp("InDatagrams") - in0;
@@ -2272,10 +2348,12 @@ int main(int argc, char** argv)
         ::unlink(ep.address().c_str());
 
     std::uint64_t msgs = 0;
-    std::vector<std::uint32_t> lat;
+    std::uint64_t replied_connections = 0;
+    std::vector<std::uint64_t> lat;
     for (auto& w : workers)
     {
         msgs += w->result().msgs;
+        replied_connections += w->result().replied_connections;
         lat.insert(lat.end(), w->result().lat_ns.begin(), w->result().lat_ns.end());
     }
     std::sort(lat.begin(), lat.end());
@@ -2285,7 +2363,7 @@ int main(int argc, char** argv)
         "RESULT impl=%s transport=%s size=%zu conns=%d active=%d msgs_per_s=%.0f mb_per_s=%.1f p50_us=%.1f "
         "p99_us=%.1f srv_cpu_pct=%.0f msgs_per_iter=%.1f drops_per_s=%.0f srv_sock_drops_per_s=%.0f "
         "max_lag_us=%.0f srv_rx_bytes_per_msg=%.1f dgram_in_per_msg=%.2f dgram_out_per_msg=%.2f delay_ms=%d "
-        "rate=%.1f p90_us=%.1f p999_us=%.1f max_us=%.1f setup_s=%.2f\n",
+        "rate=%.1f p90_us=%.1f p999_us=%.1f max_us=%.1f setup_s=%.2f reuse_port=%s io_threads=%zu\n",
         o.impl.c_str(),
         o.transport.c_str(),
         o.size,
@@ -2308,7 +2386,14 @@ int main(int argc, char** argv)
         Percentile(lat, 0.90) / 1000.0,
         Percentile(lat, 0.999) / 1000.0,
         lat.empty() ? 0.0 : static_cast<double>(lat.back()) / 1000.0,
-        setup_s);
+        setup_s,
+        o.reuse_port ? "true" : "false",
+        server_io_threads);
+    std::printf("BENCH_DIAG transport=%s conns=%d active=%d latency_bits=64 "
+                "connected_at_end=%llu replied_connections=%llu\n",
+                o.transport.c_str(), o.conns, o.active > 0 ? std::min(o.active, o.conns) : o.conns,
+                static_cast<unsigned long long>(connected_at_end),
+                static_cast<unsigned long long>(replied_connections));
     if (has_extra) // 第二个服务端线程（主循环）的 CPU 占用，单独一行以免打乱 RESULT 的固定字段
         std::printf("EXTRA main_cpu_pct=%.0f\n", (extra1 - extra0) / secs * 100.0);
     return 0;

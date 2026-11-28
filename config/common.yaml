@@ -35,6 +35,7 @@ mongo:
 # 面向客户端的进程（gate）在部署配置里设 idle_timeout_ms。
 net:
   io_threads: 4
+  rudp_reuse_port: false
   max_connections_per_loop: 65536
   high_water_mark_bytes: 262144
   idle_timeout_ms: 0

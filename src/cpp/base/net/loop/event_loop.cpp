@@ -477,6 +477,17 @@ void EventLoop::Run()
 {
     while (!quit_)
         RunOnce(-1);
+
+    // Quit 只保证本生产者顺序；停机期间其它生产者可能在最后一轮 dequeue 快照后投递任务。
+    // 把已排队任务处理完，才能兑现“已投递任务在 Run 返回前执行”，也让跨 loop 的排空任务先于线程退出。
+    for (;;)
+    {
+        const std::size_t n = tasks_.TryDequeueBulk(batch_.begin(), kTaskBatch);
+        if (n == 0)
+            break;
+        RunTasks(n);
+        ProcessClosing();
+    }
 }
 
 } // namespace breeze

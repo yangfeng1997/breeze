@@ -5,7 +5,8 @@
 // - 没有 codec / IFrameCodecFactory：消息自带边界，handler 每次收到完整的一条。
 // - 准入靠票据：控制面（login / gate）经可信通道把 RUdpTicket 发给客户端，服务端用 IssueTicket / AddTicket 登记；
 //   客户端握手时出示，一次有效。没登记的来源发什么都建不起会话。
-// - 一个 socket、一个 loop：所有会话都在 Start 时选定的那个 loop 上（要横向扩展就多开几个服务端、监听不同端口）。
+// - 默认一个 socket、一个 loop；reuse_port 开启后，同端口在 group 每个 loop 各建一个 socket，内核按四元组分流。
+//   shard 数量在 Start 后固定，不支持运行中增减；同一来源的会话始终由同一个 loop 服务。
 // - 会话按来源 ip:port 固定，不支持迁移（客户端换网络要重新握手，拿新票据）。
 // - 没有加密与完整性保护（v1）：票据防的是"谁能建会话"，不防在路径上的人读 / 改 / 注入数据报。
 //
@@ -37,10 +38,12 @@ struct RUdpServerOptions
         connection; // 水位、idle_timeout：对每条会话生效。客户端默认每秒一个心跳，idle_timeout 设成几倍间隔
     RUdpOptions rudp;
     // 空 = 全部接受。在 Hello 到达的 IO 线程上、校验票据之前运行；PeerInfo::endpoint 是对端的 udp://ip:port，
-    // 没有 credentials。拒绝的计入 rejected_filter，对端收到 Reject。
+    // 没有 credentials。拒绝的计入 rejected_filter，对端收到 Reject；reuse_port 开启后可被多个 IO 线程并发调用。
     AcceptFilter accept_filter;
     // 已登记但还没被使用的票据上限，防控制面出 bug 时把内存吃光；满了 IssueTicket 返回空。
     std::size_t max_pending_tickets = 65536;
+    // 启用 SO_REUSEPORT：使用 group 的全部 loop；handler / accept_filter 须能被这些线程并发调用。
+    bool reuse_port = false;
 };
 
 class RUdpServer final : public INetServer

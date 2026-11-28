@@ -91,14 +91,35 @@ static_assert(sizeof(AddrKey) == 20, "AddrKeyHash 假定 ip 数组之前是 4 �
 
 } // namespace
 
-struct RUdpServer::Impl final : IDatagramHandler, RUdpConnection::Owner
+struct RUdpServer::Impl
 {
-    Impl(EventLoopGroup& g, Endpoint ep, RUdpServerOptions o, IConnectionHandler& h)
-        : group(g)
-        , endpoint(std::move(ep))
-        , options(std::move(o))
-        , handler(h)
-        , tickets(options.max_pending_tickets)
+    struct Shard;
+
+    Impl(EventLoopGroup& g, Endpoint ep, RUdpServerOptions o, IConnectionHandler& h);
+
+    EventLoopGroup& group;
+    Endpoint endpoint;
+    RUdpServerOptions options;
+    IConnectionHandler& handler;
+    TicketTable tickets;
+    // Start 完成后不增减 shard；全部 socket 建好前不放行 Hello，避免扩组改变已有会话的四元组归属。
+    std::vector<std::unique_ptr<Shard>> shards;
+    std::atomic<bool> accepting{false};
+    // 启动期间、每个尚在接纳的 shard、每个存活会话各占一份；最后一份归还后才能安全缩掉 reuseport 组。
+    std::atomic<std::size_t> lifecycle_refs{0};
+    std::atomic<std::size_t> closing_sockets{0};
+    std::atomic<bool> drained{false};
+
+    bool Drained() const { return drained.load(std::memory_order_acquire); }
+    void ReleaseLifecycle();
+    void Rollback();
+};
+
+struct RUdpServer::Impl::Shard final : IDatagramHandler, RUdpConnection::Owner
+{
+    Shard(Impl& s, EventLoop& l)
+        : server(s)
+        , loop(&l)
         , by_addr(0, AddrKeyHash{RandomSeed()})
     {
     }
@@ -109,14 +130,9 @@ struct RUdpServer::Impl final : IDatagramHandler, RUdpConnection::Owner
         AddrKey key;
     };
 
-    EventLoopGroup& group;
-    Endpoint endpoint;
-    RUdpServerOptions options;
-    IConnectionHandler& handler;
-    TicketTable tickets;
-
-    // 以下只在 loop 线程访问（Start 时选定 loop 之前除外）。
-    EventLoop* loop = nullptr;
+    Impl& server;
+    EventLoop* loop;
+    // 以下只在所属 loop 线程访问。
     std::unique_ptr<UdpSocket> socket;
     FlatHashMap<AddrKey, std::size_t, AddrKeyHash> by_addr; // → sessions 下标
     std::vector<Session> sessions;
@@ -124,17 +140,15 @@ struct RUdpServer::Impl final : IDatagramHandler, RUdpConnection::Owner
     EventLoop::TimerId tick_timer = 0;
     EventLoop::HookId hook = 0;
     bool accepting = false;
-    // 会话数：loop 线程写，析构线程等它归零。
-    std::atomic<std::uint32_t> live{0};
 
     // 过载时每秒可能有成千上万个 Hello 被拒，日志限频。
     EventLoop::Clock::time_point last_reject_log{};
     std::uint64_t suppressed_rejects = 0;
 
-    int StartOnLoop();
+    int StartOnLoop(const Endpoint& local);
     void StopAccepting();
     void CloseAll();
-    void MaybeCloseSocket();
+    void Cleanup();
     void ArmTick();
     void TickAll();
     void RemoveActive(std::size_t i);
@@ -148,40 +162,97 @@ struct RUdpServer::Impl final : IDatagramHandler, RUdpConnection::Owner
     void OnConnectionWake(RUdpConnection& conn) noexcept override;
 };
 
-int RUdpServer::Impl::StartOnLoop()
+RUdpServer::Impl::Impl(EventLoopGroup& g, Endpoint ep, RUdpServerOptions o, IConnectionHandler& h)
+    : group(g)
+    , endpoint(std::move(ep))
+    , options(std::move(o))
+    , handler(h)
+    , tickets(options.max_pending_tickets)
 {
-    if (const int e = UdpSocket::OpenServer(*loop, endpoint, options.rudp, *this, socket); e != 0)
+}
+
+void RUdpServer::Impl::ReleaseLifecycle()
+{
+    if (lifecycle_refs.fetch_sub(1, std::memory_order_acq_rel) != 1)
+        return;
+    // 先关空 shard 会改变 SO_REUSEPORT 的四元组分配，活着的会话就会落到错误的 loop；必须全部排空后一起关。
+    closing_sockets.store(shards.size(), std::memory_order_relaxed);
+    for (const auto& shard : shards)
+    {
+        auto close = [this, s = shard.get()]
+        {
+            s->socket->Close();
+            // MPSC 的不同生产者不保证全局 FIFO；等关 socket 的任务执行完再允许析构，不能只等它们入队。
+            if (closing_sockets.fetch_sub(1, std::memory_order_acq_rel) == 1)
+                drained.store(true, std::memory_order_release);
+        };
+        if (shard->loop->InLoopThread())
+            close();
+        else
+            shard->loop->Post(std::move(close));
+    }
+}
+
+void RUdpServer::Impl::Rollback()
+{
+    for (const auto& shard : shards)
+        (void)shard->loop->CallSync(
+            [&shard]
+            {
+                shard->Cleanup();
+                return 0;
+            });
+    shards.clear();
+    lifecycle_refs.store(0, std::memory_order_relaxed);
+    drained.store(false, std::memory_order_relaxed);
+}
+
+int RUdpServer::Impl::Shard::StartOnLoop(const Endpoint& local)
+{
+    if (!loop->accepting() || !server.group.running())
+        return ESHUTDOWN;
+    if (const int e = UdpSocket::OpenServer(*loop, local, server.options.rudp, *this, socket, server.options.reuse_port);
+        e != 0)
         return e;
     accepting = true;
-    // 停机时 loop 自己停掉接受：group 不认识 RUdpServer，只认钩子。socket 要留着：优雅关闭的会话还要收 ack、发 Close。
+    // socket 要留到全部 shard 排空：优雅关闭仍需收 ack、发 Close，提前缩组也会破坏四元组亲和。
     hook = loop->AddShutdownHook(
         [this]
         {
-            hook = 0; // 钩子执行完就被清掉了
+            hook = 0;
+            server.accepting.store(false, std::memory_order_release);
             StopAccepting();
         });
     return 0;
 }
 
-void RUdpServer::Impl::StopAccepting()
+void RUdpServer::Impl::Shard::StopAccepting()
 {
-    accepting = false;
-    if (hook != 0)
+    if (accepting)
     {
-        loop->RemoveShutdownHook(hook);
-        hook = 0;
+        accepting = false;
+        if (hook != 0)
+        {
+            loop->RemoveShutdownHook(hook);
+            hook = 0;
+        }
+        server.ReleaseLifecycle();
     }
-    MaybeCloseSocket();
 }
 
-// 不再接受、且没有会话了：关 socket，端口随之释放。
-void RUdpServer::Impl::MaybeCloseSocket()
+void RUdpServer::Impl::Shard::Cleanup()
 {
-    if (!accepting && sessions.empty() && socket)
+    if (hook != 0)
+        loop->RemoveShutdownHook(hook);
+    hook = 0;
+    if (tick_timer != 0)
+        loop->Cancel(tick_timer);
+    tick_timer = 0;
+    if (socket)
         socket->Close();
 }
 
-void RUdpServer::Impl::CloseAll()
+void RUdpServer::Impl::Shard::CloseAll()
 {
     StopAccepting();
     // Close 只是标记并排进回收列表，不会摘表，所以遍历期间 sessions 不变。
@@ -189,7 +260,7 @@ void RUdpServer::Impl::CloseAll()
         s.conn->Close();
 }
 
-bool RUdpServer::Impl::ShouldLogReject()
+bool RUdpServer::Impl::Shard::ShouldLogReject()
 {
     const auto now = EventLoop::Clock::now();
     if (now - last_reject_log < std::chrono::seconds(1))
@@ -201,14 +272,14 @@ bool RUdpServer::Impl::ShouldLogReject()
     return true;
 }
 
-void RUdpServer::Impl::Reply(const sockaddr_storage& to, socklen_t to_len, const rudp::Control& c)
+void RUdpServer::Impl::Shard::Reply(const sockaddr_storage& to, socklen_t to_len, const rudp::Control& c)
 {
     (void)socket->Send({}, c.view(), &to, to_len); // 失败（缓冲满）就丢：对端会重发
 }
 
 // ---- 收 ----
 
-void RUdpServer::Impl::OnDatagram(const sockaddr_storage& src, socklen_t len, std::span<const std::byte> data)
+void RUdpServer::Impl::Shard::OnDatagram(const sockaddr_storage& src, socklen_t len, std::span<const std::byte> data)
 {
     LoopStats& st = loop->stats();
     const auto packet = rudp::Parse(data);
@@ -234,7 +305,7 @@ void RUdpServer::Impl::OnDatagram(const sockaddr_storage& src, socklen_t len, st
 
 // 没有会话的来源发来数据：丢掉。Data / Ping 回一个 Close，让重启前的客户端立刻知道会话没了，
 // 而不是等心跳超时。Close 比触发它的包小，不会被用来放大流量。
-void RUdpServer::Impl::UnknownSource(const sockaddr_storage& src, socklen_t len, const rudp::Packet& p)
+void RUdpServer::Impl::Shard::UnknownSource(const sockaddr_storage& src, socklen_t len, const rudp::Packet& p)
 {
     LoopStats::Bump(loop->stats().datagrams_dropped);
     std::uint32_t conv = 0;
@@ -246,7 +317,7 @@ void RUdpServer::Impl::UnknownSource(const sockaddr_storage& src, socklen_t len,
         Reply(src, len, rudp::EncodeClose(conv, static_cast<std::uint8_t>(CloseReason::PeerClosed)));
 }
 
-void RUdpServer::Impl::HandleHello(const sockaddr_storage& src,
+void RUdpServer::Impl::Shard::HandleHello(const sockaddr_storage& src,
                                    socklen_t len,
                                    const AddrKey& key,
                                    const rudp::Packet& p)
@@ -262,7 +333,7 @@ void RUdpServer::Impl::HandleHello(const sockaddr_storage& src,
             LoopStats::Bump(st.datagrams_dropped);
         return;
     }
-    if (!accepting)
+    if (!accepting || !server.accepting.load(std::memory_order_acquire))
     {
         Reply(src, len, rudp::EncodeReject(rudp::RejectReason::Stopping));
         return;
@@ -275,7 +346,7 @@ void RUdpServer::Impl::HandleHello(const sockaddr_storage& src,
 
     PeerInfo info;
     info.endpoint = sock::FromSockaddr(src, len, Endpoint::Kind::Udp);
-    if (options.accept_filter && !options.accept_filter(info))
+    if (server.options.accept_filter && !server.options.accept_filter(info))
     {
         LoopStats::Bump(st.rejected_filter);
         Reply(src, len, rudp::EncodeReject(rudp::RejectReason::Filtered));
@@ -294,7 +365,7 @@ void RUdpServer::Impl::HandleHello(const sockaddr_storage& src,
         Reply(src, len, rudp::EncodeReject(rudp::RejectReason::Busy));
         return;
     }
-    if (!tickets.Consume(p.conv, p.token))
+    if (!server.tickets.Consume(p.conv, p.token))
     {
         loop->table().Unreserve();
         LoopStats::Bump(st.rejected_ticket);
@@ -303,7 +374,7 @@ void RUdpServer::Impl::HandleHello(const sockaddr_storage& src,
     }
 
     RUdpConnection* c = RUdpConnection::Create(
-        *loop, *socket, &src, len, p.conv, std::move(info), handler, *this, options.connection, options.rudp);
+        *loop, *socket, &src, len, p.conv, std::move(info), server.handler, *this, server.options.connection, server.options.rudp);
     if (c == nullptr)
     {
         loop->table().Unreserve(); // KCP 建不出来（内存不足）：票据已用掉，客户端要换一张
@@ -314,7 +385,7 @@ void RUdpServer::Impl::HandleHello(const sockaddr_storage& src,
     c->owner_index = sessions.size();
     sessions.push_back({c, key});
     by_addr.emplace(key, c->owner_index);
-    live.fetch_add(1, std::memory_order_relaxed);
+    server.lifecycle_refs.fetch_add(1, std::memory_order_relaxed);
     // Accept 先于 OnConnected 发出：OnConnected 里就能 Send，数据排在 Accept 之后，客户端不会先收到数据。
     Reply(src, len, rudp::EncodeAccept(p.conv));
     c->Establish();
@@ -323,7 +394,7 @@ void RUdpServer::Impl::HandleHello(const sockaddr_storage& src,
 
 // ---- 摘表（会话回收前，由 NotifyClosed 触发）----
 
-void RUdpServer::Impl::OnConnectionDetached(RUdpConnection& conn) noexcept
+void RUdpServer::Impl::Shard::OnConnectionDetached(RUdpConnection& conn) noexcept
 {
     if (conn.ticking())
         RemoveActive(conn.tick_index); // 关了但还没被 TickAll 清走：回收前必须摘掉，否则活跃表里是悬空指针
@@ -336,17 +407,16 @@ void RUdpServer::Impl::OnConnectionDetached(RUdpConnection& conn) noexcept
         by_addr[sessions[i].key] = i;
     }
     sessions.pop_back();
-    live.fetch_sub(1, std::memory_order_release);
-    MaybeCloseSocket();
+    server.ReleaseLifecycle();
 }
 
 // ---- 定时推进 ----
 
-void RUdpServer::Impl::ArmTick()
+void RUdpServer::Impl::Shard::ArmTick()
 {
     if (tick_timer != 0)
         return;
-    tick_timer = loop->RunAfter(std::chrono::milliseconds(options.rudp.interval_ms),
+    tick_timer = loop->RunAfter(std::chrono::milliseconds(server.options.rudp.interval_ms),
                                 [this]
                                 {
                                     tick_timer = 0;
@@ -354,14 +424,14 @@ void RUdpServer::Impl::ArmTick()
                                 });
 }
 
-void RUdpServer::Impl::OnConnectionWake(RUdpConnection& conn) noexcept
+void RUdpServer::Impl::Shard::OnConnectionWake(RUdpConnection& conn) noexcept
 {
     conn.tick_index = active.size();
     active.push_back(&conn);
     ArmTick();
 }
 
-void RUdpServer::Impl::RemoveActive(std::size_t i)
+void RUdpServer::Impl::Shard::RemoveActive(std::size_t i)
 {
     RUdpConnection* last = active.back();
     active.pop_back();
@@ -375,7 +445,7 @@ void RUdpServer::Impl::RemoveActive(std::size_t i)
 // 只走活跃的会话（有事可做的）；静止的不在表里，空闲会话不占 CPU。没有活跃会话就不再装定时器，下一次唤醒时再装。
 // Tick 里的关闭只标记、不摘表（摘表在回收阶段）；回调里可能唤醒别的会话（push_back），所以按下标遍历、每轮重读大小，
 // 新加的在本轮就会被走到。
-void RUdpServer::Impl::TickAll()
+void RUdpServer::Impl::Shard::TickAll()
 {
     const std::uint32_t now = KcpNowMs();
     for (std::size_t i = 0; i < active.size();)
@@ -403,26 +473,27 @@ RUdpServer::RUdpServer(EventLoopGroup& group,
 RUdpServer::~RUdpServer()
 {
     Impl& m = *impl_;
-    if (m.loop == nullptr || !m.group.running())
+    if (m.shards.empty() || !m.group.running())
         return; // 没 Start 过；或 group 已 Shutdown：会话早已回收，停机钩子也处理过了
-    // 同步关：不然 Stop 投递的任务可能在本对象销毁之后才在 loop 上跑；会话里有指向 Impl 的指针，也要等它们回收完。
-    (void)m.loop->CallSync(
-        [&m]
-        {
-            m.CloseAll();
-            return 0;
-        });
-    for (int i = 0; i < 5000 && m.live.load(std::memory_order_acquire) != 0; ++i)
+    m.accepting.store(false, std::memory_order_release);
+    // 每个 loop 都先同步停收、关会话；排空前 Shard 不能销毁（连接的 Owner、定时器都指向它）。
+    for (const auto& shard : m.shards)
+        (void)shard->loop->CallSync(
+            [&shard]
+            {
+                shard->CloseAll();
+                return 0;
+            });
+    for (int i = 0; i < 5000 && !m.Drained(); ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    // 最后一次 TickAll 之后装的定时器还挂在 loop 上、捕获着 this：摘掉，否则它会在本对象销毁之后触发。
-    (void)m.loop->CallSync(
-        [&m]
-        {
-            if (m.tick_timer != 0)
-                m.loop->Cancel(m.tick_timer);
-            m.tick_timer = 0;
-            return 0;
-        });
+    // 排空后仍可能挂着最后一次 Tick 的定时器与关 socket 的任务；各 loop 的同步清理也为这些任务设一道栅栏。
+    for (const auto& shard : m.shards)
+        (void)shard->loop->CallSync(
+            [&shard]
+            {
+                shard->Cleanup();
+                return 0;
+            });
 }
 
 int RUdpServer::Start()
@@ -436,26 +507,46 @@ int RUdpServer::Start()
             return ESHUTDOWN;
         LOG_FATAL("RUdpServer::Start 之前必须已 EventLoopGroup::Start() 成功 endpoint={}", m.endpoint.ToString());
     }
-    if (m.loop != nullptr)
+    if (!m.shards.empty())
         LOG_FATAL("RUdpServer 重复 Start endpoint={}", m.endpoint.ToString());
 
-    m.loop = &GroupAccess::PickLoop(m.group);
-    // bind 与登记 epoll 只能在 loop 线程上做；loop 已在运行，投过去等结果。
-    if (const int rc = m.loop->CallSync([&m] { return m.StartOnLoop(); }); rc != 0)
+    if (m.options.reuse_port)
     {
-        m.loop = nullptr;
-        return rc;
+        for (std::size_t i = 0; i < GroupAccess::LoopCount(m.group); ++i)
+            m.shards.push_back(std::make_unique<Impl::Shard>(m, GroupAccess::LoopAt(m.group, i)));
     }
-    endpoint_ = m.socket->local();
+    else
+        m.shards.push_back(std::make_unique<Impl::Shard>(m, GroupAccess::PickLoop(m.group)));
+
+    m.lifecycle_refs.store(m.shards.size() + 1, std::memory_order_relaxed);
+    Endpoint local = m.endpoint;
+    for (const auto& shard : m.shards)
+    {
+        // 首个 socket 填回端口 0 的实际地址，后续全部绑定该地址；此时共享闸门仍关闭，不能产生会话。
+        if (const int rc = shard->loop->CallSync([&shard, &local] { return shard->StartOnLoop(local); }); rc != 0)
+        {
+            m.Rollback();
+            return rc;
+        }
+        local = shard->socket->local();
+    }
+    if (!m.group.running())
+    {
+        m.Rollback();
+        return ESHUTDOWN;
+    }
+    endpoint_ = local;
+    m.accepting.store(true, std::memory_order_release);
+    m.ReleaseLifecycle();
     return 0;
 }
 
 void RUdpServer::Stop()
 {
     Impl& m = *impl_;
-    if (m.loop == nullptr)
-        return;
-    m.loop->Post([&m] { m.StopAccepting(); });
+    m.accepting.store(false, std::memory_order_release);
+    for (const auto& shard : m.shards)
+        shard->loop->Post([s = shard.get()] { s->StopAccepting(); });
 }
 
 RUdpEndpoint RUdpServer::local_endpoint() const

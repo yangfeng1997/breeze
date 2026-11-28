@@ -79,6 +79,7 @@ NetModuleOptions NetModuleOptionsFrom(const config::NetConfig& c)
     NetModuleOptions o;
     o.group.io_threads = c.ioThreads;
     o.group.max_connections_per_loop = c.maxConnectionsPerLoop;
+    o.rudp_reuse_port = c.rudpReusePort;
     o.connection.high_water_mark = c.highWaterMarkBytes;
     o.connection.idle_timeout = std::chrono::milliseconds(c.idleTimeoutMs);
     o.tcp.keepalive_idle = std::chrono::seconds(c.keepaliveIdleS);
@@ -261,6 +262,7 @@ std::expected<INetServer*, Error> NetModule::AddServer(std::string_view endpoint
         RUdpServerOptions o;
         o.connection = options.connection;
         o.rudp = options_.rudp;
+        o.reuse_port = options_.rudp_reuse_port;
         o.accept_filter = std::move(options.accept_filter);
         auto s = AddRUdpServer(*udp, handler, std::move(o));
         if (!s)
@@ -557,6 +559,7 @@ std::expected<RUdpServer*, Error> NetModule::AddRUdpServer(const RUdpEndpoint& e
     RUdpServerOptions o;
     o.connection = options_.connection;
     o.rudp = options_.rudp;
+    o.reuse_port = options_.rudp_reuse_port;
     return AddRUdpServer(endpoint, handler, std::move(o));
 }
 

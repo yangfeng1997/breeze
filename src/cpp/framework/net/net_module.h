@@ -80,6 +80,8 @@ struct NetModuleOptions
     // 帧选项；端点的路径（"ws://host:port/game" 里的 /game）覆盖 ws_server.path / ws_client.path。
     WsServerOptions ws_server;
     WsClientOptions ws_client;
+    // 不另给 RUdpServerOptions 时使用；SO_REUSEPORT 按 group 的全部 IO 线程分流。
+    bool rudp_reuse_port = false;
 };
 
 // 校验 net.proto 的取值范围由配置库负责；这里只做字段搬运与单位换算。
@@ -105,7 +107,7 @@ public:
     // udp://ip:port（配置里直接写字符串）； 不合法返回错误并带上原字符串。**ws:// / wss:// 自带分帧**，用不带 codec
     // 工厂的重载；给它工厂是错误（不静默忽略）。 返回的指针在模块存活期内有效。 之后经 INetClient::Send /
     // ConnectionHandle 发送；handler 与 factory 要比 Shutdown 活得久。 udp:// 的 AddServer 装配的是 rudp
-    // 服务端（用模块的 connection 与 rudp 默认选项；显式选项里只有 connection 与 accept_filter 对它有意义），factory
+    // 服务端（用模块的 rudp 与 rudp_reuse_port；显式选项里只有 connection 与 accept_filter 对它有意义），factory
     // 对它被忽略：rudp 的消息自带边界，没有 codec。要签发票据就要拿到 RUdpServer， 用 AddRUdpServer（或对返回的
     // INetServer* 做 dynamic_cast）。 AddClient 不收 udp://：rudp 客户端要凭票据握手，用 AddRUdpClient。 不带 codec
     // 工厂：只收 ws:// / wss://（WebSocket 自带分帧，选项取 NetModuleOptions::ws_server）。

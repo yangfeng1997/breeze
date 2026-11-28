@@ -64,9 +64,10 @@ int UdpSocket::OpenServer(EventLoop& loop,
                           const Endpoint& local,
                           const RUdpOptions& options,
                           IDatagramHandler& handler,
-                          std::unique_ptr<UdpSocket>& out)
+                          std::unique_ptr<UdpSocket>& out,
+                          bool reuse_port)
 {
-    return Open(loop, local, true, options, handler, out);
+    return Open(loop, local, true, options, handler, out, reuse_port);
 }
 
 int UdpSocket::OpenClient(EventLoop& loop,
@@ -83,7 +84,8 @@ int UdpSocket::Open(EventLoop& loop,
                     bool server,
                     const RUdpOptions& options,
                     IDatagramHandler& handler,
-                    std::unique_ptr<UdpSocket>& out)
+                    std::unique_ptr<UdpSocket>& out,
+                    bool reuse_port)
 {
     loop.AssertInLoopThread();
     if (ep.kind() != Endpoint::Kind::Udp)
@@ -91,6 +93,12 @@ int UdpSocket::Open(EventLoop& loop,
     UniqueFd fd;
     if (const int e = sock::CreateSocket(ep, SOCK_DGRAM, fd); e != 0)
         return e;
+    if (server && reuse_port)
+    {
+        const int on = 1;
+        if (::setsockopt(fd.get(), SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on)) != 0)
+            return errno;
+    }
     SetBuffer(fd.get(), SO_RCVBUF, options.socket_recv_buffer);
     SetBuffer(fd.get(), SO_SNDBUF, options.socket_send_buffer);
     if (const int e = server ? BindTo(fd.get(), ep) : ConnectTo(fd.get(), ep); e != 0)

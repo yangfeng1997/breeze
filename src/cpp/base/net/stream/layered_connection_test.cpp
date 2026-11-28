@@ -277,6 +277,69 @@ void TestBacklogOfManyFramesKeepsOrder()
     s.rec.CheckInvariants();
 }
 
+// Send 返回后立即改写源内存；优雅关闭须按序排空 payload 与层在 Shutdown 时追加的字节。
+void TestGracefulCloseFlushesPayloadAndLayerShutdownBytes()
+{
+    const LeakCheck leak;
+    class GrowingLayer final : public IStreamLayer
+    {
+    public:
+        LayerStatus Start() override { return LayerStatus::HandshakeDone; }
+        LayerStatus Unwrap(std::span<std::byte> wire, PlainSink sink) override
+        {
+            (void)sink(wire);
+            return LayerStatus::Ok;
+        }
+        LayerStatus Wrap(std::span<const std::byte> plain) override
+        {
+            wire_.Append(plain);
+            return LayerStatus::Ok;
+        }
+        std::span<const std::byte> PendingWire() const noexcept override { return wire_.Readable(); }
+        void ConsumeWire(std::size_t n) noexcept override { wire_.Consume(n); }
+        LayerStatus Shutdown() override
+        {
+            wire_.Append(B(std::string(90000, 'b')));
+            return LayerStatus::Ok;
+        }
+        int error_code() const noexcept override { return 0; }
+
+    private:
+        Buffer wire_;
+    };
+    class GrowingFactory final : public IStreamLayerFactory
+    {
+    public:
+        std::unique_ptr<IStreamLayer> Create(LayerRole) const override { return std::make_unique<GrowingLayer>(); }
+    };
+    EventRecorder rec;
+    LengthPrefixCodecFactory codec(kMaxFrame);
+    EventLoopGroup group({1, 64});
+    StreamServerOptions options;
+    options.tls = std::make_shared<GrowingFactory>();
+    StreamServer server(group, *Endpoint::Tcp("127.0.0.1", 0), std::move(options), rec, codec);
+    rec.on_message = [](IConnection& c, std::string_view)
+    {
+        std::string source(20000, 'a');
+        CHECK(c.Send(B(source)) == SendResult::Ok);
+        std::fill(source.begin(), source.end(), 'x');
+        c.CloseGracefully(5s);
+    };
+    CHECK(group.Start() == 0);
+    CHECK(server.Start() == 0);
+    {
+        TestClient c(server.endpoint());
+        c.SendFrame("go");
+        // 不能混用 TestClient::RecvFrame 的内部预读缓冲与直接 recv，否则追加字节可能已被预读。
+        const std::string expected = FrameBytes(std::string(20000, 'a')) + std::string(90000, 'b');
+        CHECK(ReadRaw(c, expected.size()) == expected);
+        CHECK(c.WaitClosed());
+        c.Close();
+    }
+    CHECK(rec.WaitClosed(0).reason == CloseReason::LocalClose);
+    rec.CheckInvariants();
+}
+
 // 层在握手完成之后出错：OnClosed 报 TlsError，sys_errno 为 0（层的底层错误码只进日志）。
 void TestLayerErrorAfterReady()
 {
@@ -667,6 +730,7 @@ int main()
     TestPlaintextInSameReadAsHandshake();
     TestLargePayloadCrossesWireBudget();
     TestBacklogOfManyFramesKeepsOrder();
+    TestGracefulCloseFlushesPayloadAndLayerShutdownBytes();
     TestLayerErrorAfterReady();
     TestLayerErrorDuringHandshake();
     TestLayerHandshakeTimeout();

@@ -7,6 +7,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -19,9 +20,11 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <stop_token>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "base/net/codec/length_prefix_codec.h"
@@ -1294,6 +1297,7 @@ void TestOptionsFromConfig()
     // 单位换算与字段搬运
     config::NetConfig c;
     c.ioThreads = 7;
+    c.rudpReusePort = true;
     c.maxConnectionsPerLoop = 1000;
     c.highWaterMarkBytes = 4096;
     c.idleTimeoutMs = 1500;
@@ -1308,12 +1312,27 @@ void TestOptionsFromConfig()
     c.shutdownDeadlineMs = 1234;
     const NetModuleOptions o = NetModuleOptionsFrom(c);
     CHECK(o.group.io_threads == 7 && o.group.max_connections_per_loop == 1000);
+    CHECK(o.rudp_reuse_port);
     CHECK(o.connection.high_water_mark == 4096 && o.connection.idle_timeout == 1500ms);
     CHECK(o.tcp.keepalive_idle == 30s && o.tcp.keepalive_interval == 5s && o.tcp.keepalive_count == 2);
     CHECK(o.tcp.tcp_user_timeout == 20000ms);
     CHECK(o.inbound.max_messages_per_conn == 10 && o.inbound.max_bytes_per_conn == 2048);
     CHECK(o.inbound.global_budget_bytes == 3u * 1024 * 1024);
     CHECK(o.wake_budget == 77 && o.shutdown_deadline == 1234ms);
+}
+
+void TestRUdpReusePortConfigParsing()
+{
+    CHECK(!NetModuleOptionsFrom(config::NetConfig{}).rudp_reuse_port);
+    for (const bool enabled : {false, true})
+    {
+        const auto yaml = Config::LoadString(
+            std::string("net: {rudp_reuse_port: ") + (enabled ? "true}" : "false}"));
+        CHECK(yaml);
+        const auto cfg = yaml->Get<config::NetConfig>("net");
+        CHECK(cfg);
+        CHECK(NetModuleOptionsFrom(*cfg).rudp_reuse_port == enabled);
+    }
 }
 
 // NetModule(app) 在 Init 时从 ConfigModule 读 net 段；真实的 config/common.yaml 单独就能起，取到的是 net.proto
@@ -1333,6 +1352,7 @@ void TestModuleReadsNetSectionFromConfig()
     CHECK(net != nullptr);
     const NetModuleOptions& o = net->options();
     CHECK(o.group.io_threads == 4 && o.group.max_connections_per_loop == 65536);
+    CHECK(!o.rudp_reuse_port);
     CHECK(o.connection.high_water_mark == 262144 && o.connection.idle_timeout == 0ms);
     CHECK(o.tcp.keepalive_idle == 60s && o.tcp.keepalive_interval == 10s && o.tcp.keepalive_count == 3);
     CHECK(o.inbound.max_messages_per_conn == 256 && o.inbound.max_bytes_per_conn == 65536);
@@ -1435,6 +1455,51 @@ void TestRUdpModuleDefaultsReachServer()
     CHECK(WaitUntil([&] { return biz.connected() == 1; }));
     CHECK(WaitUntil([&] { return biz.closed() == 1; }, 8s)); // 不发心跳：被空闲检测关掉
     CHECK(biz.closed_list()[0].second == CloseReason::IdleTimeout);
+}
+
+// 模块默认值同时覆盖类型化与字符串入口；显式 RUdpServerOptions 可关闭 reuseport。
+void TestRUdpReusePortDefaultsReachServers()
+{
+    const LeakCheck leak;
+    Biz biz;
+    LengthPrefixCodecFactory factory;
+    NetModuleOptions options = SmallOptions();
+    options.group.io_threads = 3;
+    options.rudp_reuse_port = true;
+    App app("net-reuseport");
+    app.RegisterModule([&](App& a) { return std::make_unique<NetModule>(a, options); });
+    CHECK(app.Build() && app.Init());
+    auto* net = app.GetModule<NetModule>("net");
+    const auto typed = net->AddRUdpServer(RUdpLoopback(), biz);
+    const auto uri = net->AddServer("udp://127.0.0.1:0", biz, factory);
+    const auto explicit_opts = net->AddRUdpServer(RUdpLoopback(), biz, RUdpServerOptions{});
+    CHECK(typed && uri && explicit_opts);
+    CHECK(app.Start());
+    const auto count_sockets = [](std::uint16_t port, int reuse_port)
+    {
+        // 按socket身份计数，验证监听组成员数量。
+        std::set<std::pair<dev_t, ino_t>> sockets;
+        int count = 0;
+        for (int fd = 0; fd < 4096; ++fd)
+        {
+            sockaddr_in local{};
+            socklen_t len = sizeof(local);
+            if (::getsockname(fd, reinterpret_cast<sockaddr*>(&local), &len) != 0 ||
+                local.sin_family != AF_INET || ntohs(local.sin_port) != port)
+                continue;
+            CHECK(GetIntOpt(fd, SOL_SOCKET, SO_TYPE) == SOCK_DGRAM);
+            CHECK(GetIntOpt(fd, SOL_SOCKET, SO_REUSEPORT) == reuse_port);
+            struct stat identity{};
+            CHECK(::fstat(fd, &identity) == 0);
+            if (sockets.emplace(identity.st_dev, identity.st_ino).second)
+                ++count;
+        }
+        return count;
+    };
+    CHECK(count_sockets((*typed)->endpoint().port(), 1) == 3);
+    CHECK(count_sockets((*uri)->endpoint().port(), 1) == 3);
+    CHECK(count_sockets((*explicit_opts)->endpoint().port(), 0) == 1);
+    CHECK(app.Stop() && app.Shutdown());
 }
 
 // 字符串形式的 udp:// 服务端：显式选项里的 accept_filter 也生效（拒绝的收到 Reject(Filtered)）。
@@ -1541,9 +1606,11 @@ int main()
     TestBadTlsConfigFailsInit();
     TestRUdpThroughModule();
     TestRUdpModuleDefaultsReachServer();
+    TestRUdpReusePortDefaultsReachServers();
     TestUdpAddServerStringPassesFilter();
     TestRUdpAssembly();
     TestOptionsFromConfig();
+    TestRUdpReusePortConfigParsing();
     TestModuleReadsNetSectionFromConfig();
     TestDependsOn();
     std::puts("net_module_test: ok");

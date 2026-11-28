@@ -5,7 +5,10 @@
 
 #include "base/net/rudp/rudp_server.h"
 
+#include <sys/resource.h>
+
 #include <atomic>
+#include <barrier>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -95,6 +98,237 @@ struct Fixture
             RunOnLoop(GroupAccess::LoopAt(group, i), [] {});
     }
 };
+
+// SO_REUSEPORT 的分片数固定；用足够多的不同源端口确认所有 loop 都在同一个实际端口上服务。
+void TestReusePortDistributionAffinityAndPortZero()
+{
+    RUdpServerOptions o;
+    o.reuse_port = true;
+    Fixture f(std::move(o), EventLoopGroupOptions{4, 256});
+    f.rec.on_message = [](IConnection& c, std::string_view sv) { Echo(c, sv); };
+    CHECK(f.ep().port() != 0 && f.server->local_endpoint().endpoint() == f.ep());
+    std::set<std::uint32_t> loops;
+    std::vector<std::unique_ptr<RawUdp>> peers;
+    for (int i = 0; i < 96; ++i)
+    {
+        // 会话仍然活着，源端口不能释放后被下一客户端复用，否则测试会撞上合法的旧会话。
+        peers.push_back(std::make_unique<RawUdp>());
+        RawUdp& raw = *peers.back();
+        const auto ticket = f.Ticket();
+        SendHello(raw, f.ep(), ticket);
+        Endpoint from = Loopback();
+        const auto dg = raw.Recv(2s, &from);
+        CHECK(dg && from == f.ep());
+        const auto accepted = rudp::Parse(*dg);
+        CHECK(accepted && accepted->type == rudp::PacketType::Accept && accepted->conv == ticket.conv);
+        const auto handle = f.rec.WaitConnected(static_cast<std::size_t>(i));
+        loops.insert(handle.loop());
+        CHECK(handle.loop() < 4);
+        CHECK(GroupAccess::LoopAt(f.group, handle.loop()).ConnectionCount() != 0);
+        for (int n = 0; n < 3; ++n)
+        {
+            SendHello(raw, f.ep(), ticket);
+            const auto reply = RecvReply(raw);
+            CHECK(reply && reply->type == rudp::PacketType::Accept && reply->conv == ticket.conv);
+            raw.SendTo(f.ep(), rudp::EncodePing(ticket.conv).view());
+            const auto pong = RecvReply(raw);
+            CHECK(pong && pong->type == rudp::PacketType::Pong && pong->conv == ticket.conv);
+        }
+        KcpPeer peer(raw, f.ep(), ticket.conv);
+        peer.Send("affinity");
+        CHECK(peer.RunUntil([&] { return peer.messages().size() == 1; }));
+        CHECK(peer.messages()[0] == "affinity");
+        CHECK(f.rec.connected_count() == static_cast<std::size_t>(i + 1));
+    }
+    CHECK(loops.size() == 4);
+    CHECK(f.stats().accepted == 96 && f.stats().connections == 96);
+}
+
+// 默认仍只选一个 loop；即使 group 有多个线程，也不会自动开启端口复用。
+void TestDefaultUsesSingleLoop()
+{
+    Fixture f(RUdpServerOptions{}, EventLoopGroupOptions{4, 128});
+    std::set<std::uint32_t> loops;
+    std::vector<std::unique_ptr<RawUdp>> peers;
+    for (int i = 0; i < 32; ++i)
+    {
+        peers.push_back(std::make_unique<RawUdp>());
+        RawUdp& raw = *peers.back();
+        SendHello(raw, f.ep(), f.Ticket());
+        CHECK(RecvReply(raw)->type == rudp::PacketType::Accept);
+        loops.insert(f.rec.WaitConnected(static_cast<std::size_t>(i)).loop());
+    }
+    CHECK(loops.size() == 1);
+    RUdpServerOptions reuse;
+    reuse.reuse_port = true;
+    RUdpServer other(f.group, f.server->local_endpoint(), std::move(reuse), f.rec);
+    CHECK(other.Start() == EADDRINUSE);
+}
+
+// filter 记录内核把来源分配到哪个 loop；同票据在不同 shard 同时验票时只能一个成功。
+void TestReusePortTicketConsumedAtomically()
+{
+    std::mutex mu;
+    std::unordered_map<std::uint16_t, std::uint32_t> assigned;
+    std::atomic<EventLoopGroup*> group{nullptr};
+    RUdpServerOptions o;
+    o.reuse_port = true;
+    o.accept_filter = [&](const PeerInfo& info) noexcept
+    {
+        const auto* g = group.load(std::memory_order_acquire);
+        CHECK(g && info.endpoint);
+        std::uint32_t index = UINT32_MAX;
+        for (std::size_t i = 0; i < GroupAccess::LoopCount(*g); ++i)
+            if (GroupAccess::LoopAt(*g, i).InLoopThread())
+                index = static_cast<std::uint32_t>(i);
+        CHECK(index != UINT32_MAX);
+        const std::lock_guard lk(mu);
+        assigned[info.endpoint->port()] = index;
+        return true;
+    };
+    Fixture f(std::move(o), EventLoopGroupOptions{4, 256});
+    group = &f.group;
+    std::vector<std::unique_ptr<RawUdp>> sources;
+    std::set<std::uint32_t> loops;
+    RUdpTicket unknown;
+    unknown.conv = 0x12345678;
+    for (int i = 0; i < 128 && loops.size() < 4; ++i)
+    {
+        auto raw = std::make_unique<RawUdp>();
+        SendHello(*raw, f.ep(), unknown);
+        CHECK(IsReject(RecvReply(*raw), rudp::RejectReason::Ticket));
+        const std::lock_guard lk(mu);
+        if (loops.insert(assigned.at(raw->local().port())).second)
+            sources.push_back(std::move(raw));
+    }
+    CHECK(sources.size() == 4);
+    for (int attempt = 0; attempt < 12; ++attempt)
+    {
+        const auto ticket = f.Ticket();
+        std::barrier ready(5);
+        std::vector<std::thread> threads;
+        for (auto& source : sources)
+            threads.emplace_back([&, raw = source.get()]
+                                 {
+                                     ready.arrive_and_wait();
+                                     SendHello(*raw, f.ep(), ticket);
+                                 });
+        ready.arrive_and_wait();
+        for (auto& thread : threads)
+            thread.join();
+        std::size_t accepts = 0;
+        RawUdp* winner = nullptr;
+        for (auto& source : sources)
+        {
+            const auto reply = RecvReply(*source);
+            CHECK(reply.has_value());
+            if (reply->type == rudp::PacketType::Accept)
+            {
+                CHECK(reply->conv == ticket.conv);
+                ++accepts;
+                winner = source.get();
+            }
+            else
+                CHECK(IsReject(reply, rudp::RejectReason::Ticket));
+        }
+        CHECK(accepts == 1 && f.server->pending_tickets() == 0);
+        CHECK(f.rec.WaitConnected(static_cast<std::size_t>(attempt)).valid());
+        winner->SendTo(f.ep(), rudp::EncodeClose(ticket.conv, 0).view());
+        f.rec.WaitClosed(static_cast<std::size_t>(attempt));
+        f.Barrier();
+    }
+    CHECK(f.stats().accepted == 12 && f.stats().connections == 0);
+}
+
+// Stop 后保持全部 socket，直到最后一个 shard 的最后一个会话退出；否则四元组会被重新分流。
+void TestReusePortStopDrainsAllShardsAndReleasesPort()
+{
+    RUdpServerOptions o;
+    o.reuse_port = true;
+    Fixture f(std::move(o), EventLoopGroupOptions{4, 256});
+    std::vector<std::unique_ptr<RawUdp>> sources;
+    std::vector<RUdpTicket> tickets;
+    std::set<std::uint32_t> loops;
+    for (int i = 0; i < 96; ++i)
+    {
+        sources.push_back(std::make_unique<RawUdp>());
+        tickets.push_back(f.Ticket());
+        SendHello(*sources.back(), f.ep(), tickets.back());
+        CHECK(RecvReply(*sources.back())->type == rudp::PacketType::Accept);
+        loops.insert(f.rec.WaitConnected(static_cast<std::size_t>(i)).loop());
+    }
+    CHECK(loops.size() == 4);
+    const auto ep = f.ep();
+    f.server->Stop();
+    f.Barrier();
+    for (std::size_t i = 1; i < sources.size(); ++i)
+        sources[i]->SendTo(ep, rudp::EncodeClose(tickets[i].conv, 0).view());
+    CHECK(WaitUntil([&] { return f.rec.closed_count() == sources.size() - 1; }));
+    f.Barrier();
+    for (int i = 0; i < 20; ++i)
+    {
+        sources.front()->SendTo(ep, rudp::EncodePing(tickets.front().conv).view());
+        const auto pong = RecvReply(*sources.front());
+        CHECK(pong && pong->type == rudp::PacketType::Pong);
+    }
+    RawUdp late;
+    SendHello(late, ep, f.Ticket());
+    CHECK(IsReject(RecvReply(late), rudp::RejectReason::Stopping));
+    sockaddr_storage addr;
+    const auto len = sock::ToSockaddr(ep, addr);
+    UniqueFd fd;
+    CHECK(sock::CreateSocket(ep, SOCK_DGRAM, fd) == 0);
+    CHECK(::bind(fd.get(), reinterpret_cast<const sockaddr*>(&addr), len) == -1 && errno == EADDRINUSE);
+    sources.front()->SendTo(ep, rudp::EncodeClose(tickets.front().conv, 0).view());
+    CHECK(WaitUntil([&] { return f.rec.closed_count() == sources.size(); }));
+    f.Barrier();
+    CHECK(WaitUntil([&] { return ::bind(fd.get(), reinterpret_cast<const sockaddr*>(&addr), len) == 0; }));
+}
+
+// fd 只余一个名额：首个 shard 能绑定、第二个失败，所有已注册 socket 与停机钩子都须回滚。
+void TestReusePortPartialStartRollback()
+{
+    LeakCheck leak;
+    EventRecorder rec;
+    EventLoopGroup group(EventLoopGroupOptions{4, 64});
+    CHECK(group.Start() == 0);
+    const auto ep = []
+    {
+        RawUdp port;
+        return port.local();
+    }();
+    std::vector<UniqueFd> fillers;
+    fillers.reserve(256);
+    rlimit original;
+    CHECK(::getrlimit(RLIMIT_NOFILE, &original) == 0);
+    rlimit limited = original;
+    limited.rlim_cur = 256;
+    CHECK(::setrlimit(RLIMIT_NOFILE, &limited) == 0);
+    for (;;)
+    {
+        UniqueFd fd;
+        if (const int rc = sock::CreateSocket(ep, SOCK_DGRAM, fd); rc != 0)
+        {
+            CHECK(rc == EMFILE);
+            break;
+        }
+        fillers.push_back(std::move(fd));
+    }
+    CHECK(!fillers.empty());
+    fillers.pop_back();
+    RUdpServerOptions o;
+    o.reuse_port = true;
+    RUdpServer server(group, *RUdpEndpoint::From(ep), std::move(o), rec);
+    const int rc = server.Start();
+    CHECK(::setrlimit(RLIMIT_NOFILE, &original) == 0);
+    CHECK(rc == EMFILE);
+    fillers.clear();
+    CHECK(server.Start() == 0);
+    server.Stop();
+    for (std::size_t i = 0; i < GroupAccess::LoopCount(group); ++i)
+        RunOnLoop(GroupAccess::LoopAt(group, i), [] {});
+    group.Shutdown(1s);
+}
 
 // ---- 握手 ----
 
@@ -506,9 +740,11 @@ void TestStopRejectsNewButKeepsExisting()
 }
 
 // Stop 时没有会话：端口立刻释放。对没 Start 过的对象是空操作。
-void TestStopWithoutSessionsReleasesPort()
+void CheckStopWithoutSessionsReleasesPort(bool reuse_port)
 {
-    Fixture f;
+    RUdpServerOptions o;
+    o.reuse_port = reuse_port;
+    Fixture f(std::move(o));
     const Endpoint ep = f.ep();
     f.server->Stop();
     f.Barrier();
@@ -524,6 +760,12 @@ void TestStopWithoutSessionsReleasesPort()
     RUdpServer never_started(g2, RUdpLoopback(), RUdpServerOptions{}, rec2);
     never_started.Stop(); // 空操作
     g2.Shutdown(1s);
+}
+
+void TestStopWithoutSessionsReleasesPort()
+{
+    CheckStopWithoutSessionsReleasesPort(false);
+    CheckStopWithoutSessionsReleasesPort(true);
 }
 
 void TestStartErrors()
@@ -573,7 +815,7 @@ void TestEndpointBeforeAndAfterStart()
 }
 
 // 析构时 group 还在跑、会话还活着：先同步关掉全部会话并等它们回收（OnClosed 都已回调），不崩、不泄漏。
-void TestDestructorWithLiveSessions()
+void CheckDestructorWithLiveSessions(bool reuse_port)
 {
     LeakCheck leak;
     EventLoopGroup group(EventLoopGroupOptions{2, 64});
@@ -582,7 +824,9 @@ void TestDestructorWithLiveSessions()
     std::vector<std::unique_ptr<RawUdp>> raws;
     auto dtor_start = std::chrono::steady_clock::now();
     {
-        RUdpServer server(group, RUdpLoopback(), RUdpServerOptions{}, rec);
+        RUdpServerOptions o;
+        o.reuse_port = reuse_port;
+        RUdpServer server(group, RUdpLoopback(), std::move(o), rec);
         CHECK(server.Start() == 0);
         for (int i = 0; i < 5; ++i)
         {
@@ -610,23 +854,51 @@ void TestDestructorWithLiveSessions()
     group.Shutdown(1s);
 }
 
+void TestDestructorWithLiveSessions()
+{
+    CheckDestructorWithLiveSessions(false);
+    CheckDestructorWithLiveSessions(true);
+}
+
 // group 先 Shutdown（优雅关闭所有会话），服务端对象之后才销毁。
-void TestGroupShutdownClosesSessions()
+void CheckGroupShutdownClosesSessions(bool reuse_port)
 {
     LeakCheck leak;
     EventLoopGroup group(EventLoopGroupOptions{2, 64});
     CHECK(group.Start() == 0);
     EventRecorder rec;
-    RUdpServer server(group, RUdpLoopback(), RUdpServerOptions{}, rec);
+    RUdpServerOptions o;
+    o.reuse_port = reuse_port;
+    RUdpServer server(group, RUdpLoopback(), std::move(o), rec);
     CHECK(server.Start() == 0);
-    RawUdp raw;
-    const auto t = server.IssueTicket(10s);
-    raw.SendTo(server.endpoint(), rudp::EncodeHello(t->conv, t->token).view());
-    CHECK(RecvReply(raw)->type == rudp::PacketType::Accept);
-    rec.WaitConnected(0);
+    std::vector<std::unique_ptr<RawUdp>> sources;
+    std::set<std::uint32_t> loops;
+    for (int i = 0; i < 32; ++i)
+    {
+        sources.push_back(std::make_unique<RawUdp>());
+        const auto t = server.IssueTicket(10s);
+        SendHello(*sources.back(), server.endpoint(), *t);
+        CHECK(RecvReply(*sources.back())->type == rudp::PacketType::Accept);
+        loops.insert(rec.WaitConnected(static_cast<std::size_t>(i)).loop());
+    }
+    CHECK(loops.size() == (reuse_port ? 2 : 1));
+    const auto ep = server.endpoint();
     group.Shutdown(2s);
-    CHECK(rec.closed_count() == 1 && rec.WaitClosed(0).reason == CloseReason::LocalClose);
+    CHECK(rec.closed_count() == 32);
+    for (std::size_t i = 0; i < 32; ++i)
+        CHECK(rec.WaitClosed(i).reason == CloseReason::LocalClose);
     rec.CheckInvariants();
+    sockaddr_storage addr;
+    const auto len = sock::ToSockaddr(ep, addr);
+    UniqueFd fd;
+    CHECK(sock::CreateSocket(ep, SOCK_DGRAM, fd) == 0);
+    CHECK(::bind(fd.get(), reinterpret_cast<const sockaddr*>(&addr), len) == 0);
+}
+
+void TestGroupShutdownClosesSessions()
+{
+    CheckGroupShutdownClosesSessions(false);
+    CheckGroupShutdownClosesSessions(true);
 }
 
 // 许多会话并发握手、各自心跳：按来源分得开，计数对得上。
@@ -1003,6 +1275,11 @@ void TestDataPathAndOversizeFromPeer()
 
 int main()
 {
+    RUN(TestReusePortDistributionAffinityAndPortZero);
+    RUN(TestDefaultUsesSingleLoop);
+    RUN(TestReusePortTicketConsumedAtomically);
+    RUN(TestReusePortStopDrainsAllShardsAndReleasesPort);
+    RUN(TestReusePortPartialStartRollback);
     RUN(TestHandshakeAccept);
     RUN(TestUnknownTicketRejected);
     RUN(TestWrongTokenRejectedThenRightOne);

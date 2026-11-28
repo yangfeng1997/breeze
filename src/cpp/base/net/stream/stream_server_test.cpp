@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -150,6 +151,89 @@ void TestTcpAndUdsShareOneGroup()
     b.Close();
     CHECK(WaitUntil([&] { return rec.closed_count() == 2; }));
     rec.CheckInvariants();
+}
+
+// 大帧 Send 后立即 Close；反复回收连接与复用 fd，下一条连接仍须正常回显。
+void TestCloseWithPendingSendKeepsNextConnectionIntact()
+{
+    const LeakCheck leak;
+    TempDir dir;
+    for (const Endpoint& endpoint : {LoopbackAnyPort(), dir.Unix("pending-close.sock")})
+    {
+        StreamServerOptions options;
+        options.connection.high_water_mark = 8u << 20;
+        Fixture f(endpoint, {1, 8}, std::move(options), false);
+        f.rec.on_message = [](IConnection& c, std::string_view request)
+        {
+            if (request != "drop")
+                return Echo(c, request);
+            std::vector<std::byte> source(3u << 20, std::byte{0x5a});
+            CHECK(c.Send(std::span<const std::byte>(source)) == SendResult::Ok);
+            std::memset(source.data(), 0xee, source.size());
+            c.Close();
+            CHECK(!c.IsConnected());
+        };
+        for (std::size_t i = 0; i < 64; ++i)
+        {
+            TestClient c(f.server.endpoint());
+            c.SendFrame("drop");
+            CHECK(f.rec.WaitClosed(i).reason == CloseReason::LocalClose);
+        }
+        TestClient next(f.server.endpoint());
+        next.SendFrame("fresh-connection");
+        CHECK(next.RecvFrame() == "fresh-connection");
+        next.Close();
+        f.rec.WaitClosed(64);
+        f.rec.CheckInvariants();
+    }
+}
+
+// 首次 Send 返回后立即改写源内存，再优雅关闭；空帧、小帧与 3MB 大帧都须原样排空并完成记账。
+void TestFirstSendViewFlushesBeforeGracefulClose()
+{
+    const LeakCheck leak;
+    TempDir dir;
+    for (const Endpoint& endpoint : {LoopbackAnyPort(), dir.Unix("first-send.sock")})
+    {
+        StreamServerOptions options;
+        options.connection.high_water_mark = 8u << 20;
+        Fixture f(endpoint, {1, 8}, std::move(options), false);
+        EventLoop& loop = GroupAccess::LoopAt(f.group, 0);
+        std::size_t frames = 0;
+        f.rec.on_message = [](IConnection& c, std::string_view request)
+        {
+            std::vector<std::byte> source(request.size());
+            for (std::size_t i = 0; i < source.size(); ++i)
+                source[i] = static_cast<std::byte>(i % 251);
+            CHECK(c.Send(std::span<const std::byte>(source)) == SendResult::Ok);
+            std::fill(source.begin(), source.end(), std::byte{0xee});
+            c.CloseGracefully(5s);
+        };
+        std::uint64_t bytes = 0;
+        for (const std::size_t payload_size : {std::size_t{0}, std::size_t{64}, std::size_t{3u << 20}})
+        {
+            TestClient c(f.server.endpoint());
+            const ConnectionHandle h = f.rec.WaitConnected(frames);
+            c.SendFrame(std::string(payload_size, 'q'));
+            const std::string received = c.RecvFrame();
+            CHECK(received.size() == payload_size);
+            for (std::size_t i = 0; i < received.size(); ++i)
+                CHECK(static_cast<unsigned char>(received[i]) == i % 251);
+            CHECK(c.WaitClosed());
+            CHECK(WaitUntil([&] { return loop.table().PendingBytes(h.slot()) == 0; }));
+            bytes += 4 + payload_size;
+            ++frames;
+            CHECK(WaitUntil(
+                [&]
+                {
+                    const NetStats stats = f.group.GetStats();
+                    return stats.messages_out == frames && stats.bytes_out == bytes;
+                }));
+            c.Close();
+            CHECK(f.rec.WaitClosed(frames - 1).reason == CloseReason::LocalClose);
+        }
+        f.rec.CheckInvariants();
+    }
 }
 
 // ---- 连接数最少的 loop 优先 ----
@@ -434,6 +518,8 @@ int main()
 
     TestStartErrorsRollBack();
     TestTcpAndUdsShareOneGroup();
+    TestCloseWithPendingSendKeepsNextConnectionIntact();
+    TestFirstSendViewFlushesBeforeGracefulClose();
     TestConnectionsSpreadAcrossLoops();
     TestAcceptFilterRejectsWithoutCallbacks();
     TestAcceptFilterSeesUdsCredentials();
