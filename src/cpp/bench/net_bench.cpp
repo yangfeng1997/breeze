@@ -240,7 +240,7 @@ std::vector<int> ParseCpus(const std::string& s)
     return v;
 }
 
-// 服务端连接表的槽数（每槽 64 字节）：默认 64K，连接数更多时放大到 128K；main 在建服务端之前按 --conns 设定。
+// 服务端连接表的槽数：按请求规模取2的幂，所有候选使用同一容量，避免大规模测试先撞容量上限。
 std::uint32_t g_table_slots = 1u << 16;
 
 // TCP 连接数超过 2 万时，单个（源地址, 目的地址）的临时端口不够（本机范围 32768–60999，约 2.8 万）：
@@ -2302,7 +2302,12 @@ int main(int argc, char** argv)
     if (g_fanout > 1 && (o.impl != "breeze-mainloop" || o.transport == "udp"))
         Die("--fanout 只配 --impl breeze-mainloop（要经 NetModule 的跨线程 Send），传输 tcp / uds / tls / ws / wss");
 
-    g_table_slots = std::max(o.conns, o.mem_probe) > 60000 ? (1u << 17) : (1u << 16);
+    const int requested_connections = std::max(o.conns, o.mem_probe);
+    if (requested_connections > static_cast<int>(ConnectionTable::kMaxCapacity))
+        Die("请求连接数超过连接表上限");
+    g_table_slots = 1u << 16;
+    while (g_table_slots < static_cast<std::uint32_t>(requested_connections))
+        g_table_slots <<= 1;
     auto server = MakeServer(o);
     const Endpoint ep = server->Start(*listen_ep, o.server_cpu);
     const std::string server_backend = server->ActualBackend();
@@ -2379,6 +2384,19 @@ int main(int argc, char** argv)
     }
     while (connected.load() < o.client_threads)
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    // 客户端connect完成不等于服务端已接纳全部；先等连接表，不能把未接纳阶段计入收发窗口。
+    if (o.transport != "udp" && o.impl.rfind("breeze", 0) == 0)
+    {
+        const auto until = BenchClock::now() + std::chrono::seconds(30);
+        while (server->Connections() < static_cast<std::uint64_t>(o.conns) && BenchClock::now() < until)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (server->Connections() != static_cast<std::uint64_t>(o.conns))
+        {
+            std::fprintf(stderr, "server acceptance incomplete requested=%d accepted=%llu\n", o.conns,
+                         static_cast<unsigned long long>(server->Connections()));
+            Die("服务端未接纳全部连接");
+        }
+    }
     const double setup_s = std::chrono::duration<double>(BenchClock::now() - setup0).count();
     Phase("clients connected");
 
