@@ -532,7 +532,9 @@ void TestIdleTimeoutAndHeartbeat()
     auto quiet = env.Connected(quiet_rec, std::move(quiet_o));
     const auto closed = quiet_rec.WaitClosed(0, 8s);
     CHECK(closed.reason == CloseReason::PeerClosed); // 服务端关它时发的 Close
-    CHECK(env.srv.closed_count() == 1 && env.srv.WaitClosed(0).reason == CloseReason::IdleTimeout);
+    // 客户端收到 Close 与服务端延后回收没有跨 loop 顺序，先等服务端回调再核对数量。
+    CHECK(env.srv.WaitClosed(0).reason == CloseReason::IdleTimeout);
+    CHECK(env.srv.closed_count() == 1);
     std::this_thread::sleep_for(1500ms);
     CHECK(alive_rec.closed_count() == 0 && alive->handle().valid()); // 心跳的那个一直在
     CHECK(env.stats().closed[static_cast<std::size_t>(CloseReason::IdleTimeout)] == 1);
