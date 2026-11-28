@@ -52,7 +52,7 @@ int EventLoopGroup::Start()
     for (std::uint32_t i = 0; i < options_.io_threads; ++i)
     {
         auto w = std::make_unique<Worker>();
-        const EventLoopOptions lo{id, i, options_.max_connections_per_loop, options_.io_backend};
+        const EventLoopOptions lo{id, i, options_.max_connections_per_loop, options_.io_backend, options_.uring};
         if (const int e = w->loop.Init(lo); e != 0)
         {
             workers_.clear();

@@ -6,5 +6,5 @@
 
 namespace breeze
 {
-std::unique_ptr<IoEngine> MakeUringEngine();
+std::unique_ptr<IoEngine> MakeUringEngine(UringReceiveMode mode);
 }

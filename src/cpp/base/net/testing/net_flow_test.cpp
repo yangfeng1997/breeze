@@ -172,6 +172,42 @@ void TestPauseOnClosedHandleIsNoop()
     CHECK(f.rec.closed_count() == 1 && f.Paused() == 0);
 }
 
+// 取消multishot前已完成的多块数据不能互相覆盖；反复恢复/暂停后仍交付全部有序帧。
+void TestPauseAfterMultishotBurstPreservesAllFrames()
+{
+    const LeakCheck leak;
+    Fixture f;
+    std::atomic<unsigned> delivered{0};
+    f.rec.on_message = [&](IConnection& c, std::string_view)
+    {
+        if (delivered.fetch_add(1) % 8 == 7)
+            c.PauseRead();
+    };
+    TestClient client(f.server.endpoint());
+    const auto h = f.rec.WaitConnected(0);
+    constexpr unsigned frames = 256;
+    std::string wire;
+    for (unsigned i = 0; i < frames; ++i)
+    {
+        std::string payload(512, static_cast<char>('a' + i % 26));
+        const auto frame = TestClient::Frame(payload);
+        wire.append(reinterpret_cast<const char*>(frame.data()), frame.size());
+    }
+    client.SendAll(std::as_bytes(std::span(wire.data(), wire.size())));
+    const auto until = std::chrono::steady_clock::now() + 5s;
+    while (delivered.load() < frames && std::chrono::steady_clock::now() < until)
+    {
+        if (f.Paused() != 0)
+            h.ResumeRead();
+        std::this_thread::sleep_for(200us);
+    }
+    CHECK(delivered.load() == frames);
+    const auto got = f.rec.payloads();
+    CHECK(got.size() == frames);
+    for (unsigned i = 0; i < frames; ++i)
+        CHECK(got[i] == std::string(512, static_cast<char>('a' + i % 26)));
+}
+
 // ---- CloseGracefully ----
 
 // 队列里的数据先发完，再 shutdown(SHUT_WR)；对端收到全部数据与 EOF，关闭之后正常结束（LocalClose），不用等超时。
@@ -515,6 +551,7 @@ int main()
     TestPausedConnectionStillClosesOnReset();
     TestPausedConnectionNoticesFinOnResume();
     TestPauseOnClosedHandleIsNoop();
+    TestPauseAfterMultishotBurstPreservesAllFrames();
     TestGracefulFlushesThenWaitsForPeer();
     TestGracefulForceClosesOnTimeout();
     TestGracefulForceClosesWithUnsentBacklog();

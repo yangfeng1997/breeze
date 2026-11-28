@@ -76,6 +76,7 @@ IoRegistration IoEngine::AttachStream(int, IStreamCompletion&, int& error)
 void IoEngine::ReadStream(IoRegistration, bool) {}
 int IoEngine::WriteStream(IoRegistration, std::span<const iovec>) { return ENOTSUP; }
 int IoEngine::WriteOwnedStream(IoRegistration, SharedBuffer) { return ENOTSUP; }
+int IoEngine::WriteOwnedStreamV(IoRegistration, std::span<const std::byte>, SharedBuffer) { return ENOTSUP; }
 void IoEngine::Detach(IoRegistration) {}
 IoRegistration IoEngine::AttachDatagram(int, IDatagramCompletion&, int& error)
 {
@@ -88,9 +89,22 @@ int IoEngine::SendDatagram(
     return ENOTSUP;
 }
 
-std::unique_ptr<IoEngine> MakeIoEngine(IoBackend backend, int& error)
+std::unique_ptr<IoEngine> MakeIoEngine(IoBackend backend, int& error, UringOptions options)
 {
     error = 0;
+    (void)options; // 禁用uring编译时不使用后端专有选项。
+    if (const char* receive = std::getenv("BREEZE_TEST_URING_RECV"))
+    {
+        if (std::strcmp(receive, "multishot") == 0)
+            options.receive_mode = UringReceiveMode::Multishot;
+        else if (std::strcmp(receive, "hybrid") == 0)
+            options.receive_mode = UringReceiveMode::Hybrid;
+        else
+        {
+            error = EINVAL;
+            return nullptr;
+        }
+    }
     // 测试/排障可强制后端；生产默认 Epoll，显式 Auto 才做运行时探测。
     if (const char* value = std::getenv("BREEZE_IO_BACKEND"))
     {
@@ -109,7 +123,7 @@ std::unique_ptr<IoEngine> MakeIoEngine(IoBackend backend, int& error)
     if (backend == IoBackend::Auto)
     {
 #if BREEZE_HAS_IO_URING
-        auto candidate = MakeUringEngine();
+        auto candidate = MakeUringEngine(options.receive_mode);
         if (const int e = candidate->Init(); e == 0)
             return candidate;
         else
@@ -125,7 +139,7 @@ std::unique_ptr<IoEngine> MakeIoEngine(IoBackend backend, int& error)
             break;
         case IoBackend::IoUring:
 #if BREEZE_HAS_IO_URING
-            engine = MakeUringEngine();
+            engine = MakeUringEngine(options.receive_mode);
             break;
 #else
             error = ENOTSUP;

@@ -159,6 +159,7 @@ protected:
     virtual void StartIoWrite() {}
     bool SubmitIoWrite(std::span<const iovec> buffers);
     bool SubmitIoOwnedWrite(SharedBuffer bytes);
+    bool SubmitIoOwnedWriteV(std::span<const std::byte> prefix, SharedBuffer payload);
     bool CompleteIoWrite(std::size_t bytes, int error);
 
     // 一个握手来源完成：清它的位，全部清完就回调 OnConnected。幂等；连接已关闭则忽略。

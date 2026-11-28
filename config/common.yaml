@@ -37,6 +37,8 @@ net:
   io_threads: 4
   rudp_reuse_port: false
   io_backend: epoll
+  uring_receive: hybrid
+  uring_owned_vectored_send: false
   max_connections_per_loop: 65536
   high_water_mark_bytes: 262144
   idle_timeout_ms: 0

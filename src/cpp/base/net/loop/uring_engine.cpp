@@ -4,6 +4,7 @@
 #include <liburing.h>
 #include <poll.h>
 #include <sys/epoll.h>
+#include <sys/stat.h>
 
 #include <algorithm>
 #include <array>
@@ -30,9 +31,22 @@ class UringEngine final : public IoEngine
 {
     static constexpr std::uint64_t kPoll = 1;
     static constexpr unsigned kBufferCount = 256;
-    static constexpr unsigned kBufferBytes = 16 * 1024;
     static constexpr unsigned kDatagramBytes = 2048;
     static constexpr unsigned kCompletionBudget = 1024;
+    static constexpr unsigned kStreamBufferCount = 2048;
+    static constexpr unsigned kStreamBufferBytes = 8192;
+    static constexpr unsigned kStreamGroupConnections = 2048;
+    struct StreamBuffers
+    {
+        io_uring_buf_ring* ring = nullptr;
+        void* bytes = nullptr;
+        unsigned attached = 0;
+        ~StreamBuffers()
+        {
+            std::free(ring);
+            std::free(bytes);
+        }
+    };
     static constexpr std::size_t kSendLimit = 256 * 1024;
     enum class Kind
     {
@@ -50,8 +64,13 @@ class UringEngine final : public IoEngine
         IDatagramCompletion* datagram = nullptr;
         bool alive = true;
         bool reading = true;
+        unsigned stream_group = 0;
+        ino_t retired_inode = 0;
         bool read_ready = false;
         bool poll_registered = false;
+        bool rearm_queued = false;
+        unsigned received_this_round = 0;
+        std::uint64_t receive_round = 0;
         std::uint64_t read = 0;
         std::uint64_t write = 0;
         std::uint64_t watch = 0;
@@ -68,6 +87,7 @@ class UringEngine final : public IoEngine
         std::unique_ptr<DatagramQueue> datagram_queue;
         std::vector<std::byte> deferred;
         bool deferred_event = false;
+        bool deferred_eof = false;
         int deferred_error = 0;
     };
     struct Operation
@@ -77,6 +97,10 @@ class UringEngine final : public IoEngine
         SharedBuffer bytes;
         sockaddr_storage address{};
         iovec iov{};
+        std::array<std::byte, 16> prefix{};
+        std::array<iovec, 2> owned_iov{};
+        unsigned prefix_size = 0;
+        std::size_t accounted_bytes = 0;
         msghdr msg{};
         explicit Operation(Kind k, std::shared_ptr<State> s)
             : kind(k)
@@ -93,6 +117,7 @@ class UringEngine final : public IoEngine
     using Operations = detail::IoOperationTable<Operation>;
 
 public:
+    explicit UringEngine(UringReceiveMode mode) : native_receive_(mode == UringReceiveMode::Multishot) {}
     ~UringEngine() override
     {
         // queue_exit 先撤销内核引用；buf ring、operation 及数据随后才释放。
@@ -112,10 +137,10 @@ public:
         }
         if (buffers_)
             std::free(buffers_);
-        if (datagram_buffers_)
-            std::free(datagram_buffers_);
         if (buffer_ring_)
             std::free(buffer_ring_);
+        if (datagram_buffers_)
+            std::free(datagram_buffers_);
         if (datagram_ring_)
             std::free(datagram_ring_);
     }
@@ -126,6 +151,9 @@ public:
         if (!epfd_.valid())
             return errno;
         io_uring_params params{};
+        // 原生multishot可在用户态处理前产生多条完成，CQ独立放大以容纳突发。
+        params.flags = IORING_SETUP_CQSIZE;
+        params.cq_entries = native_receive_ ? 8192 : 2048;
         const int rc = io_uring_queue_init_params(1024, &ring_, &params);
         if (rc < 0)
             return -rc;
@@ -184,7 +212,8 @@ public:
     int Wait(std::span<IoEvent> events, int timeout_ms) override
     {
         StageCancellations();
-        StageStreamReads();
+        if (!native_receive_)
+            StageStreamReads();
         StageDatagrams();
         if (!poll_armed_)
             if (const int e = ArmPoll(); e != 0)
@@ -273,13 +302,40 @@ public:
         auto deferred = std::move(deferred_);
         for (const auto& state : deferred)
         {
-            if (!state->alive || !state->deferred_event || (!state->reading && state->deferred_error == 0))
+            if (!state->alive || !state->deferred_event || !state->reading)
                 continue;
             auto data = std::move(state->deferred);
             const int error = state->deferred_error;
+            const bool eof = state->deferred_eof;
             state->deferred_event = false;
-            state->stream->OnIoRead(data, error);
-            if (state->alive && state->reading)
+            state->deferred_error = 0;
+            state->deferred_eof = false;
+            std::size_t delivered = 0;
+            while (delivered < data.size() && state->alive && state->reading)
+            {
+                const std::size_t take = std::min<std::size_t>(kStreamBufferBytes, data.size() - delivered);
+                state->stream->OnIoRead(std::span<std::byte>(data).subspan(delivered, take), 0);
+                delivered += take;
+            }
+            if (state->alive && delivered < data.size())
+            {
+                state->deferred.insert(state->deferred.begin(), data.begin() + delivered, data.end());
+                state->deferred_event = true;
+                state->deferred_eof = eof;
+                state->deferred_error = error;
+            }
+            if (state->alive && delivered == data.size() && (eof || error != 0))
+            {
+                if (state->reading || error != 0)
+                    state->stream->OnIoRead({}, error);
+                else
+                {
+                    state->deferred_event = true;
+                    state->deferred_eof = eof;
+                    state->deferred_error = error;
+                }
+            }
+            if (state->alive && state->reading && !state->deferred_event)
                 RearmRead(state);
         }
         completion_work_.clear();
@@ -308,6 +364,16 @@ public:
                 }
                 over_budget = queue.received_this_round++ >= 64;
             }
+            else if (operation && operation->kind == Kind::Read)
+            {
+                auto& state = *operation->state;
+                if (state.receive_round != dispatch_round_)
+                {
+                    state.receive_round = dispatch_round_;
+                    state.received_this_round = 0;
+                }
+                over_budget = state.received_this_round++ >= 16;
+            }
             if (over_budget)
                 completions_.push_back(c); // 保留 buffer 所有权，下一轮继续，避免单 socket 独占 loop。
             else
@@ -317,8 +383,11 @@ public:
         auto rearm = std::move(rearm_);
         rearm_.clear();
         for (const auto& state : rearm)
+        {
+            state->rearm_queued = false;
             if (state->alive && state->reading && state->read == 0 && !state->deferred_event)
                 RearmRead(state);
+        }
     }
 
     void Drain() override
@@ -357,6 +426,47 @@ public:
                     Complete(c);
             }
         }
+        // 长期multishot数量可能很大，先分批取消并持续收割，避免一次同步取消形成退出突发。
+        std::deque<std::uint64_t> pending_cancel;
+        if (native_receive_)
+            operations_.ForEach([&](std::uint64_t id, const Operation&) { pending_cancel.push_back(id); });
+        const auto cancel_until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (native_receive_ && (!pending_cancel.empty() || !operations_.empty()) && std::chrono::steady_clock::now() < cancel_until)
+        {
+            unsigned staged_cancel = 0;
+            while (!pending_cancel.empty() && staged_cancel < 128)
+            {
+                const auto id = pending_cancel.front();
+                if (!operations_.Get(id))
+                {
+                    pending_cancel.pop_front();
+                    continue;
+                }
+                auto* sqe = io_uring_get_sqe(&ring_);
+                if (!sqe)
+                    break;
+                pending_cancel.pop_front();
+                io_uring_prep_cancel64(sqe, id, 0);
+                io_uring_sqe_set_data64(sqe, 0);
+                ++staged_cancel;
+            }
+            Flush();
+            io_uring_cqe* ready = nullptr;
+            __kernel_timespec timeout{0, 1000000};
+            (void)io_uring_wait_cqe_timeout(&ring_, &ready, &timeout);
+            unsigned count = 0;
+            while (ready && count++ < kCompletionBudget)
+            {
+                const Completion c{io_uring_cqe_get_data64(ready), ready->res, ready->flags};
+                io_uring_cqe_seen(&ring_, ready);
+                if (c.id == kPoll)
+                    poll_armed_ = false;
+                else if (c.id != 0)
+                    Complete(c);
+                ready = nullptr;
+                (void)io_uring_peek_cqe(&ring_, &ready);
+            }
+        }
         Flush();
         io_uring_sync_cancel_reg cancel{};
         cancel.flags = IORING_ASYNC_CANCEL_ANY | IORING_ASYNC_CANCEL_ALL;
@@ -369,11 +479,12 @@ public:
             io_uring_cqe_seen(&ring_, cqe);
         operations_.Clear();
         states_.clear();
+        retired_sockets_.clear();
+        stream_ready_.clear();
+        stream_reads_in_flight_ = 0;
         completions_.clear();
         deferred_.clear();
         rearm_.clear();
-        stream_ready_.clear();
-        stream_reads_in_flight_ = 0;
         completion_work_.clear();
         datagram_ready_.clear();
         datagram_work_.clear();
@@ -385,7 +496,8 @@ public:
     void Flush() override
     {
         StageCancellations();
-        StageStreamReads();
+        if (!native_receive_)
+            StageStreamReads();
         StageDatagrams();
         SubmitPending();
     }
@@ -404,13 +516,19 @@ public:
 
     IoRegistration AttachStream(int fd, IStreamCompletion& sink, int& error) override
     {
-        if (!buffer_ring_)
+        unsigned group = 0;
+        error = 0;
+        if (native_receive_)
+            group = SelectStreamGroup(error);
+        else if (!buffer_ring_)
         {
-            error = SetupBuffers(1, kBufferBytes, buffer_ring_, buffers_);
-            if (error)
-                return 0;
-            IoCounters::Add(counters_.receive_buffer_bytes, kBufferCount * kBufferBytes);
+            error = SetupBuffers(1, 16 * 1024, buffer_ring_, buffers_);
+            if (error == 0)
+                IoCounters::Add(counters_.receive_buffer_bytes, kBufferCount * 16 * 1024);
         }
+        if (error != 0)
+            return 0;
+        CancelRetiredSocket(fd);
         auto state = NewState(fd);
         if (!state->fd.valid())
         {
@@ -419,9 +537,14 @@ public:
             return 0;
         }
         state->stream = &sink;
+        state->stream_group = group;
+        if (group != 0)
+            ++stream_groups_[group - 16]->attached;
         error = QueueRead(state);
         if (error)
         {
+            if (group != 0)
+                --stream_groups_[group - 16]->attached;
             states_.erase(state->id);
             return 0;
         }
@@ -436,6 +559,7 @@ public:
                 return 0;
             IoCounters::Add(counters_.receive_buffer_bytes, kBufferCount * kDatagramBytes);
         }
+        CancelRetiredSocket(fd);
         auto state = NewState(fd);
         if (!state->fd.valid())
         {
@@ -515,6 +639,21 @@ public:
         op->bytes = std::move(bytes);
         return QueueWrite(std::move(op));
     }
+    int WriteOwnedStreamV(IoRegistration id, std::span<const std::byte> prefix, SharedBuffer payload) override
+    {
+        auto state = Find(id);
+        if (!state || !state->stream)
+            return EBADF;
+        if (state->write)
+            return EBUSY;
+        if (prefix.size() > 16 || payload.size() > kSendLimit - prefix.size() || (prefix.empty() && payload.empty()))
+            return EMSGSIZE;
+        auto op = Acquire(Kind::Write, state);
+        std::copy(prefix.begin(), prefix.end(), op->prefix.begin());
+        op->prefix_size = static_cast<unsigned>(prefix.size());
+        op->bytes = std::move(payload);
+        return QueueWrite(std::move(op));
+    }
     int SendDatagram(IoRegistration id,
                      std::span<const std::byte> prefix,
                      std::span<const std::byte> payload,
@@ -552,6 +691,19 @@ public:
             return;
         state->alive = false;
         RemoveStreamPoll(*state);
+        if (state->stream_group != 0)
+        {
+            --stream_groups_[state->stream_group - 16]->attached;
+            if (state->read != 0)
+            {
+                struct stat identity{};
+                if (::fstat(state->fd.get(), &identity) == 0)
+                {
+                    state->retired_inode = identity.st_ino;
+                    retired_sockets_[identity.st_ino] = state;
+                }
+            }
+        }
         state->deferred.clear();
         state->deferred_event = false;
         if (state->read)
@@ -583,6 +735,29 @@ public:
     }
 
 private:
+    void CancelRetiredSocket(int fd)
+    {
+        if (retired_sockets_.empty())
+            return;
+        struct stat identity{};
+        if (::fstat(fd, &identity) != 0)
+            return;
+        const auto it = retired_sockets_.find(identity.st_ino);
+        if (it == retired_sockets_.end())
+            return;
+        if (auto old = it->second.lock(); old && old->read != 0)
+        {
+            // 同一socket立即重新注册时，旧multishot不能在取消生效前吞掉新注册的数据。
+            Flush();
+            io_uring_sync_cancel_reg cancel{};
+            cancel.addr = old->read;
+            cancel.timeout.tv_sec = 1;
+            const int rc = io_uring_register_sync_cancel(&ring_, &cancel);
+            if (rc < 0 && rc != -ENOENT)
+                LOG_FATAL("旧socket读取取消失败 errno={}", -rc);
+        }
+        retired_sockets_.erase(identity.st_ino);
+    }
     std::shared_ptr<State> NewState(int fd)
     {
         auto state = std::make_shared<State>();
@@ -600,7 +775,7 @@ private:
     bool HasDeferred() const noexcept
     {
         return !deferred_.empty() || !rearm_.empty() || !cancellations_.empty() ||
-               (!stream_ready_.empty() && stream_reads_in_flight_ < kBufferCount);
+               (!native_receive_ && !stream_ready_.empty() && stream_reads_in_flight_ < kBufferCount);
     }
     io_uring_sqe* GetSqe()
     {
@@ -669,10 +844,20 @@ private:
     void Release(std::uint64_t id)
     {
         auto op = operations_.Remove(id);
+        if (op->kind == Kind::Read && op->state->retired_inode != 0)
+        {
+            const auto inode = op->state->retired_inode;
+            const auto it = retired_sockets_.find(inode);
+            if (it != retired_sockets_.end() && it->second.lock() == op->state)
+                retired_sockets_.erase(inode);
+        }
         op->state.reset();
         op->bytes = {};
         op->msg = {};
         op->iov = {};
+        op->owned_iov = {};
+        op->prefix_size = 0;
+        op->accounted_bytes = 0;
         op->address = {};
         if (operation_pool_.size() < 2048)
             operation_pool_.push_back(std::move(op));
@@ -681,18 +866,26 @@ private:
     {
         if (const int error = QueueRead(state); error != 0)
         {
-            // ResumeRead调用栈内也不能同步回调；epoll重挂失败下一轮上报，不能静默停读。
+            // ResumeRead调用栈内也不能同步回调；重挂失败下一轮上报，不能静默停读。
             state->deferred.clear();
             state->deferred_error = error;
             state->deferred_event = true;
             deferred_.push_back(state);
         }
     }
+    void ScheduleRead(const std::shared_ptr<State>& state)
+    {
+        if (!state->rearm_queued)
+        {
+            state->rearm_queued = true;
+            rearm_.push_back(state);
+        }
+    }
     int QueueRead(const std::shared_ptr<State>& state)
     {
         if (state->read || state->read_ready || !state->alive || !state->reading)
             return 0;
-        if (state->stream)
+        if (state->stream && !native_receive_)
         {
             if (state->id > (UINT64_MAX >> 1))
                 LOG_FATAL("流注册ID耗尽");
@@ -708,14 +901,24 @@ private:
         auto* sqe = GetSqe();
         if (!sqe)
         {
-            rearm_.push_back(state);
+            ScheduleRead(state);
             return 0;
         }
-        auto op = Acquire(Kind::DatagramRead, state);
-        op->msg.msg_namelen = sizeof(sockaddr_storage);
-        io_uring_prep_recvmsg_multishot(sqe, state->fd.get(), &op->msg, 0);
+        const bool datagram = state->datagram != nullptr;
+        auto op = Acquire(datagram ? Kind::DatagramRead : Kind::Read, state);
+        if (datagram)
+        {
+            op->msg.msg_namelen = sizeof(sockaddr_storage);
+            io_uring_prep_recvmsg_multishot(sqe, state->fd.get(), &op->msg, 0);
+            sqe->buf_group = 2;
+        }
+        else
+        {
+            // len=0兼容早期multishot；buf group限制单次字节，内核自己等待socket就绪。
+            io_uring_prep_recv_multishot(sqe, state->fd.get(), nullptr, 0, 0);
+            sqe->buf_group = static_cast<unsigned short>(state->stream_group);
+        }
         sqe->flags |= IOSQE_BUFFER_SELECT;
-        sqe->buf_group = 2;
         const auto id = operations_.Insert(std::move(op));
         io_uring_sqe_set_data64(sqe, id);
         state->read = id;
@@ -744,7 +947,7 @@ private:
                 LOG_FATAL("已就绪流无法提交读取");
             const auto id = operations_.Insert(Acquire(Kind::Read, state));
             // readiness可能被旧请求或外部读取消费；DONTWAIT禁止在无数据时继续占住缓冲名额。
-            io_uring_prep_recv(sqe, state->fd.get(), nullptr, kBufferBytes, MSG_DONTWAIT);
+            io_uring_prep_recv(sqe, state->fd.get(), nullptr, 16 * 1024, MSG_DONTWAIT);
             sqe->flags |= IOSQE_BUFFER_SELECT;
             sqe->buf_group = 1;
             io_uring_sqe_set_data64(sqe, id);
@@ -760,9 +963,20 @@ private:
         if (!datagram && !sqe)
             return EAGAIN;
         op->iov = {const_cast<std::byte*>(op->bytes.data()), op->bytes.size()};
-        op->msg.msg_iov = &op->iov;
-        op->msg.msg_iovlen = 1;
-        IoCounters::Add(counters_.pending_send_bytes, op->bytes.size());
+        if (op->prefix_size != 0)
+        {
+            op->owned_iov[0] = {op->prefix.data(), op->prefix_size};
+            op->owned_iov[1] = op->iov;
+            op->msg.msg_iov = op->owned_iov.data();
+            op->msg.msg_iovlen = op->bytes.empty() ? 1 : 2;
+        }
+        else
+        {
+            op->msg.msg_iov = &op->iov;
+            op->msg.msg_iovlen = 1;
+        }
+        op->accounted_bytes = op->bytes.size() + op->prefix_size;
+        IoCounters::Add(counters_.pending_send_bytes, op->accounted_bytes);
         Operation* raw = op.get();
         const auto id = operations_.Insert(std::move(op));
         if (datagram)
@@ -778,7 +992,7 @@ private:
         {
             state->write = id;
             // 流发送已是连续owned块，不必再让内核导入单iovec/msghdr；数据报仍保留地址语义。
-            if (use_send_)
+            if (use_send_ && raw->prefix_size == 0)
                 io_uring_prep_send(sqe, state->fd.get(), raw->bytes.data(), raw->bytes.size(), MSG_NOSIGNAL);
             else
                 io_uring_prep_sendmsg(sqe, state->fd.get(), &raw->msg, MSG_NOSIGNAL);
@@ -827,8 +1041,14 @@ private:
     }
     int ProbeMultishot()
     {
+        if (const int error = ProbeMultishotSocket(false); error != 0)
+            return error;
+        return native_receive_ ? ProbeMultishotSocket(true) : 0;
+    }
+    int ProbeMultishotSocket(bool stream)
+    {
         int pair[2];
-        if (::socketpair(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, pair) != 0)
+        if (::socketpair(AF_UNIX, (stream ? SOCK_STREAM : SOCK_DGRAM) | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, pair) != 0)
             return errno;
         UniqueFd receiver(pair[0]), sender(pair[1]);
         io_uring_buf_ring* br = nullptr;
@@ -842,7 +1062,10 @@ private:
         }
         msghdr message{};
         auto* sqe = io_uring_get_sqe(&ring_);
-        io_uring_prep_recvmsg_multishot(sqe, receiver.get(), &message, 0);
+        if (stream)
+            io_uring_prep_recv_multishot(sqe, receiver.get(), nullptr, 0, 0);
+        else
+            io_uring_prep_recvmsg_multishot(sqe, receiver.get(), &message, 0);
         sqe->flags |= IOSQE_BUFFER_SELECT;
         sqe->buf_group = 3;
         io_uring_sqe_set_data64(sqe, 0);
@@ -869,23 +1092,43 @@ private:
         std::free(bytes);
         return error;
     }
-    int SetupBuffers(unsigned group, unsigned size, io_uring_buf_ring*& br, void*& bytes)
+    unsigned SelectStreamGroup(int& error)
+    {
+        error = 0;
+        for (unsigned i = 0; i < stream_groups_.size(); ++i)
+            if (stream_groups_[i]->attached < kStreamGroupConnections)
+                return i + 16;
+        if (stream_groups_.size() >= 65520)
+        {
+            error = ENOSPC;
+            return 0;
+        }
+        auto group = std::make_unique<StreamBuffers>();
+        const unsigned id = static_cast<unsigned>(stream_groups_.size()) + 16;
+        error = SetupBuffers(id, kStreamBufferBytes, group->ring, group->bytes, kStreamBufferCount);
+        if (error != 0)
+            return 0;
+        IoCounters::Add(counters_.receive_buffer_bytes, kStreamBufferCount * kStreamBufferBytes);
+        stream_groups_.push_back(std::move(group));
+        return id;
+    }
+    int SetupBuffers(unsigned group, unsigned size, io_uring_buf_ring*& br, void*& bytes, unsigned count = kBufferCount)
     {
         // 全部创建成功才发布成员，Attach 失败后的重试不能误用未注册的 bgid。
         void* data = nullptr;
-        if (::posix_memalign(&data, 4096, kBufferCount * size) != 0)
+        if (::posix_memalign(&data, 4096, count * size) != 0)
             return ENOMEM;
         void* ring_memory = nullptr;
-        if (::posix_memalign(&ring_memory, 4096, kBufferCount * sizeof(io_uring_buf)) != 0)
+        if (::posix_memalign(&ring_memory, 4096, count * sizeof(io_uring_buf)) != 0)
         {
             std::free(data);
             return ENOMEM;
         }
         auto* local = static_cast<io_uring_buf_ring*>(ring_memory);
-        std::memset(local, 0, kBufferCount * sizeof(io_uring_buf));
+        std::memset(local, 0, count * sizeof(io_uring_buf));
         io_uring_buf_reg reg{};
         reg.ring_addr = reinterpret_cast<std::uint64_t>(local);
-        reg.ring_entries = kBufferCount;
+        reg.ring_entries = count;
         reg.bgid = static_cast<unsigned short>(group);
         if (const int rc = io_uring_register_buf_ring(&ring_, &reg, 0); rc < 0)
         {
@@ -894,20 +1137,23 @@ private:
             return -rc;
         }
         io_uring_buf_ring_init(local);
-        for (unsigned i = 0; i < kBufferCount; ++i)
+        for (unsigned i = 0; i < count; ++i)
             io_uring_buf_ring_add(
-                local, static_cast<std::byte*>(data) + i * size, size, i, io_uring_buf_ring_mask(kBufferCount), i);
-        io_uring_buf_ring_advance(local, kBufferCount);
+                local, static_cast<std::byte*>(data) + i * size, size, i, io_uring_buf_ring_mask(count), i);
+        io_uring_buf_ring_advance(local, count);
         bytes = data;
         br = local;
         return 0;
     }
-    void ReturnBuffer(bool datagram, unsigned id)
+    void ReturnBuffer(const State& state, unsigned id)
     {
-        auto* br = datagram ? datagram_ring_ : buffer_ring_;
-        const auto size = datagram ? kDatagramBytes : kBufferBytes;
-        auto* memory = static_cast<std::byte*>(datagram ? datagram_buffers_ : buffers_);
-        io_uring_buf_ring_add(br, memory + id * size, size, id, io_uring_buf_ring_mask(kBufferCount), 0);
+        const bool datagram = state.datagram != nullptr;
+        const bool grouped = state.stream_group != 0;
+        auto* br = datagram ? datagram_ring_ : grouped ? stream_groups_[state.stream_group - 16]->ring : buffer_ring_;
+        const auto size = datagram ? kDatagramBytes : grouped ? kStreamBufferBytes : 16 * 1024;
+        auto* memory = static_cast<std::byte*>(datagram ? datagram_buffers_ : grouped ? stream_groups_[state.stream_group - 16]->bytes : buffers_);
+        const auto count = grouped ? kStreamBufferCount : kBufferCount;
+        io_uring_buf_ring_add(br, memory + id * size, size, id, io_uring_buf_ring_mask(count), 0);
         io_uring_buf_ring_advance(br, 1);
     }
     void Complete(const Completion& c)
@@ -951,7 +1197,7 @@ private:
         }
         const bool has_buffer = (c.flags & IORING_CQE_F_BUFFER) != 0;
         const unsigned bid = c.flags >> IORING_CQE_BUFFER_SHIFT;
-        if (has_buffer && bid >= kBufferCount)
+        if (has_buffer && bid >= (state->stream_group != 0 ? kStreamBufferCount : kBufferCount))
             LOG_FATAL("io_uring 无效 buffer id={}", bid);
         if (read && state->alive)
         {
@@ -976,8 +1222,9 @@ private:
                 {
                     std::span<std::byte> bytes;
                     if (has_buffer)
-                        bytes = {static_cast<std::byte*>(buffers_) + bid * kBufferBytes,
-                                 static_cast<std::size_t>(c.result)};
+                        bytes = state->stream_group != 0
+                                    ? std::span<std::byte>(static_cast<std::byte*>(stream_groups_[state->stream_group - 16]->bytes) + bid * kStreamBufferBytes, static_cast<std::size_t>(c.result))
+                                    : std::span<std::byte>(static_cast<std::byte*>(buffers_) + bid * 16 * 1024, static_cast<std::size_t>(c.result));
                     DeliverStream(state, bytes, 0);
                 }
             }
@@ -991,7 +1238,7 @@ private:
         }
         else if (!read)
         {
-            IoCounters::Add(counters_.pending_send_bytes, 0 - static_cast<std::uint64_t>(op.bytes.size()));
+            IoCounters::Add(counters_.pending_send_bytes, 0 - static_cast<std::uint64_t>(op.accounted_bytes));
             if (op.kind == Kind::DatagramWrite)
             {
                 state->queued_bytes -= op.bytes.size();
@@ -1009,11 +1256,11 @@ private:
                                                          : 0);
         }
         if (has_buffer)
-            ReturnBuffer(datagram, bid);
+            ReturnBuffer(*state, bid);
         if (terminal)
         {
             const bool datagram_write = op.kind == Kind::DatagramWrite;
-            if (op.kind == Kind::Read)
+            if (op.kind == Kind::Read && state->stream_group == 0)
             {
                 if (stream_reads_in_flight_ == 0)
                     LOG_FATAL("流读取名额计数下溢");
@@ -1028,7 +1275,7 @@ private:
                 ScheduleDatagrams(state);
             }
             if (read && state->alive && state->reading && !state->deferred_event)
-                rearm_.push_back(state);
+                ScheduleRead(state);
         }
     }
     void DeliverStream(const std::shared_ptr<State>& state, std::span<std::byte> bytes, int error)
@@ -1037,12 +1284,20 @@ private:
             state->stream->OnIoRead(bytes, error);
         else
         {
-            state->deferred.assign(bytes.begin(), bytes.end());
-            state->deferred_error = error;
+            // multishot取消生效前可能有多条CQE，暂停暂存只能追加，不能覆盖先前字节。
+            state->deferred.insert(state->deferred.end(), bytes.begin(), bytes.end());
+            if (error != 0)
+                state->deferred_error = error;
+            state->deferred_eof = state->deferred_eof || (bytes.empty() && error == 0);
             state->deferred_event = true;
         }
     }
 
+    const bool native_receive_;
+    io_uring_buf_ring* buffer_ring_ = nullptr;
+    void* buffers_ = nullptr;
+    unsigned stream_reads_in_flight_ = 0;
+    std::deque<std::shared_ptr<State>> stream_ready_;
     IoCounters counters_;
     UniqueFd epfd_;
     io_uring ring_{};
@@ -1054,16 +1309,14 @@ private:
     bool poll_armed_ = false;
     bool readiness_pending_ = false;
     std::uint64_t dispatch_round_ = 0;
-    io_uring_buf_ring* buffer_ring_ = nullptr;
+    std::vector<std::unique_ptr<StreamBuffers>> stream_groups_;
     io_uring_buf_ring* datagram_ring_ = nullptr;
-    void* buffers_ = nullptr;
     void* datagram_buffers_ = nullptr;
     std::uint64_t next_ = 2;
     std::deque<std::uint64_t> cancellations_;
     unsigned pending_datagrams_ = 0;
-    unsigned stream_reads_in_flight_ = 0;
-    std::deque<std::shared_ptr<State>> stream_ready_;
     FlatHashMap<IoRegistration, std::shared_ptr<State>> states_;
+    FlatHashMap<ino_t, std::weak_ptr<State>> retired_sockets_;
     Operations operations_;
     std::vector<Completion> completions_, completion_work_;
     std::vector<std::shared_ptr<State>> deferred_;
@@ -1073,5 +1326,5 @@ private:
 };
 } // namespace
 
-std::unique_ptr<IoEngine> MakeUringEngine() { return std::make_unique<UringEngine>(); }
+std::unique_ptr<IoEngine> MakeUringEngine(UringReceiveMode mode) { return std::make_unique<UringEngine>(mode); }
 } // namespace breeze

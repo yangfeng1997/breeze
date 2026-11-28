@@ -28,6 +28,7 @@ struct EventLoopGroupOptions
     std::uint32_t io_threads = 1;                   // 1 到 256
     std::uint32_t max_connections_per_loop = 65536; // 1 到 2^20；每个 loop 的连接表按它预分配（每槽 64 字节）
     IoBackend io_backend = IoBackend::Epoll;        // 每组选择；Auto 仅在初始化时探测/回退
+    UringOptions uring{};
 };
 
 class EventLoopGroup

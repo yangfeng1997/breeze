@@ -74,11 +74,14 @@ private:
     SendResult Enqueue(std::span<const std::byte> payload, SharedBuffer* owned, bool counted, bool raw);
     void SubmitQueued();
     void CloseAfterIoPrefix(CloseReason reason);
-    // 首帧独占一个稳定的 wire 块；只有积压才构造 out_ 的 deque。
+    bool HasPendingFirst() const noexcept { return pending_header_len_ != 0 || !pending_wire_.empty(); }
+    // 视图首帧存完整 wire；owned 首帧只留 payload 引用与独立帧头，终结 CQE 前不能改写（SubmitQueued）。
     SharedBuffer pending_wire_;
     std::size_t pending_payload_bytes_ = 0;
     std::size_t pending_wire_offset_ = 0;
     CloseReason io_close_reason_ = CloseReason::LocalClose;
+    std::array<std::byte, kMaxFrameHeaderSize> pending_header_{};
+    std::uint8_t pending_header_len_ = 0; // 非零也表示空 payload 的帧头仍待发送
 };
 
 } // namespace breeze

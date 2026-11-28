@@ -16,6 +16,13 @@ enum IoBackendConfig {
   IO_BACKEND_CONFIG_URING = 3;
 }
 
+// io_uring接收架构实验；默认沿用就绪准入，原生multishot显式开启。
+enum UringReceiveConfig {
+  URING_RECEIVE_CONFIG_UNSPECIFIED = 0;
+  URING_RECEIVE_CONFIG_HYBRID = 1;
+  URING_RECEIVE_CONFIG_MULTISHOT = 2;
+}
+
 message NetConfig {
   // ---- IO 线程与连接容量 ----
   // IO 线程数（每个线程一个 EventLoop）。
@@ -71,6 +78,9 @@ message NetConfig {
   IoBackendConfig io_backend = 19 [(config.default) = "epoll"];
   // rudp 服务端在每个 IO loop 上各绑定一个同端口的 UDP socket；启动后不能改变 shard 数。
   bool rudp_reuse_port = 20 [(config.default) = "false"];
+  UringReceiveConfig uring_receive = 21 [(config.default) = "hybrid"];
+  // 首个owned帧保留payload引用；吞吐收益与包长相关，默认关闭实验项。
+  bool uring_owned_vectored_send = 22 [(config.default) = "false"];
 }
 
 // 协议版本。生成的名字：tls12 / tls13。

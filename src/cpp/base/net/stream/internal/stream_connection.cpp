@@ -683,15 +683,24 @@ SendResult CompletionPlainStreamConnection::Enqueue(std::span<const std::byte> p
             return SendResult::Closed;
         }
     }
-    if (pending_wire_.empty() && out_.empty())
+    if (!HasPendingFirst() && out_.empty())
     {
-        // 视图与栈帧头只活到 Send 返回；首次复制直接生成引擎持有的完整 wire 块。
-        pending_wire_ = SharedBuffer::Create(header_len + payload.size());
-        const std::span<std::byte> wire = pending_wire_.MutableBytes();
-        if (header_len != 0)
-            std::memcpy(wire.data(), header.data(), header_len);
-        if (!payload.empty())
-            std::memcpy(wire.data() + header_len, payload.data(), payload.size());
+        if (owned != nullptr && loop_.options().uring.owned_vectored_send)
+        {
+            std::copy_n(header.data(), header_len, pending_header_.data());
+            pending_header_len_ = static_cast<std::uint8_t>(header_len);
+            pending_wire_ = std::move(*owned);
+        }
+        else
+        {
+            // 视图只活到 Send 返回；一次复制生成引擎持有的完整 wire 块。
+            pending_wire_ = SharedBuffer::Create(header_len + payload.size());
+            const std::span<std::byte> wire = pending_wire_.MutableBytes();
+            if (header_len != 0)
+                std::memcpy(wire.data(), header.data(), header_len);
+            if (!payload.empty())
+                std::memcpy(wire.data() + header_len, payload.data(), payload.size());
+        }
         pending_payload_bytes_ = payload.size();
         pending_wire_offset_ = 0;
     }
@@ -712,7 +721,7 @@ SendResult CompletionPlainStreamConnection::Enqueue(std::span<const std::byte> p
 
 void CompletionPlainStreamConnection::CloseAfterIoPrefix(CloseReason reason)
 {
-    if (pending_wire_.empty() && out_.empty())
+    if (!HasPendingFirst() && out_.empty())
     {
         CloseWith(reason, 0);
         return;
@@ -747,7 +756,7 @@ void CompletionPlainStreamConnection::WriteRaw(std::span<const std::byte> bytes)
 
 void CompletionPlainStreamConnection::FinishWrites()
 {
-    if (pending_wire_.empty() && out_.empty() && !io_write_pending_)
+    if (!HasPendingFirst() && out_.empty() && !io_write_pending_)
         ShutdownWrite();
 }
 
@@ -756,6 +765,16 @@ void CompletionPlainStreamConnection::SubmitQueued()
     if (state_ == State::Disconnected || io_write_pending_)
         return;
     constexpr std::size_t kMaxWriteBytes = 256 * 1024;
+    if (pending_header_len_ != 0 && out_.empty())
+    {
+        const std::size_t header_size = pending_header_len_;
+        const std::size_t header_offset = std::min(pending_wire_offset_, header_size);
+        const auto prefix = std::span<const std::byte>(pending_header_.data(), header_size).subspan(header_offset);
+        const std::size_t payload_offset = pending_wire_offset_ - header_offset;
+        const std::size_t take = std::min(pending_wire_.size() - payload_offset, kMaxWriteBytes - prefix.size());
+        (void)SubmitIoOwnedWriteV(prefix, pending_wire_.Slice(payload_offset, take));
+        return;
+    }
     if (!pending_wire_.empty() && out_.empty())
     {
         const std::size_t take = std::min(pending_wire_.size() - pending_wire_offset_, kMaxWriteBytes);
@@ -767,10 +786,16 @@ void CompletionPlainStreamConnection::SubmitQueued()
     iovec buffers[kMaxIov];
     int count = 0;
     std::size_t offered = 0;
-    if (!pending_wire_.empty())
+    if (HasPendingFirst())
     {
-        offered = std::min(pending_wire_.size() - pending_wire_offset_, kMaxWriteBytes);
-        buffers[count++] = {const_cast<std::byte*>(pending_wire_.data()) + pending_wire_offset_, offered};
+        iovec first[2];
+        const int parts = FillIov(pending_header_.data(), pending_header_len_, pending_wire_.bytes(), pending_wire_offset_, first);
+        for (int i = 0; i < parts && offered < kMaxWriteBytes; ++i)
+        {
+            const std::size_t take = std::min(first[i].iov_len, kMaxWriteBytes - offered);
+            buffers[count++] = {first[i].iov_base, take};
+            offered += take;
+        }
     }
     for (auto it = out_.begin(); it != out_.end() && count + 2 <= kMaxIov && offered < kMaxWriteBytes; ++it)
     {
@@ -820,9 +845,9 @@ void CompletionPlainStreamConnection::OnIoWrite(std::size_t bytes, int error)
 {
     if (!CompleteIoWrite(bytes, error))
         return;
-    if (!pending_wire_.empty())
+    if (HasPendingFirst())
     {
-        const std::size_t remain = pending_wire_.size() - pending_wire_offset_;
+        const std::size_t remain = pending_header_len_ + pending_wire_.size() - pending_wire_offset_;
         if (bytes < remain)
         {
             pending_wire_offset_ += bytes;
@@ -835,6 +860,7 @@ void CompletionPlainStreamConnection::OnIoWrite(std::size_t bytes, int error)
             pending_wire_ = {};
             pending_payload_bytes_ = 0;
             pending_wire_offset_ = 0;
+            pending_header_len_ = 0;
         }
     }
     while (bytes != 0)
@@ -853,7 +879,7 @@ void CompletionPlainStreamConnection::OnIoWrite(std::size_t bytes, int error)
             out_.pop_front();
         }
     }
-    if (!pending_wire_.empty() || !out_.empty())
+    if (HasPendingFirst() || !out_.empty())
         SubmitQueued();
     else if (state_ == State::ClosingIo)
         CloseWith(io_close_reason_, 0);
@@ -957,6 +983,23 @@ bool StreamConnection::SubmitIoOwnedWrite(SharedBuffer bytes)
         return false;
     const std::size_t offered = bytes.size();
     const int error = loop_.io_engine().WriteOwnedStream(io_registration_, std::move(bytes));
+    if (error != 0)
+    {
+        LoopStats::Add(loop_.stats().send_closed_io_error);
+        CloseWith(CloseReason::IoError, error);
+        return false;
+    }
+    io_write_bytes_ = offered;
+    io_write_pending_ = true;
+    return true;
+}
+
+bool StreamConnection::SubmitIoOwnedWriteV(std::span<const std::byte> prefix, SharedBuffer payload)
+{
+    if (state_ == State::Disconnected || io_write_pending_ || io_registration_ == 0 || (prefix.empty() && payload.empty()))
+        return false;
+    const std::size_t offered = prefix.size() + payload.size();
+    const int error = loop_.io_engine().WriteOwnedStreamV(io_registration_, prefix, std::move(payload));
     if (error != 0)
     {
         LoopStats::Add(loop_.stats().send_closed_io_error);

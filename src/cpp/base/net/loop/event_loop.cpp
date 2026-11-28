@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <cerrno>
 #include <climits>
+#include <cstdlib>
+#include <cstring>
 #include <iterator>
 #include <array>
 #include <latch>
@@ -39,7 +41,7 @@ int EventLoop::Init(const EventLoopOptions& options)
     if (options.max_connections == 0 || options.max_connections > ConnectionTable::kMaxCapacity)
         return EINVAL;
     int engine_error = 0;
-    auto engine = MakeIoEngine(options.io_backend, engine_error);
+    auto engine = MakeIoEngine(options.io_backend, engine_error, options.uring);
     if (engine == nullptr)
         return engine_error;
     UniqueFd wake(::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC));
@@ -48,6 +50,8 @@ int EventLoop::Init(const EventLoopOptions& options)
     if (const int e = engine->Add(&wake_handler_, wake.get(), EPOLLIN); e != 0)
         return e;
     options_ = options;
+    if (const char* owned = std::getenv("BREEZE_TEST_URING_OWNED"))
+        options_.uring.owned_vectored_send = std::strcmp(owned, "true") == 0;
     table_ = std::make_unique<ConnectionTable>(options.max_connections);
     io_engine_ = std::move(engine);
     wakefd_ = std::move(wake);

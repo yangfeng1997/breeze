@@ -86,6 +86,9 @@ NetModuleOptions NetModuleOptionsFrom(const config::NetConfig& c)
         case config::IoBackendConfig::Epoll:
         case config::IoBackendConfig::Unspecified: o.group.io_backend = IoBackend::Epoll; break;
     }
+    o.group.uring.receive_mode = c.uringReceive == config::UringReceiveConfig::Multishot
+                                     ? UringReceiveMode::Multishot : UringReceiveMode::Hybrid;
+    o.group.uring.owned_vectored_send = c.uringOwnedVectoredSend;
     o.rudp_reuse_port = c.rudpReusePort;
     o.connection.high_water_mark = c.highWaterMarkBytes;
     o.connection.idle_timeout = std::chrono::milliseconds(c.idleTimeoutMs);

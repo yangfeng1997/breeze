@@ -75,6 +75,16 @@ public:
                 return true;
         return false;
     }
+    template <class Visitor>
+    void ForEach(Visitor visitor) const
+    {
+        for (std::uint32_t i = 0; i < slots_.size(); ++i)
+        {
+            const auto& slot = slots_[i];
+            if (slot.value)
+                visitor((static_cast<std::uint64_t>(slot.generation) << 32) | i, *slot.value);
+        }
+    }
     void Reserve(std::size_t n)
     {
         slots_.reserve(n);

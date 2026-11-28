@@ -1333,6 +1333,16 @@ void TestRUdpReusePortConfigParsing()
         const auto cfg = yaml->Get<config::NetConfig>("net");
         CHECK(cfg && NetModuleOptionsFrom(*cfg).group.io_backend == backend);
     }
+    for (const auto* mode : {"hybrid", "multishot"})
+    {
+        const auto yaml = Config::LoadString(std::string("net: {uring_receive: ") + mode + ", uring_owned_vectored_send: true}");
+        CHECK(yaml);
+        const auto cfg = yaml->Get<config::NetConfig>("net");
+        CHECK(cfg);
+        const auto options = NetModuleOptionsFrom(*cfg);
+        CHECK(options.group.uring.owned_vectored_send);
+        CHECK((options.group.uring.receive_mode == UringReceiveMode::Multishot) == (std::string_view(mode) == "multishot"));
+    }
     CHECK(!NetModuleOptionsFrom(config::NetConfig{}).rudp_reuse_port);
     for (const bool enabled : {false, true})
     {

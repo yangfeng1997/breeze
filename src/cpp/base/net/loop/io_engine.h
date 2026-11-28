@@ -50,6 +50,8 @@ public:
     virtual int WriteStream(IoRegistration id, std::span<const iovec> buffers);
     // owned字节可直接借给内核；引擎持有引用至终结CQE，调用方可以立即销毁连接。
     virtual int WriteOwnedStream(IoRegistration id, SharedBuffer bytes);
+    // 小前缀复制到请求内，payload只持引用；两个iovec在终结CQE前保持稳定。
+    virtual int WriteOwnedStreamV(IoRegistration id, std::span<const std::byte> prefix, SharedBuffer payload);
     virtual void Detach(IoRegistration id);
     virtual IoRegistration AttachDatagram(int fd, IDatagramCompletion& sink, int& error);
     // 数据报提交时复制；0=引擎接收，不承诺对端交付，异步错误经 sink 上报。
@@ -66,6 +68,6 @@ private:
     std::shared_ptr<void> lifetime_ = std::make_shared<int>(0);
 };
 
-[[nodiscard]] std::unique_ptr<IoEngine> MakeIoEngine(IoBackend backend, int& error);
+[[nodiscard]] std::unique_ptr<IoEngine> MakeIoEngine(IoBackend backend, int& error, UringOptions options = {});
 
 } // namespace breeze

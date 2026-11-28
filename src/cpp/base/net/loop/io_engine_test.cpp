@@ -123,6 +123,34 @@ int main()
     }
     {
         int pair[2];
+        CHECK(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, pair) == 0);
+        UniqueFd receiver(pair[0]), sender(pair[1]);
+        StreamSink sink;
+        const auto id = engine->AttachStream(sender.get(), sink, error);
+        CHECK(id != 0 && error == 0);
+        SharedBuffer owner = SharedBuffer::Create(64);
+        std::memset(owner.MutableBytes().data(), 'p', owner.size());
+        std::array<std::byte, 4> prefix{std::byte{'h'}, std::byte{'e'}, std::byte{'a'}, std::byte{'d'}};
+        CHECK(engine->WriteOwnedStreamV(id, prefix, owner) == 0);
+        CHECK(owner.UseCount() == 2); // payload引用原块；小前缀由引擎独立持有。
+        prefix.fill(std::byte{'x'});
+        for (unsigned n = 0; n < 10 && sink.writes == 0; ++n)
+            Pump(*engine);
+        CHECK(sink.writes == 1 && owner.UseCount() == 1);
+        std::array<char, 68> got{};
+        CHECK(::recv(receiver.get(), got.data(), got.size(), MSG_WAITALL) == static_cast<ssize_t>(got.size()));
+        CHECK(std::memcmp(got.data(), "head", 4) == 0);
+        for (std::size_t i = 4; i < got.size(); ++i)
+            CHECK(got[i] == 'p');
+        CHECK(engine->WriteOwnedStreamV(id, {}, owner) == 0);
+        engine->Detach(id);
+        sender.reset();
+        for (unsigned n = 0; n < 4; ++n)
+            Pump(*engine);
+        CHECK(owner.UseCount() == 1 && sink.writes == 1);
+    }
+    {
+        int pair[2];
         CHECK(::socketpair(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, pair) == 0);
         UniqueFd receiver(pair[0]), sender(pair[1]);
         DatagramSink sink;

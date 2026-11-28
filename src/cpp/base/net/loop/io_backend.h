@@ -6,6 +6,18 @@
 namespace breeze
 {
 
+enum class UringReceiveMode : std::uint8_t
+{
+    Hybrid,
+    Multishot,
+};
+
+struct UringOptions
+{
+    UringReceiveMode receive_mode = UringReceiveMode::Hybrid;
+    bool owned_vectored_send = false; // 实验项：首帧保留payload引用，可能牺牲小包合并效率。
+};
+
 enum class IoBackend : std::uint8_t
 {
     Auto,

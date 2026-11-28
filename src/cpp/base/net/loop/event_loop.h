@@ -49,6 +49,7 @@ struct EventLoopOptions
     std::uint32_t max_connections = 4096;
     // 默认值在性能验收前保持 Epoll；Auto 在初始化阶段探测并可回退。
     IoBackend io_backend = IoBackend::Epoll;
+    UringOptions uring{};
 };
 
 class EventLoop

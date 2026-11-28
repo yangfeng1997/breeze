@@ -54,6 +54,7 @@
 //                                       跨 loop 投递闭包的分配占比（--io-threads 是服务端 loop 数，默认 4）
 //                 [--fanout K]          breeze-mainloop：主循环对同一连接连续 Send K 条回复（量批内合并）
 //                 [--io-backend auto|epoll|uring]  本库服务端的后端；默认 epoll，客户端固定 epoll
+//                 [--uring-recv hybrid|multishot] [--uring-owned-vectored true|false]  显式架构实验
 //                 [--reuse-port true|false]       rudp 服务端的 SO_REUSEPORT，默认 false
 //                 [--io-threads N]                rudp 的 group 大小（默认 1）；storm 模式默认 4
 
@@ -162,6 +163,7 @@ struct BenchOptions
     int active = 0;   // > 0：只让这么多条连接 ping-pong，其余连上之后空闲（测「会话多」对活跃连接的影响）
     double rate = 0;  // > 0：每条连接每秒发这么多条（定速负载）；0 = 闭环全速
     IoBackend io_backend = IoBackend::Epoll;
+    UringOptions uring{};
     bool reuse_port = false;
     int io_threads = 1; // rudp：group 大小；reuse_port 关闭时只在一个 loop 收包
     std::vector<int> client_cpus;
@@ -500,9 +502,9 @@ private:
 class BreezeServer final : public EchoServer
 {
 public:
-    BreezeServer(std::unique_ptr<IConnectionHandler> handler, IoBackend backend)
+    BreezeServer(std::unique_ptr<IConnectionHandler> handler, IoBackend backend, UringOptions uring = {})
         : handler_(std::move(handler))
-        , lt_(EventLoopOptions{EventLoopOptions::kNoGroup, 0, g_table_slots, backend})
+        , lt_(EventLoopOptions{EventLoopOptions::kNoGroup, 0, g_table_slots, backend, uring})
     {
     }
 
@@ -579,10 +581,11 @@ public:
 class SecureServer final : public EchoServer
 {
 public:
-    SecureServer(bool tls, bool ws, IoBackend backend)
+    SecureServer(bool tls, bool ws, IoBackend backend, UringOptions uring = {})
         : tls_(tls)
         , ws_(ws)
         , backend_(backend)
+        , uring_(uring)
     {
     }
 
@@ -606,7 +609,7 @@ public:
             REQUIRE(tls_ctx_ != nullptr);
         }
         handler_ = std::make_unique<PongHandler>();
-        group_ = std::make_unique<EventLoopGroup>(EventLoopGroupOptions{1, g_table_slots, backend_});
+        group_ = std::make_unique<EventLoopGroup>(EventLoopGroupOptions{1, g_table_slots, backend_, uring_});
         StreamServerOptions so;
         so.connection.high_water_mark = 64u << 20;
         so.tls = tls_ctx_;
@@ -644,6 +647,7 @@ private:
     bool tls_;
     bool ws_;
     IoBackend backend_;
+    UringOptions uring_{};
     std::shared_ptr<const IStreamLayerFactory> tls_ctx_;
     std::unique_ptr<PongHandler> handler_;
     std::unique_ptr<LengthPrefixCodecFactory> lp_factory_;
@@ -748,6 +752,7 @@ public:
         , rudp_(rudp)
         , scheme_(std::move(scheme))
         , backend_(options.io_backend)
+        , uring_(options.uring)
         , reuse_port_(options.reuse_port)
         , io_threads_(rudp ? options.io_threads : 1)
     {
@@ -756,7 +761,7 @@ public:
     Endpoint Start(const Endpoint& ep, int cpu) override
     {
         NetModuleOptions no;
-        no.group = {static_cast<std::uint32_t>(io_threads_), g_table_slots, backend_};
+        no.group = {static_cast<std::uint32_t>(io_threads_), g_table_slots, backend_, uring_};
         no.rudp_reuse_port = reuse_port_;
         no.rudp.flush_on_send = true; // 只对 udp:// 生效，与 rudp 一样用低延迟配置
 #if !defined(BREEZE_BENCH_NO_TLS)
@@ -838,6 +843,7 @@ private:
     bool rudp_;
     std::string scheme_;
     IoBackend backend_;
+    UringOptions uring_{};
     bool reuse_port_;
     int io_threads_;
     std::string cert_dir_; // tls / wss：证书临时目录（进程退出前由 Stop 清理）
@@ -1003,6 +1009,7 @@ public:
     RUdpBenchServer(bool flush_on_send, const BenchOptions& options)
         : flush_on_send_(flush_on_send)
         , backend_(options.io_backend)
+        , uring_(options.uring)
         , reuse_port_(options.reuse_port)
         , io_threads_(options.io_threads)
     {
@@ -1011,7 +1018,7 @@ public:
     Endpoint Start(const Endpoint& ep, int cpu) override
     {
         group_ = std::make_unique<EventLoopGroup>(
-            EventLoopGroupOptions{static_cast<std::uint32_t>(io_threads_), g_table_slots, backend_});
+            EventLoopGroupOptions{static_cast<std::uint32_t>(io_threads_), g_table_slots, backend_, uring_});
         REQUIRE(group_->Start() == 0);
         RUdpServerOptions so;
         so.reuse_port = reuse_port_;
@@ -1056,6 +1063,7 @@ public:
 private:
     bool flush_on_send_;
     IoBackend backend_;
+    UringOptions uring_{};
     bool reuse_port_;
     int io_threads_;
     RUdpEchoHandler handler_;
@@ -1072,11 +1080,11 @@ std::unique_ptr<EchoServer> MakeServer(const BenchOptions& options)
     if ((transport == "tls" || transport == "ws" || transport == "wss") && impl == "breeze-mainloop")
         return std::make_unique<MainLoopServer>(options, false, transport);
     if (transport == "tls")
-        return std::make_unique<SecureServer>(/*tls=*/true, /*ws=*/false, options.io_backend);
+        return std::make_unique<SecureServer>(/*tls=*/true, /*ws=*/false, options.io_backend, options.uring);
     if (transport == "ws")
-        return std::make_unique<SecureServer>(/*tls=*/false, /*ws=*/true, options.io_backend);
+        return std::make_unique<SecureServer>(/*tls=*/false, /*ws=*/true, options.io_backend, options.uring);
     if (transport == "wss")
-        return std::make_unique<SecureServer>(/*tls=*/true, /*ws=*/true, options.io_backend);
+        return std::make_unique<SecureServer>(/*tls=*/true, /*ws=*/true, options.io_backend, options.uring);
 #endif
     (void)transport;
     if (impl.rfind("raw", 0) == 0 && impl != "raw-udp")
@@ -1096,11 +1104,11 @@ std::unique_ptr<EchoServer> MakeServer(const BenchOptions& options)
     if (impl == "rudp-batched")
         return std::make_unique<RUdpBenchServer>(false, options);
     if (impl == "breeze")
-        return std::make_unique<BreezeServer>(std::make_unique<BenchHandler>(), options.io_backend);
+        return std::make_unique<BreezeServer>(std::make_unique<BenchHandler>(), options.io_backend, options.uring);
     if (impl == "breeze-copy")
-        return std::make_unique<BreezeServer>(std::make_unique<CopyEchoHandler>(), options.io_backend);
+        return std::make_unique<BreezeServer>(std::make_unique<CopyEchoHandler>(), options.io_backend, options.uring);
     if (impl == "breeze-fixed")
-        return std::make_unique<BreezeServer>(std::make_unique<FixedReplyHandler>(options.size), options.io_backend);
+        return std::make_unique<BreezeServer>(std::make_unique<FixedReplyHandler>(options.size), options.io_backend, options.uring);
     if (impl == "breeze-mainloop")
         return std::make_unique<MainLoopServer>(options, false);
     if (impl == "rudp-mainloop")
@@ -2079,7 +2087,7 @@ int Storm(const BenchOptions& o)
         void OnMessage(IConnection&, std::span<const std::byte>) noexcept override {}
     } handler;
     LengthPrefixCodecFactory factory(1 << 20);
-    EventLoopGroup group({static_cast<std::uint32_t>(g_io_threads), 65536, o.io_backend});
+    EventLoopGroup group({static_cast<std::uint32_t>(g_io_threads), 65536, o.io_backend, o.uring});
     StreamServerOptions so;
     so.backlog = 4096;
     StreamServer server(group, *Endpoint::Tcp("127.0.0.1", 0), std::move(so), handler, factory);
@@ -2209,6 +2217,16 @@ int main(int argc, char** argv)
             o.io_threads = g_io_threads = std::atoi(next().c_str());
         else if (a == "--io-backend")
             o.io_backend = ParseIoBackend(next());
+        else if (a == "--uring-recv")
+        {
+            const auto mode = next();
+            if (mode == "multishot")
+                o.uring.receive_mode = UringReceiveMode::Multishot;
+            else if (mode != "hybrid")
+                Die("--uring-recv 只能是 hybrid 或 multishot");
+        }
+        else if (a == "--uring-owned-vectored")
+            o.uring.owned_vectored_send = ParseBool(next());
         else if (a == "--reuse-port")
             o.reuse_port = ParseBool(next());
         else if (a == "--mem-probe")
@@ -2221,6 +2239,8 @@ int main(int argc, char** argv)
     REQUIRE(o.conns >= 1 && o.client_threads >= 1 && o.size >= 1);
     if (o.io_threads < 1 || o.io_threads > 256)
         Die("--io-threads 要在 1 到 256 之间");
+    if (std::getenv("BREEZE_TEST_URING_RECV") != nullptr || std::getenv("BREEZE_TEST_URING_OWNED") != nullptr)
+        Die("压测前移除测试强制选项，使用 --uring-recv / --uring-owned-vectored");
     if (std::getenv("BREEZE_IO_BACKEND") != nullptr)
         Die("压测前请移除 BREEZE_IO_BACKEND：它是测试用强制开关，会改变客户端后端；用 --io-backend 选择服务端");
     if (o.transport == "udp" && std::max(o.conns, o.mem_probe) > kUdpMaxConns)
@@ -2444,6 +2464,9 @@ int main(int argc, char** argv)
         server_backend.c_str(),
         o.reuse_port ? "true" : "false",
         server_io_threads);
+    std::printf("ARCH_DIAG uring_receive=%s owned_vectored=%s\n",
+                o.uring.receive_mode == UringReceiveMode::Multishot ? "multishot" : "hybrid",
+                o.uring.owned_vectored_send ? "true" : "false");
     std::printf("IO_DIAG transport=%s conns=%d active=%d backend=%s latency_bits=64 "
                 "connected_at_end=%llu replied_connections=%llu completions=%llu receive_buffer_exhaustions=%llu "
                 "budget_exhaustions=%llu receive_buffer_bytes=%llu pending_send_bytes=%llu\n",
