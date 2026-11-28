@@ -139,6 +139,7 @@ public:
         for (int op :
              {IORING_OP_POLL_ADD, IORING_OP_ASYNC_CANCEL, IORING_OP_RECV, IORING_OP_RECVMSG, IORING_OP_SENDMSG})
             supported = supported && io_uring_opcode_supported(probe, op);
+        use_send_ = io_uring_opcode_supported(probe, IORING_OP_SEND);
         io_uring_free_probe(probe);
         if (!supported)
             return ENOTSUP;
@@ -212,23 +213,28 @@ public:
         }
         if (rc < 0 && rc != -ETIME && rc != -EINTR && rc != -EAGAIN)
             return rc;
-        for (unsigned i = 0; i < kCompletionBudget && cqe && completions_.size() < kCompletionBudget; ++i)
+        // 批量取得完成项并只发布一次CQ head，避免每个CQE重复读tail/写head。
+        std::array<io_uring_cqe*, kCompletionBudget> ready;
+        const unsigned room = kCompletionBudget - static_cast<unsigned>(completions_.size());
+        const unsigned count = room == 0 ? 0 : io_uring_peek_batch_cqe(&ring_, ready.data(), room);
+        int poll_error = 0;
+        for (unsigned i = 0; i < count; ++i)
         {
-            const auto id = io_uring_cqe_get_data64(cqe);
+            const auto* item = ready[i];
+            const auto id = io_uring_cqe_get_data64(item);
             if (id == kPoll)
             {
                 poll_armed_ = false;
                 readiness_pending_ = true;
-                if (cqe->res < 0)
-                    return cqe->res;
+                if (item->res < 0)
+                    poll_error = item->res;
             }
             else if (id != 0)
-                completions_.push_back({id, cqe->res, cqe->flags});
-            io_uring_cqe_seen(&ring_, cqe);
-            cqe = nullptr;
-            if (io_uring_peek_cqe(&ring_, &cqe) < 0)
-                break;
+                completions_.push_back({id, item->res, item->flags});
         }
+        io_uring_cq_advance(&ring_, count);
+        if (poll_error != 0)
+            return poll_error;
         if (completions_.size() >= kCompletionBudget)
             IoCounters::Add(counters_.budget_exhaustions);
         if (!readiness_pending_ || events.empty())
@@ -771,7 +777,11 @@ private:
         else
         {
             state->write = id;
-            io_uring_prep_sendmsg(sqe, state->fd.get(), &raw->msg, MSG_NOSIGNAL);
+            // 流发送已是连续owned块，不必再让内核导入单iovec/msghdr；数据报仍保留地址语义。
+            if (use_send_)
+                io_uring_prep_send(sqe, state->fd.get(), raw->bytes.data(), raw->bytes.size(), MSG_NOSIGNAL);
+            else
+                io_uring_prep_sendmsg(sqe, state->fd.get(), &raw->msg, MSG_NOSIGNAL);
             io_uring_sqe_set_data64(sqe, id);
         }
         return 0;
@@ -1038,6 +1048,7 @@ private:
     io_uring ring_{};
     bool initialized_ = false;
     bool sync_cancel_supported_ = false;
+    bool use_send_ = false;
     bool drained_ = false;
     bool draining_ = false;
     bool poll_armed_ = false;
