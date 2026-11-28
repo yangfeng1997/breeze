@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstddef>
+#include <cstring>
 #include <limits>
 
 #include "base/logger/logger.h"
@@ -153,6 +154,9 @@ StreamConnection* StreamConnection::Create(EventLoop& loop,
                                                handle,
                                                std::move(layer),
                                                encodes_payload));
+    else if (loop.io_backend() == IoBackend::IoUring)
+        conn.reset(new CompletionPlainStreamConnection(
+            loop, std::move(fd), std::move(peer), handler, std::move(codec), options, table.slot(slot), slot, handle));
     else
         conn.reset(new PlainStreamConnection(
             loop, std::move(fd), std::move(peer), handler, std::move(codec), options, table.slot(slot), slot, handle));
@@ -200,14 +204,24 @@ StreamConnection::StreamConnection(EventLoop& loop,
 {
 }
 
-StreamConnection::~StreamConnection() = default;
+StreamConnection::~StreamConnection()
+{
+    // EventLoop 先销毁连接表再销毁引擎；异常退出主循环也不能留下指向 adapter 的完成回调。
+    if (io_registration_ != 0)
+        loop_.io_engine().Detach(io_registration_);
+}
 
 bool StreamConnection::Establish()
 {
     loop_.AssertInLoopThread();
-    if (const int err = loop_.Add(this, fd_.get(), EPOLLIN | EPOLLRDHUP); err != 0)
+    int err = 0;
+    if (loop_.io_backend() == IoBackend::IoUring)
+        io_registration_ = loop_.io_engine().AttachStream(fd_.get(), completion_, err);
+    else
+        err = loop_.Add(this, fd_.get(), EPOLLIN | EPOLLRDHUP);
+    if (err != 0 || (loop_.io_backend() == IoBackend::IoUring && io_registration_ == 0))
     {
-        LOG_WARN("epoll_ctl(ADD) 失败 fd={} errno={}，只关闭这条新连接", fd_.get(), err);
+        LOG_WARN("stream IO 登记失败 fd={} errno={}，只关闭这条新连接", fd_.get(), err);
         state_ = State::Disconnected;
         slot_.state.store(ConnectionTable::State::Disconnected, std::memory_order_release);
         loop_.QueueClose(this); // 没回调过 OnConnected，回收时也就不会有 OnClosed
@@ -309,7 +323,7 @@ void PlainStreamConnection::OnEvents(std::uint32_t events)
     std::size_t total = 0;
     std::uint64_t messages = 0;
     // Disconnecting 也要分发：优雅关闭期间对端的最后几条回包不能丢。
-    while (state_ != State::Disconnected && total < data.size())
+    while (state_ <= State::Disconnecting && total < data.size())
     {
         std::size_t used = 0;
         const DecodeResult r = codec_->Decode(
@@ -606,6 +620,247 @@ void PlainStreamConnection::HandleWrite()
         ShutdownWrite(); // 优雅关闭：该发的都发完了，告诉对端我们这边结束
 }
 
+SendResult CompletionPlainStreamConnection::Send(SharedBuffer payload)
+{
+    return Enqueue(payload.bytes(), &payload, false, false);
+}
+
+SendResult CompletionPlainStreamConnection::Send(std::span<const std::byte> payload)
+{
+    return Enqueue(payload, nullptr, false, false);
+}
+
+void CompletionPlainStreamConnection::SendFromTask(SharedBuffer payload)
+{
+    if (state_ == State::Connected)
+    {
+        (void)Enqueue(payload.bytes(), &payload, true, false);
+        SubmitQueued();
+    }
+}
+
+void CompletionPlainStreamConnection::SendBatchFromTask(std::span<SharedBuffer> payloads)
+{
+    if (state_ != State::Connected)
+        return;
+    for (SharedBuffer& payload : payloads)
+    {
+        if (Enqueue(payload.bytes(), &payload, true, false) != SendResult::Ok)
+            return;
+    }
+    SubmitQueued();
+}
+
+SendResult CompletionPlainStreamConnection::Enqueue(std::span<const std::byte> payload,
+                                                    SharedBuffer* owned,
+                                                    bool counted,
+                                                    bool raw)
+{
+    loop_.AssertInLoopThread();
+    if (state_ >= State::Disconnected || (!raw && state_ != State::Connected))
+    {
+        LoopStats::Add(loop_.stats().send_closed_stale);
+        return SendResult::Closed;
+    }
+    std::array<std::byte, kMaxFrameHeaderSize> header;
+    const std::size_t header_len = raw ? 0 : codec_->EncodeHeader(payload.size(), header);
+    if (!raw && header_len == 0)
+    {
+        LOG_ERROR("Send 的 payload 超过 codec 上限 size={}，关闭连接", payload.size());
+        LoopStats::Add(loop_.stats().send_closed_oversize);
+        CloseAfterIoPrefix(CloseReason::ProtocolError);
+        return SendResult::Closed;
+    }
+    if (!counted)
+    {
+        const std::uint64_t pending =
+            slot_.pending_bytes.fetch_add(payload.size(), std::memory_order_relaxed) + payload.size();
+        if (pending > high_water_)
+        {
+            LOG_WARN("发送积压 {} 字节超过水位 {}，按慢消费者关闭连接", pending, high_water_);
+            LoopStats::Add(loop_.stats().send_closed_slow_consumer);
+            CloseWith(CloseReason::SlowConsumer, 0);
+            return SendResult::Closed;
+        }
+    }
+    if (pending_wire_.empty() && out_.empty())
+    {
+        // 视图与栈帧头只活到 Send 返回；首次复制直接生成引擎持有的完整 wire 块。
+        pending_wire_ = SharedBuffer::Create(header_len + payload.size());
+        const std::span<std::byte> wire = pending_wire_.MutableBytes();
+        if (header_len != 0)
+            std::memcpy(wire.data(), header.data(), header_len);
+        if (!payload.empty())
+            std::memcpy(wire.data() + header_len, payload.data(), payload.size());
+        pending_payload_bytes_ = payload.size();
+        pending_wire_offset_ = 0;
+    }
+    else
+    {
+        Pending& p = out_.emplace_back();
+        if (header_len != 0)
+            p.header = header;
+        p.header_len = static_cast<std::uint8_t>(header_len);
+        p.payload = owned != nullptr ? std::move(*owned) : SharedBuffer::CopyFrom(payload);
+    }
+    if (!raw)
+        LoopStats::Bump(loop_.stats().messages_out);
+    if (!counted)
+        SubmitQueued();
+    return state_ == State::Disconnected ? SendResult::Closed : SendResult::Ok;
+}
+
+void CompletionPlainStreamConnection::CloseAfterIoPrefix(CloseReason reason)
+{
+    if (pending_wire_.empty() && out_.empty())
+    {
+        CloseWith(reason, 0);
+        return;
+    }
+    state_ = State::ClosingIo;
+    io_close_reason_ = reason;
+    slot_.state.store(ConnectionTable::State::Disconnecting, std::memory_order_release);
+    if (!paused_)
+    {
+        paused_ = true;
+        LoopStats::Bump(loop_.stats().paused);
+    }
+    if (idle_registered_)
+        loop_.SetIdlePaused(slot_index_, true);
+    loop_.io_engine().ReadStream(io_registration_, false);
+    if (timer_ != 0)
+        loop_.Cancel(timer_);
+    timer_ = loop_.RunAfter(std::chrono::milliseconds(100),
+                            [this]
+                            {
+                                timer_ = 0;
+                                CloseWith(io_close_reason_, 0);
+                            });
+    SubmitQueued();
+}
+
+void CompletionPlainStreamConnection::WriteRaw(std::span<const std::byte> bytes)
+{
+    if (!bytes.empty())
+        (void)Enqueue(bytes, nullptr, false, true);
+}
+
+void CompletionPlainStreamConnection::FinishWrites()
+{
+    if (pending_wire_.empty() && out_.empty() && !io_write_pending_)
+        ShutdownWrite();
+}
+
+void CompletionPlainStreamConnection::SubmitQueued()
+{
+    if (state_ == State::Disconnected || io_write_pending_)
+        return;
+    constexpr std::size_t kMaxWriteBytes = 256 * 1024;
+    if (!pending_wire_.empty() && out_.empty())
+    {
+        const std::size_t take = std::min(pending_wire_.size() - pending_wire_offset_, kMaxWriteBytes);
+        (void)SubmitIoOwnedWrite(pending_wire_.Slice(pending_wire_offset_, take));
+        return;
+    }
+    if (out_.empty())
+        return;
+    iovec buffers[kMaxIov];
+    int count = 0;
+    std::size_t offered = 0;
+    if (!pending_wire_.empty())
+    {
+        offered = std::min(pending_wire_.size() - pending_wire_offset_, kMaxWriteBytes);
+        buffers[count++] = {const_cast<std::byte*>(pending_wire_.data()) + pending_wire_offset_, offered};
+    }
+    for (auto it = out_.begin(); it != out_.end() && count + 2 <= kMaxIov && offered < kMaxWriteBytes; ++it)
+    {
+        iovec frame[2];
+        const int parts = FillIov(it->header.data(), it->header_len, it->payload.bytes(), it->offset, frame);
+        for (int i = 0; i < parts && offered < kMaxWriteBytes; ++i)
+        {
+            const std::size_t take = std::min(frame[i].iov_len, kMaxWriteBytes - offered);
+            buffers[count++] = {frame[i].iov_base, take};
+            offered += take;
+        }
+    }
+    (void)SubmitIoWrite(std::span<const iovec>(buffers, static_cast<std::size_t>(count)));
+}
+
+void CompletionPlainStreamConnection::OnIoRead(std::span<std::byte> fresh, int error)
+{
+    if (state_ >= State::Disconnected)
+        return;
+    if (error != 0)
+    {
+        CloseWith(CloseReason::IoError, error);
+        return;
+    }
+    if (fresh.empty())
+    {
+        CloseWith(PeerCloseReason(), 0);
+        return;
+    }
+    LoopStats::Bump(loop_.stats().bytes_in, static_cast<std::uint64_t>(fresh.size()));
+    if (idle_timeout_ms_ != 0)
+        loop_.TouchIdle(slot_index_);
+    if (in_.ReadableBytes() == 0)
+    {
+        const std::size_t used = DecodeAllInline(fresh);
+        if (used < fresh.size() && state_ != State::Disconnected)
+            in_.Append(fresh.subspan(used));
+        return;
+    }
+    in_.Append(fresh);
+    in_.Consume(DecodeAllInline(in_.ReadableMut()));
+    if (in_.ReadableBytes() == 0 && in_.Capacity() > kShrinkAbove)
+        in_.ShrinkIfEmpty(0);
+}
+
+void CompletionPlainStreamConnection::OnIoWrite(std::size_t bytes, int error)
+{
+    if (!CompleteIoWrite(bytes, error))
+        return;
+    if (!pending_wire_.empty())
+    {
+        const std::size_t remain = pending_wire_.size() - pending_wire_offset_;
+        if (bytes < remain)
+        {
+            pending_wire_offset_ += bytes;
+            bytes = 0;
+        }
+        else
+        {
+            bytes -= remain;
+            slot_.pending_bytes.fetch_sub(pending_payload_bytes_, std::memory_order_relaxed);
+            pending_wire_ = {};
+            pending_payload_bytes_ = 0;
+            pending_wire_offset_ = 0;
+        }
+    }
+    while (bytes != 0)
+    {
+        Pending& frame = out_.front();
+        const std::size_t remain = frame.Total() - frame.offset;
+        if (bytes < remain)
+        {
+            frame.offset += bytes;
+            bytes = 0;
+        }
+        else
+        {
+            bytes -= remain;
+            slot_.pending_bytes.fetch_sub(frame.payload.size(), std::memory_order_relaxed);
+            out_.pop_front();
+        }
+    }
+    if (!pending_wire_.empty() || !out_.empty())
+        SubmitQueued();
+    else if (state_ == State::ClosingIo)
+        CloseWith(io_close_reason_, 0);
+    else if (state_ == State::Disconnecting)
+        FinishWrites();
+}
+
 // 不经 EncodeHeader 写原始字节（ICodecHost::SendRaw）：与 SendImpl 同构——队列空先直写，没写完入队保序。
 // 都是握手应答、控制帧这类很小的字节，不计 messages_out；超水位照样按慢消费者关闭。
 void PlainStreamConnection::WriteRaw(std::span<const std::byte> bytes)
@@ -662,10 +917,72 @@ void StreamConnection::ApplyInterest()
 {
     if (!registered_)
         return;
+    if (io_registration_ != 0)
+    {
+        loop_.io_engine().ReadStream(io_registration_, !paused_);
+        if (want_write_)
+            StartIoWrite();
+        return;
+    }
     std::uint32_t ev = paused_ ? 0u : static_cast<std::uint32_t>(EPOLLIN | EPOLLRDHUP);
     if (want_write_)
         ev |= EPOLLOUT;
     loop_.Mod(this, fd_.get(), ev);
+}
+
+bool StreamConnection::SubmitIoWrite(std::span<const iovec> buffers)
+{
+    if (state_ == State::Disconnected || io_write_pending_ || io_registration_ == 0)
+        return false;
+    std::size_t offered = 0;
+    for (const iovec& buffer : buffers)
+        offered += buffer.iov_len;
+    if (offered == 0)
+        return false;
+    const int error = loop_.io_engine().WriteStream(io_registration_, buffers);
+    if (error != 0)
+    {
+        LoopStats::Add(loop_.stats().send_closed_io_error);
+        CloseWith(CloseReason::IoError, error);
+        return false;
+    }
+    io_write_bytes_ = offered;
+    io_write_pending_ = true;
+    return true;
+}
+
+bool StreamConnection::SubmitIoOwnedWrite(SharedBuffer bytes)
+{
+    if (state_ == State::Disconnected || io_write_pending_ || io_registration_ == 0 || bytes.empty())
+        return false;
+    const std::size_t offered = bytes.size();
+    const int error = loop_.io_engine().WriteOwnedStream(io_registration_, std::move(bytes));
+    if (error != 0)
+    {
+        LoopStats::Add(loop_.stats().send_closed_io_error);
+        CloseWith(CloseReason::IoError, error);
+        return false;
+    }
+    io_write_bytes_ = offered;
+    io_write_pending_ = true;
+    return true;
+}
+
+bool StreamConnection::CompleteIoWrite(std::size_t bytes, int error)
+{
+    if (state_ == State::Disconnected)
+        return false;
+    const bool valid = io_write_pending_ && bytes <= io_write_bytes_;
+    io_write_pending_ = false;
+    io_write_bytes_ = 0;
+    if (!valid || error != 0 || bytes == 0)
+    {
+        LoopStats::Add(loop_.stats().send_closed_io_error);
+        CloseWith(CloseReason::IoError, error != 0 ? error : EIO);
+        return false;
+    }
+    LoopStats::Bump(loop_.stats().bytes_out, static_cast<std::uint64_t>(bytes));
+    return true;
 }
 
 void StreamConnection::ShutdownWrite()
@@ -691,7 +1008,7 @@ void StreamConnection::PauseRead()
 void StreamConnection::ResumeRead()
 {
     loop_.AssertInLoopThread();
-    if (!paused_)
+    if (!paused_ || state_ == State::ClosingIo)
         return;
     paused_ = false;
     LoopStats::Drop(loop_.stats().paused);
@@ -790,7 +1107,13 @@ void StreamConnection::CloseWith(CloseReason reason, int sys_errno)
     }
     if (registered_)
     {
-        loop_.Del(fd_.get());
+        if (io_registration_ != 0)
+        {
+            loop_.io_engine().Detach(io_registration_);
+            io_registration_ = 0;
+        }
+        else
+            loop_.Del(fd_.get());
         registered_ = false;
     }
     // fd 此刻仍然开着：回调栈里的代码可能还在用本对象，关 fd 与销毁都留到回收时。

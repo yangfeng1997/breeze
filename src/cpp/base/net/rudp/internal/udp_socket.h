@@ -4,7 +4,7 @@
 // 设计见 docs/网络库设计.md §4.14。
 //
 // 只能在所属 EventLoop 的线程上使用。UDP 不可靠，发送失败（缓冲满 EAGAIN / ENOBUFS）就丢：KCP 会重传。
-// 析构只关 fd（epoll 会自动摘掉）而不碰 loop：loop 可能已经先销毁了；要在 loop 还活着时摘掉并关掉，调 Close()。
+// 析构在引擎仍存活时撤销完成回调，否则只关 fd；Close 会停止交付并收尾已接受的控制包。
 
 #pragma once
 
@@ -37,7 +37,7 @@ protected:
     ~IDatagramHandler() = default;
 };
 
-class UdpSocket final : public IPollable
+class UdpSocket final : public IPollable, private IDatagramCompletion
 {
 public:
     // 服务端：bind 到 local。成功时 out 有值，失败返回 errno（out 不变）。
@@ -54,13 +54,14 @@ public:
                                         IDatagramHandler& handler,
                                         std::unique_ptr<UdpSocket>& out);
 
-    ~UdpSocket() override = default;
+    ~UdpSocket() override;
 
     UdpSocket(const UdpSocket&) = delete;
     UdpSocket& operator=(const UdpSocket&) = delete;
 
     // 发一个数据报：prefix 与 payload 拼成一个包（任一可以为空）。to 为空 = 用 connect 的对端。
-    // 返回 0 或 errno；EAGAIN / ENOBUFS 也是错误码，调用方按丢包处理，不要重试。
+    // 返回 0 表示接受；epoll 当场写入，完成模型在 loop 边界提交，异步错误经 OnSocketError。
+    // EAGAIN / ENOBUFS 表示本次未接受，调用方按丢包处理，由 KCP 重传；无自动重试。
     int Send(std::span<const std::byte> prefix,
              std::span<const std::byte> payload,
              const sockaddr_storage* to,
@@ -94,12 +95,19 @@ private:
     void OnEvents(std::uint32_t events) override;
     // 读一批，返回收到的数据报个数；0 = 没有更多。
     int ReadBatch();
+    void OnIoDatagram(const sockaddr_storage& src, socklen_t length,
+                      std::span<const std::byte> data) override;
+    void OnIoDatagramError(int error) override;
+    void OnIoDatagramSent(std::size_t bytes) override;
 
     EventLoop& loop_;
     UniqueFd fd_;
     IDatagramHandler& handler_;
     Endpoint local_;
     bool registered_ = false;
+    IoEngine* engine_ = nullptr;
+    IoRegistration io_registration_ = 0;
+    std::weak_ptr<void> engine_lifetime_;
 };
 
 } // namespace breeze

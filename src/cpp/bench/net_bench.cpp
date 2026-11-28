@@ -53,6 +53,7 @@
 //                 [--storm N]           重连风暴：N 个客户端线程不停 connect → RST 断开，量每次 accept 的服务端 CPU 与
 //                                       跨 loop 投递闭包的分配占比（--io-threads 是服务端 loop 数，默认 4）
 //                 [--fanout K]          breeze-mainloop：主循环对同一连接连续 Send K 条回复（量批内合并）
+//                 [--io-backend auto|epoll|uring]  本库服务端的后端；默认 epoll，客户端固定 epoll
 //                 [--reuse-port true|false]       rudp 服务端的 SO_REUSEPORT，默认 false
 //                 [--io-threads N]                rudp 的 group 大小（默认 1）；storm 模式默认 4
 
@@ -160,10 +161,22 @@ struct BenchOptions
     int delay_ms = 0; // UDP：客户端侧给每个方向各加这么多毫秒的延迟（往返 = 2 倍），模拟有 RTT 的网络
     int active = 0;   // > 0：只让这么多条连接 ping-pong，其余连上之后空闲（测「会话多」对活跃连接的影响）
     double rate = 0;  // > 0：每条连接每秒发这么多条（定速负载）；0 = 闭环全速
+    IoBackend io_backend = IoBackend::Epoll;
     bool reuse_port = false;
     int io_threads = 1; // rudp：group 大小；reuse_port 关闭时只在一个 loop 收包
     std::vector<int> client_cpus;
 };
+
+IoBackend ParseIoBackend(const std::string& s)
+{
+    if (s == "auto")
+        return IoBackend::Auto;
+    if (s == "epoll")
+        return IoBackend::Epoll;
+    if (s == "uring")
+        return IoBackend::IoUring;
+    Die("--io-backend 只能是 auto、epoll 或 uring");
+}
 
 bool ParseBool(const std::string& s)
 {
@@ -172,6 +185,15 @@ bool ParseBool(const std::string& s)
     if (s == "false")
         return false;
     Die("--reuse-port 只能是 true 或 false");
+}
+
+const char* GroupBackend(EventLoopGroup& group)
+{
+    const IoBackend first = GroupAccess::LoopAt(group, 0).io_backend();
+    for (std::size_t i = 1; i < GroupAccess::LoopCount(group); ++i)
+        if (GroupAccess::LoopAt(group, i).io_backend() != first)
+            return "mixed";
+    return ToString(first);
 }
 
 std::uint64_t GroupIterations(EventLoopGroup& group)
@@ -257,6 +279,8 @@ public:
     // 服务端 IO 线程：读它的 CPU 时间，判断压测时它是否已经饱和（没饱和说明瓶颈在别处，比出来的不是服务端的差异）。
     virtual pthread_t ServerThread() = 0;
     virtual std::vector<pthread_t> ServerThreads() { return {ServerThread()}; }
+    virtual const char* ActualBackend() { return "epoll"; }
+    virtual IoStats EngineStats() { return {}; }
     virtual std::uint64_t Connections() { return 0; }
     // 服务端 loop 已经跑过的轮数；没有"轮"概念的实现返回 0。
     virtual std::uint64_t Iterations() { return 0; }
@@ -476,8 +500,9 @@ private:
 class BreezeServer final : public EchoServer
 {
 public:
-    explicit BreezeServer(std::unique_ptr<IConnectionHandler> handler)
+    BreezeServer(std::unique_ptr<IConnectionHandler> handler, IoBackend backend)
         : handler_(std::move(handler))
+        , lt_(EventLoopOptions{EventLoopOptions::kNoGroup, 0, g_table_slots, backend})
     {
     }
 
@@ -493,12 +518,14 @@ public:
     }
     void Stop() override { lt_.Stop(); }
     pthread_t ServerThread() override { return lt_.native_handle(); }
+    const char* ActualBackend() override { return ToString(lt_.loop.io_backend()); }
+    IoStats EngineStats() override { return lt_.loop.io_engine().stats(); }
     std::uint64_t Connections() override { return lt_.loop.ConnectionCount(); }
     std::uint64_t Iterations() override { return lt_.loop.Iterations(); }
 
 private:
     std::unique_ptr<IConnectionHandler> handler_;
-    EventLoopThread lt_{EventLoopOptions{EventLoopOptions::kNoGroup, 0, g_table_slots}}; // 连接表要装得下全部连接
+    EventLoopThread lt_; // 连接表要装得下全部连接
     std::unique_ptr<LengthPrefixCodecFactory> factory_;
     std::unique_ptr<LoopServer> srv_;
 };
@@ -552,9 +579,10 @@ public:
 class SecureServer final : public EchoServer
 {
 public:
-    SecureServer(bool tls, bool ws)
+    SecureServer(bool tls, bool ws, IoBackend backend)
         : tls_(tls)
         , ws_(ws)
+        , backend_(backend)
     {
     }
 
@@ -578,7 +606,7 @@ public:
             REQUIRE(tls_ctx_ != nullptr);
         }
         handler_ = std::make_unique<PongHandler>();
-        group_ = std::make_unique<EventLoopGroup>(EventLoopGroupOptions{1, g_table_slots});
+        group_ = std::make_unique<EventLoopGroup>(EventLoopGroupOptions{1, g_table_slots, backend_});
         StreamServerOptions so;
         so.connection.high_water_mark = 64u << 20;
         so.tls = tls_ctx_;
@@ -607,12 +635,15 @@ public:
             group_->Shutdown(std::chrono::milliseconds::zero());
     }
     pthread_t ServerThread() override { return thread_; }
+    const char* ActualBackend() override { return GroupBackend(*group_); }
+    IoStats EngineStats() override { return group_->GetStats().io; }
     std::uint64_t Connections() override { return group_->GetStats().connections; }
     std::uint64_t Iterations() override { return group_ ? GroupAccess::LoopAt(*group_, 0).Iterations() : 0; }
 
 private:
     bool tls_;
     bool ws_;
+    IoBackend backend_;
     std::shared_ptr<const IStreamLayerFactory> tls_ctx_;
     std::unique_ptr<PongHandler> handler_;
     std::unique_ptr<LengthPrefixCodecFactory> lp_factory_;
@@ -716,6 +747,7 @@ public:
         : mainloop_cpu_(options.mainloop_cpu)
         , rudp_(rudp)
         , scheme_(std::move(scheme))
+        , backend_(options.io_backend)
         , reuse_port_(options.reuse_port)
         , io_threads_(rudp ? options.io_threads : 1)
     {
@@ -724,7 +756,7 @@ public:
     Endpoint Start(const Endpoint& ep, int cpu) override
     {
         NetModuleOptions no;
-        no.group = {static_cast<std::uint32_t>(io_threads_), g_table_slots};
+        no.group = {static_cast<std::uint32_t>(io_threads_), g_table_slots, backend_};
         no.rudp_reuse_port = reuse_port_;
         no.rudp.flush_on_send = true; // 只对 udp:// 生效，与 rudp 一样用低延迟配置
 #if !defined(BREEZE_BENCH_NO_TLS)
@@ -784,6 +816,7 @@ public:
     }
     pthread_t ServerThread() override { return io_threads_native_.front(); }
     std::vector<pthread_t> ServerThreads() override { return io_threads_native_; }
+    const char* ActualBackend() override { return GroupBackend(net_->group()); }
     pthread_t ExtraThread() override { return thread_.native_handle(); }
     std::uint64_t Connections() override { return net_->group().GetStats().connections; }
     std::uint64_t Iterations() override { return GroupIterations(net_->group()); }
@@ -804,6 +837,7 @@ private:
     int mainloop_cpu_;
     bool rudp_;
     std::string scheme_;
+    IoBackend backend_;
     bool reuse_port_;
     int io_threads_;
     std::string cert_dir_; // tls / wss：证书临时目录（进程退出前由 Stop 清理）
@@ -867,6 +901,7 @@ public:
         thread_.join();
     }
     pthread_t ServerThread() override { return thread_.native_handle(); }
+    const char* ActualBackend() override { return std::getenv("MUDUO_USE_POLL") != nullptr ? "poll" : "epoll"; }
 
 private:
     muduo::net::EventLoop* loop_ = nullptr;
@@ -967,6 +1002,7 @@ class RUdpBenchServer final : public EchoServer
 public:
     RUdpBenchServer(bool flush_on_send, const BenchOptions& options)
         : flush_on_send_(flush_on_send)
+        , backend_(options.io_backend)
         , reuse_port_(options.reuse_port)
         , io_threads_(options.io_threads)
     {
@@ -975,7 +1011,7 @@ public:
     Endpoint Start(const Endpoint& ep, int cpu) override
     {
         group_ = std::make_unique<EventLoopGroup>(
-            EventLoopGroupOptions{static_cast<std::uint32_t>(io_threads_), g_table_slots});
+            EventLoopGroupOptions{static_cast<std::uint32_t>(io_threads_), g_table_slots, backend_});
         REQUIRE(group_->Start() == 0);
         RUdpServerOptions so;
         so.reuse_port = reuse_port_;
@@ -995,6 +1031,8 @@ public:
     }
     pthread_t ServerThread() override { return io_threads_native_.front(); }
     std::vector<pthread_t> ServerThreads() override { return io_threads_native_; }
+    const char* ActualBackend() override { return GroupBackend(*group_); }
+    IoStats EngineStats() override { return group_->GetStats().io; }
     std::uint64_t Connections() override { return group_->GetStats().connections; }
     std::uint64_t Iterations() override { return GroupIterations(*group_); }
     std::uint64_t BytesIn() override { return group_->GetStats().bytes_in; }
@@ -1017,6 +1055,7 @@ public:
 
 private:
     bool flush_on_send_;
+    IoBackend backend_;
     bool reuse_port_;
     int io_threads_;
     RUdpEchoHandler handler_;
@@ -1033,11 +1072,11 @@ std::unique_ptr<EchoServer> MakeServer(const BenchOptions& options)
     if ((transport == "tls" || transport == "ws" || transport == "wss") && impl == "breeze-mainloop")
         return std::make_unique<MainLoopServer>(options, false, transport);
     if (transport == "tls")
-        return std::make_unique<SecureServer>(/*tls=*/true, /*ws=*/false);
+        return std::make_unique<SecureServer>(/*tls=*/true, /*ws=*/false, options.io_backend);
     if (transport == "ws")
-        return std::make_unique<SecureServer>(/*tls=*/false, /*ws=*/true);
+        return std::make_unique<SecureServer>(/*tls=*/false, /*ws=*/true, options.io_backend);
     if (transport == "wss")
-        return std::make_unique<SecureServer>(/*tls=*/true, /*ws=*/true);
+        return std::make_unique<SecureServer>(/*tls=*/true, /*ws=*/true, options.io_backend);
 #endif
     (void)transport;
     if (impl.rfind("raw", 0) == 0 && impl != "raw-udp")
@@ -1057,11 +1096,11 @@ std::unique_ptr<EchoServer> MakeServer(const BenchOptions& options)
     if (impl == "rudp-batched")
         return std::make_unique<RUdpBenchServer>(false, options);
     if (impl == "breeze")
-        return std::make_unique<BreezeServer>(std::make_unique<BenchHandler>());
+        return std::make_unique<BreezeServer>(std::make_unique<BenchHandler>(), options.io_backend);
     if (impl == "breeze-copy")
-        return std::make_unique<BreezeServer>(std::make_unique<CopyEchoHandler>());
+        return std::make_unique<BreezeServer>(std::make_unique<CopyEchoHandler>(), options.io_backend);
     if (impl == "breeze-fixed")
-        return std::make_unique<BreezeServer>(std::make_unique<FixedReplyHandler>(options.size));
+        return std::make_unique<BreezeServer>(std::make_unique<FixedReplyHandler>(options.size), options.io_backend);
     if (impl == "breeze-mainloop")
         return std::make_unique<MainLoopServer>(options, false);
     if (impl == "rudp-mainloop")
@@ -1319,7 +1358,7 @@ public:
             tls_ctx_ = TlsContext::CreateClient(BenchClientTls(), err);
             REQUIRE(tls_ctx_ != nullptr);
         }
-        group_ = std::make_unique<EventLoopGroup>(EventLoopGroupOptions{1, g_table_slots});
+        group_ = std::make_unique<EventLoopGroup>(EventLoopGroupOptions{1, g_table_slots, IoBackend::Epoll});
         REQUIRE(group_->Start() == 0);
         const IFrameCodecFactory& factory = ws_ ? static_cast<const IFrameCodecFactory&>(*ws_factory_) : *lp_factory_;
         clients_.reserve(static_cast<std::size_t>(nconns_));
@@ -1979,7 +2018,8 @@ int MemProbe(const BenchOptions& o, const Endpoint& ep, EchoServer& server, bool
     const double idle_cpu = (ServerCpuSeconds(server) - cpu0) / 3.0 * 100.0;
     std::printf(
         "MEM impl=%s transport=%s conns=%d rss_before_kb=%ld rss_after_kb=%ld bytes_per_conn=%.0f "
-        "idle_cpu_pct=%.2f reuse_port=%s io_threads=%zu\n",
+        "idle_cpu_pct=%.2f requested_backend=%s server_backend=%s client_backend=poll reuse_port=%s "
+        "io_threads=%zu\n",
         o.impl.c_str(),
         o.transport.c_str(),
         o.mem_probe,
@@ -1987,6 +2027,8 @@ int MemProbe(const BenchOptions& o, const Endpoint& ep, EchoServer& server, bool
         after,
         static_cast<double>(after - before) * 1024.0 / o.mem_probe,
         idle_cpu,
+        ToString(o.io_backend),
+        server.ActualBackend(),
         o.reuse_port ? "true" : "false",
         server.ServerThreads().size());
     fds.clear();
@@ -2037,13 +2079,14 @@ int Storm(const BenchOptions& o)
         void OnMessage(IConnection&, std::span<const std::byte>) noexcept override {}
     } handler;
     LengthPrefixCodecFactory factory(1 << 20);
-    EventLoopGroup group({static_cast<std::uint32_t>(g_io_threads), 65536});
+    EventLoopGroup group({static_cast<std::uint32_t>(g_io_threads), 65536, o.io_backend});
     StreamServerOptions so;
     so.backlog = 4096;
     StreamServer server(group, *Endpoint::Tcp("127.0.0.1", 0), std::move(so), handler, factory);
     REQUIRE(group.Start() == 0);
     REQUIRE(server.Start() == 0);
     const std::uint16_t port = server.endpoint().port();
+    const std::string backend = GroupBackend(group);
 
     std::vector<pthread_t> io_threads;
     for (int i = 0; i < g_io_threads; ++i)
@@ -2108,13 +2151,15 @@ int Storm(const BenchOptions& o)
     const double alloc_ns = ClosureAllocNs();
     std::printf(
         "STORM io_threads=%d client_threads=%d accepted_per_s=%.0f server_cpu_us_per_accept=%.2f closure_alloc_ns=%.0f "
-        "closure_share_pct=%.2f\n",
+        "closure_share_pct=%.2f requested_backend=%s server_backend=%s client_backend=poll\n",
         g_io_threads,
         g_storm_threads,
         accepted / secs,
         us_per_accept,
         alloc_ns,
-        us_per_accept > 0 ? alloc_ns / 1000.0 / us_per_accept * 100.0 : 0.0);
+        us_per_accept > 0 ? alloc_ns / 1000.0 / us_per_accept * 100.0 : 0.0,
+        ToString(o.io_backend),
+        backend.c_str());
     return 0;
 }
 
@@ -2162,6 +2207,8 @@ int main(int argc, char** argv)
             g_storm_threads = std::atoi(next().c_str());
         else if (a == "--io-threads")
             o.io_threads = g_io_threads = std::atoi(next().c_str());
+        else if (a == "--io-backend")
+            o.io_backend = ParseIoBackend(next());
         else if (a == "--reuse-port")
             o.reuse_port = ParseBool(next());
         else if (a == "--mem-probe")
@@ -2174,6 +2221,8 @@ int main(int argc, char** argv)
     REQUIRE(o.conns >= 1 && o.client_threads >= 1 && o.size >= 1);
     if (o.io_threads < 1 || o.io_threads > 256)
         Die("--io-threads 要在 1 到 256 之间");
+    if (std::getenv("BREEZE_IO_BACKEND") != nullptr)
+        Die("压测前请移除 BREEZE_IO_BACKEND：它是测试用强制开关，会改变客户端后端；用 --io-backend 选择服务端");
     if (o.transport == "udp" && std::max(o.conns, o.mem_probe) > kUdpMaxConns)
         Die("UDP 在本机最多约 2.5 万条连接（临时端口范围，见 kScaleThreshold 旁的注释）");
     o.client_threads = std::min(o.client_threads, o.conns);
@@ -2236,6 +2285,7 @@ int main(int argc, char** argv)
     g_table_slots = std::max(o.conns, o.mem_probe) > 60000 ? (1u << 17) : (1u << 16);
     auto server = MakeServer(o);
     const Endpoint ep = server->Start(*listen_ep, o.server_cpu);
+    const std::string server_backend = server->ActualBackend();
     const std::size_t server_io_threads = server->ServerThreads().size();
     if (o.mem_probe > 0)
         return MemProbe(o, ep, *server, kcp_impl);
@@ -2317,6 +2367,7 @@ int main(int argc, char** argv)
     const double cpu0 = ServerCpuSeconds(*server);
     const bool has_extra = server->ExtraThread() != 0;
     const double extra0 = has_extra ? ThreadCpuSeconds(server->ExtraThread()) : 0.0;
+    const IoStats io0 = server->EngineStats();
     const std::uint64_t iter0 = server->Iterations();
     const std::uint64_t drops0 = UdpRcvbufErrors();
     const std::uint64_t sdrops0 = o.transport == "udp" ? UdpSocketDrops(ep.port()) : 0;
@@ -2333,6 +2384,7 @@ int main(int argc, char** argv)
     const std::uint64_t iters = server->Iterations() - iter0;
     const std::uint64_t drops = UdpRcvbufErrors() - drops0;
     const std::uint64_t sdrops = o.transport == "udp" ? UdpSocketDrops(ep.port()) - sdrops0 : 0;
+    const IoStats io1 = server->EngineStats();
     const std::uint64_t connected_at_end = server->Connections();
     const double max_lag_us = server->MaxLoopLagUs();
     const std::uint64_t rx_bytes = server->BytesIn() - bytes0;
@@ -2363,7 +2415,8 @@ int main(int argc, char** argv)
         "RESULT impl=%s transport=%s size=%zu conns=%d active=%d msgs_per_s=%.0f mb_per_s=%.1f p50_us=%.1f "
         "p99_us=%.1f srv_cpu_pct=%.0f msgs_per_iter=%.1f drops_per_s=%.0f srv_sock_drops_per_s=%.0f "
         "max_lag_us=%.0f srv_rx_bytes_per_msg=%.1f dgram_in_per_msg=%.2f dgram_out_per_msg=%.2f delay_ms=%d "
-        "rate=%.1f p90_us=%.1f p999_us=%.1f max_us=%.1f setup_s=%.2f reuse_port=%s io_threads=%zu\n",
+        "rate=%.1f p90_us=%.1f p999_us=%.1f max_us=%.1f setup_s=%.2f requested_backend=%s "
+        "server_backend=%s client_backend=epoll reuse_port=%s io_threads=%zu\n",
         o.impl.c_str(),
         o.transport.c_str(),
         o.size,
@@ -2387,13 +2440,21 @@ int main(int argc, char** argv)
         Percentile(lat, 0.999) / 1000.0,
         lat.empty() ? 0.0 : static_cast<double>(lat.back()) / 1000.0,
         setup_s,
+        ToString(o.io_backend),
+        server_backend.c_str(),
         o.reuse_port ? "true" : "false",
         server_io_threads);
-    std::printf("BENCH_DIAG transport=%s conns=%d active=%d latency_bits=64 "
-                "connected_at_end=%llu replied_connections=%llu\n",
+    std::printf("IO_DIAG transport=%s conns=%d active=%d backend=%s latency_bits=64 "
+                "connected_at_end=%llu replied_connections=%llu completions=%llu receive_buffer_exhaustions=%llu "
+                "budget_exhaustions=%llu receive_buffer_bytes=%llu pending_send_bytes=%llu\n",
                 o.transport.c_str(), o.conns, o.active > 0 ? std::min(o.active, o.conns) : o.conns,
-                static_cast<unsigned long long>(connected_at_end),
-                static_cast<unsigned long long>(replied_connections));
+                server_backend.c_str(), static_cast<unsigned long long>(connected_at_end),
+                static_cast<unsigned long long>(replied_connections),
+                static_cast<unsigned long long>(io1.completions - io0.completions),
+                static_cast<unsigned long long>(io1.receive_buffer_exhaustions - io0.receive_buffer_exhaustions),
+                static_cast<unsigned long long>(io1.budget_exhaustions - io0.budget_exhaustions),
+                static_cast<unsigned long long>(io1.receive_buffer_bytes),
+                static_cast<unsigned long long>(io1.pending_send_bytes));
     if (has_extra) // 第二个服务端线程（主循环）的 CPU 占用，单独一行以免打乱 RESULT 的固定字段
         std::printf("EXTRA main_cpu_pct=%.0f\n", (extra1 - extra0) / secs * 100.0);
     return 0;

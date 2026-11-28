@@ -1,4 +1,4 @@
-// 一个线程上的全部 IO：epoll、跨线程投递、定时器、连接的延后回收。设计见 docs/网络库设计.md §4.5 / §4.8。
+// 一个线程上的全部 IO：可选 IO 引擎、跨线程投递、定时器、连接的延后回收。设计见 docs/网络库设计.md §4.5 / §4.8。
 //
 // 不是公开类型（业务代码不该直接用）：Run / RunOnce 不创建线程，线程由使用方（将来是 EventLoopGroup）创建并持有，
 // 所以 loop 可以独立存在，测试直接在当前线程 RunOnce。
@@ -7,8 +7,6 @@
 // 是单线程的装配阶段，任何线程都可以调用；开始运行后，装配线程不能再碰它。
 
 #pragma once
-
-#include <sys/epoll.h>
 
 #include <array>
 #include <atomic>
@@ -26,6 +24,7 @@
 #include "base/net/connection/connection_options.h"
 #include "base/net/endpoint/peer_info.h"
 #include "base/net/loop/connection_table.h"
+#include "base/net/loop/io_engine.h"
 #include "base/net/loop/loop_stats.h"
 #include "base/net/loop/pollable_interface.h"
 #include "base/net/socket/unique_fd.h"
@@ -48,6 +47,8 @@ struct EventLoopOptions
     std::uint32_t index = 0;
     // 连接表容量（连接数上限）。表按它预分配，每槽 64 字节。
     std::uint32_t max_connections = 4096;
+    // 默认值在性能验收前保持 Epoll；Auto 在初始化阶段探测并可回退。
+    IoBackend io_backend = IoBackend::Epoll;
 };
 
 class EventLoop
@@ -94,6 +95,8 @@ public:
     // 连接表：Find / TryReserve / Live 等任意线程可用，其余见 ConnectionTable。
     ConnectionTable& table() noexcept { return *table_; }
     const EventLoopOptions& options() const noexcept { return options_; }
+    IoBackend io_backend() const noexcept { return io_engine_->backend(); }
+    IoEngine& io_engine() noexcept { return *io_engine_; }
     // 计数：IO 线程写，任意线程可读。写法见 loop_stats.h。
     LoopStats& stats() noexcept { return stats_; }
     const LoopStats& stats() const noexcept { return stats_; }
@@ -234,7 +237,7 @@ private:
     NowFn now_;
     EventLoopOptions options_;
     std::unique_ptr<ConnectionTable> table_;
-    UniqueFd epfd_;
+    std::unique_ptr<IoEngine> io_engine_;
     UniqueFd wakefd_;
     WakeHandler wake_handler_{*this};
 

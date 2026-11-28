@@ -1323,6 +1323,16 @@ void TestOptionsFromConfig()
 
 void TestRUdpReusePortConfigParsing()
 {
+    CHECK(NetModuleOptionsFrom(config::NetConfig{}).group.io_backend == IoBackend::Epoll);
+    for (const auto& [name, backend] : {std::pair{"epoll", IoBackend::Epoll},
+                                       std::pair{"uring", IoBackend::IoUring},
+                                       std::pair{"auto", IoBackend::Auto}})
+    {
+        const auto yaml = Config::LoadString(std::string("net: {io_backend: ") + name + "}");
+        CHECK(yaml);
+        const auto cfg = yaml->Get<config::NetConfig>("net");
+        CHECK(cfg && NetModuleOptionsFrom(*cfg).group.io_backend == backend);
+    }
     CHECK(!NetModuleOptionsFrom(config::NetConfig{}).rudp_reuse_port);
     for (const bool enabled : {false, true})
     {

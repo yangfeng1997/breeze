@@ -239,12 +239,16 @@ void TestSendGather()
     const Bytes ab = ToBytes("AB"), cde = ToBytes("CDE");
 
     CHECK(s->Send(ab, cde, &to, len) == 0);
+    l.loop.RunOnce(0);
     CHECK(peer.Recv(2s) == ToBytes("ABCDE"));
     CHECK(s->Send({}, cde, &to, len) == 0);
+    l.loop.RunOnce(0);
     CHECK(peer.Recv(2s) == ToBytes("CDE"));
     CHECK(s->Send(ab, {}, &to, len) == 0);
+    l.loop.RunOnce(0);
     CHECK(peer.Recv(2s) == ToBytes("AB"));
     CHECK(s->Send({}, {}, &to, len) == 0);
+    l.loop.RunOnce(0);
     const auto empty = peer.Recv(2s);
     CHECK(empty.has_value() && empty->empty());
 }
@@ -303,6 +307,7 @@ void TestIcmpErrorReported()
     // 错误已清除：不再空转（10ms 一轮，100ms 内远少于 1000 轮）
     CHECK(l.loop.Iterations() - before < 200);
     CHECK(cli->Send({}, ToBytes("y"), nullptr, 0) == 0);
+    l.loop.RunOnce(0);
 }
 
 // Close：摘出 epoll 并关 fd；幂等；之后发送得到 EBADF；端口随之释放，可以重新绑定。
@@ -378,7 +383,7 @@ void TestByteStats()
     socklen_t len = 0;
     const sockaddr_storage to = Addr(peer.local(), &len);
     CHECK(s->Send(ToBytes("ab"), ToBytes("cdef"), &to, len) == 0);
-    CHECK(l.loop.stats().bytes_out.load() == 6);
+    CHECK(l.PumpUntil([&] { return l.loop.stats().bytes_out.load() == 6; }));
 }
 
 // IPv6 回环（机器没有 IPv6 就跳过）。

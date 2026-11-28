@@ -48,6 +48,9 @@ private:
     void OnEstablish() override;
     void FinishWrites() override;
     void WriteRaw(std::span<const std::byte> bytes) override;
+    void OnIoRead(std::span<std::byte> data, int error) override;
+    void OnIoWrite(std::size_t bytes, int error) override;
+    void StartIoWrite() override;
 
     SendResult SendImpl(std::span<const std::byte> payload, SharedBuffer* owned, bool counted);
     void HandleRead();
@@ -55,6 +58,9 @@ private:
     // 层交来的一块明文：与 PlainStreamConnection::HandleRead 里 read 之后的半帧逻辑相同。
     void OnPlainChunk(std::span<std::byte> plain);
     void HandleLayerStatus(LayerStatus st);
+    void HandleWireChunk(std::span<std::byte> wire);
+    // completion 的最后一次 alert / close_notify 必须排在已有在途密文之后，短暂保留连接至完成或超时。
+    void CloseIoAfterFlush(CloseReason reason);
     // 把"帧头 + payload"从 offset 起依次加密进层，直到整帧加密完或层里待发字节达到预算；返回已加密的字节数（含 offset）。
     // header 可以为空（header_len = 0：原始字节）。层出错时关闭连接并返回。
     std::size_t EncryptFrame(const std::byte* header,
@@ -71,6 +77,8 @@ private:
     std::unique_ptr<IStreamLayer> layer_;
     const bool encodes_payload_;
     bool layer_shutdown_ = false; // 已让层发过关闭通知
+    bool io_closing_ = false;
+    CloseReason io_close_reason_ = CloseReason::LocalClose;
 };
 
 } // namespace breeze

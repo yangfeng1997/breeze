@@ -10,6 +10,7 @@
 #include <cstdint>
 
 #include "base/net/connection/connection_handler_interface.h"
+#include "base/net/loop/io_stats.h"
 
 namespace breeze
 {
@@ -27,6 +28,7 @@ inline constexpr std::size_t kHandshakeFailureCount = static_cast<std::size_t>(H
 
 struct NetStats
 {
+    IoStats io;
     // ---- 当前值 ----
     std::uint64_t connections = 0;           // 已预留 + 已建立的连接数
     std::uint64_t paused_connections = 0;    // 正被 PauseRead 暂停的连接数

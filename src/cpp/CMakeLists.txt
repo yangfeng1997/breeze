@@ -500,6 +500,7 @@ if(BREEZE_BUILD_NET)
     ${NET_DIR}/ws/internal/ws_frame.cpp
     ${NET_DIR}/connection/connection_handle.cpp
     ${NET_DIR}/loop/event_loop_group.cpp
+    ${NET_DIR}/loop/io_engine.cpp
     ${NET_DIR}/loop/connection_table.cpp
     ${NET_DIR}/loop/group_registry.cpp
     ${NET_DIR}/loop/event_loop.cpp
@@ -531,6 +532,17 @@ if(BREEZE_BUILD_NET)
                         PRIVATE breeze_logger breeze_string breeze_random breeze_hash)
   target_compile_options(breeze_net PRIVATE -Wall -Wextra)
   breeze_apply_log_level(breeze_net)
+
+  option(BREEZE_ENABLE_IO_URING "构建可选 io_uring 后端（需要 vcpkg uring feature）" ON)
+  if(BREEZE_ENABLE_IO_URING)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing>=2.3)
+    target_link_libraries(breeze_net PRIVATE PkgConfig::LIBURING)
+    target_sources(breeze_net PRIVATE ${NET_DIR}/loop/uring_engine.cpp)
+    target_compile_definitions(breeze_net PRIVATE BREEZE_HAS_IO_URING=1)
+  else()
+    target_compile_definitions(breeze_net PRIVATE BREEZE_HAS_IO_URING=0)
+  endif()
 
   # rudp 单独一个库：KCP 只在这里 PRIVATE 链接，不用 rudp 的使用方（只用 TCP / UDS）不背这个依赖。
   # 端点（RUdpEndpoint）仍在 breeze_net：它只是地址类型，NetModule 解析端点字符串要用。
@@ -950,6 +962,8 @@ if(BREEZE_BUILD_NET)
   breeze_net_test(http_upgrade_test DIR ws/internal)
   breeze_net_test(unique_fd_test DIR socket)
   breeze_net_test(event_loop_test DIR loop)
+  breeze_net_test(io_engine_test DIR loop)
+  set_tests_properties(io_engine_test PROPERTIES SKIP_RETURN_CODE 77)
   breeze_net_test(connection_table_test DIR loop)
   breeze_net_test(group_registry_test DIR loop)
   breeze_net_test(stream_socket_test DIR stream/internal)

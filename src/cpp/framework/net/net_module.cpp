@@ -79,6 +79,13 @@ NetModuleOptions NetModuleOptionsFrom(const config::NetConfig& c)
     NetModuleOptions o;
     o.group.io_threads = c.ioThreads;
     o.group.max_connections_per_loop = c.maxConnectionsPerLoop;
+    switch (c.ioBackend)
+    {
+        case config::IoBackendConfig::Auto: o.group.io_backend = IoBackend::Auto; break;
+        case config::IoBackendConfig::Uring: o.group.io_backend = IoBackend::IoUring; break;
+        case config::IoBackendConfig::Epoll:
+        case config::IoBackendConfig::Unspecified: o.group.io_backend = IoBackend::Epoll; break;
+    }
     o.rudp_reuse_port = c.rudpReusePort;
     o.connection.high_water_mark = c.highWaterMarkBytes;
     o.connection.idle_timeout = std::chrono::milliseconds(c.idleTimeoutMs);

@@ -35,6 +35,7 @@
         "CMAKE_BUILD_TYPE": "Release",
         "VCPKG_INSTALLED_DIR": "$env{HOME}/.cache/breeze/vcpkg_installed_notls",
         "VCPKG_MANIFEST_NO_DEFAULT_FEATURES": "ON",
+        "VCPKG_MANIFEST_FEATURES": "uring",
         "BREEZE_BUILD_NET_TLS": "OFF"
       }
     },

@@ -1,5 +1,6 @@
 #include "base/net/loop/event_loop.h"
 
+#include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
 
@@ -7,6 +8,7 @@
 #include <cerrno>
 #include <climits>
 #include <iterator>
+#include <array>
 #include <latch>
 
 #include "base/logger/logger.h"
@@ -23,26 +25,31 @@ EventLoop::EventLoop(NowFn now)
 
 // 在这里定义（而不是头文件里默认）：销毁连接表需要 IConnection 是完整类型。
 // 没有走正常关闭流程就析构时，剩下的连接直接销毁（fd 随之关闭），不再回调 OnClosed。
-EventLoop::~EventLoop() = default;
+EventLoop::~EventLoop()
+{
+    // 析构前先停接收并整体取消；逐连接析构内提交取消会阻止CQ收割，十万连接时可卡住退出。
+    if (io_engine_)
+        io_engine_->Drain();
+    table_.reset();
+    io_engine_.reset();
+}
 
 int EventLoop::Init(const EventLoopOptions& options)
 {
     if (options.max_connections == 0 || options.max_connections > ConnectionTable::kMaxCapacity)
         return EINVAL;
-    UniqueFd ep(::epoll_create1(EPOLL_CLOEXEC));
-    if (!ep.valid())
-        return errno;
+    int engine_error = 0;
+    auto engine = MakeIoEngine(options.io_backend, engine_error);
+    if (engine == nullptr)
+        return engine_error;
     UniqueFd wake(::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC));
     if (!wake.valid())
         return errno;
-    epoll_event ev{};
-    ev.events = EPOLLIN;
-    ev.data.ptr = &wake_handler_;
-    if (::epoll_ctl(ep.get(), EPOLL_CTL_ADD, wake.get(), &ev) != 0)
-        return errno;
+    if (const int e = engine->Add(&wake_handler_, wake.get(), EPOLLIN); e != 0)
+        return e;
     options_ = options;
     table_ = std::make_unique<ConnectionTable>(options.max_connections);
-    epfd_ = std::move(ep);
+    io_engine_ = std::move(engine);
     wakefd_ = std::move(wake);
     return 0;
 }
@@ -154,25 +161,17 @@ void EventLoop::DrainWakeFd()
 
 int EventLoop::Add(IPollable* p, int fd, std::uint32_t events)
 {
-    epoll_event ev{};
-    ev.events = events;
-    ev.data.ptr = p;
-    return ::epoll_ctl(epfd_.get(), EPOLL_CTL_ADD, fd, &ev) == 0 ? 0 : errno;
+    return io_engine_->Add(p, fd, events);
 }
 
 void EventLoop::Mod(IPollable* p, int fd, std::uint32_t events)
 {
-    epoll_event ev{};
-    ev.events = events;
-    ev.data.ptr = p;
-    if (::epoll_ctl(epfd_.get(), EPOLL_CTL_MOD, fd, &ev) != 0)
-        LOG_FATAL("epoll_ctl(MOD) 失败 fd={} errno={}", fd, errno);
+    io_engine_->Mod(p, fd, events);
 }
 
 void EventLoop::Del(int fd)
 {
-    if (::epoll_ctl(epfd_.get(), EPOLL_CTL_DEL, fd, nullptr) != 0)
-        LOG_FATAL("epoll_ctl(DEL) 失败 fd={} errno={}", fd, errno);
+    io_engine_->Del(fd);
 }
 
 // ---- 定时器 ----
@@ -451,8 +450,10 @@ void EventLoop::RunOnce(int timeout_ms)
     const std::size_t pending = tasks_.TryDequeueBulk(batch_.begin(), kTaskBatch);
     const int wait_ms = pending > 0 ? 0 : WaitMs(timeout_ms);
 
-    epoll_event events[kMaxEvents];
-    const int n = ::epoll_wait(epfd_.get(), events, kMaxEvents, wait_ms);
+    std::array<IoEvent, kMaxEvents> events;
+    const int n = io_engine_->Wait(events, wait_ms);
+    if (n < 0)
+        LOG_FATAL("IO 后端等待失败 backend={} errno={}", ToString(io_engine_->backend()), -n);
     // 无论被什么唤醒，醒来先清标志，再（在分发到唤醒 fd 时）读空 eventfd。
     sleeping_.store(false, std::memory_order_seq_cst);
 
@@ -462,10 +463,12 @@ void EventLoop::RunOnce(int timeout_ms)
         cached_now_ = Now();
 
     for (int i = 0; i < n; ++i)
-        static_cast<IPollable*>(events[i].data.ptr)->OnEvents(events[i].events);
+        events[static_cast<std::size_t>(i)].target->OnEvents(events[static_cast<std::size_t>(i)].events);
 
+    io_engine_->Dispatch();
     RunTasks(pending);
     RunTimers();
+    io_engine_->Flush();
     ProcessClosing();
 
     const auto lag = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - busy_start).count());
@@ -478,8 +481,7 @@ void EventLoop::Run()
     while (!quit_)
         RunOnce(-1);
 
-    // Quit 只保证本生产者顺序；停机期间其它生产者可能在最后一轮 dequeue 快照后投递任务。
-    // 把已排队任务处理完，才能兑现“已投递任务在 Run 返回前执行”，也让跨 loop 的排空任务先于线程退出。
+    // Quit 不保证跨生产者顺序；先处理已排队的跨 loop 收尾，再取消内核在途请求。
     for (;;)
     {
         const std::size_t n = tasks_.TryDequeueBulk(batch_.begin(), kTaskBatch);
@@ -488,6 +490,7 @@ void EventLoop::Run()
         RunTasks(n);
         ProcessClosing();
     }
+    io_engine_->Drain();
 }
 
 } // namespace breeze

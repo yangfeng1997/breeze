@@ -98,6 +98,8 @@ void LayeredStreamConnection::OnEstablish()
 
 void LayeredStreamConnection::HandleLayerStatus(LayerStatus st)
 {
+    if (state_ == State::Disconnected || io_closing_)
+        return;
     switch (st)
     {
         case LayerStatus::Ok:
@@ -112,6 +114,11 @@ void LayeredStreamConnection::HandleLayerStatus(LayerStatus st)
             // 对端发来了关闭通知（TLS 的 close_notify）：按 RFC 回一个自己的再关，对端据此知道是正常结束而不是被截断；
             // 之后与读到 EOF 同样处理。
             (void)layer_->Shutdown();
+            if (io_registration_ != 0)
+            {
+                CloseIoAfterFlush(PeerCloseReason());
+                return;
+            }
             FlushWireBestEffort();
             CloseWith(PeerCloseReason(), 0);
             return;
@@ -119,10 +126,44 @@ void LayeredStreamConnection::HandleLayerStatus(LayerStatus st)
             LOG_DEBUG("stream layer error {} code={}", handle_.ToString(), layer_->error_code());
             // 层出错时往往已经在发送缓冲里放了 TLS 的致命 alert：尽力写出去再关，让对端知道为什么被拒，而不是只看到 EOF
             // （对端据此给出 TlsError 而不是 PeerClosed，日志里也有原因）。
+            if (io_registration_ != 0)
+            {
+                CloseIoAfterFlush(CloseReason::TlsError);
+                return;
+            }
             FlushWireBestEffort();
             CloseWith(CloseReason::TlsError, 0); // 层的底层错误码只进日志，不放进 sys_errno
             return;
     }
+}
+
+void LayeredStreamConnection::CloseIoAfterFlush(CloseReason reason)
+{
+    if (state_ == State::Disconnected || io_closing_)
+        return;
+    io_closing_ = true;
+    io_close_reason_ = reason;
+    const bool was_paused = paused_;
+    paused_ = true;
+    if (!was_paused)
+        LoopStats::Bump(loop_.stats().paused);
+    if (idle_registered_)
+        loop_.SetIdlePaused(slot_index_, true);
+    loop_.io_engine().ReadStream(io_registration_, false);
+    // 握手失败仍须保留握手位，由 CloseWith 记失败；ClosingIo 同时终止当前 DecodeAll 的剩余帧。
+    state_ = State::ClosingIo;
+    slot_.state.store(ConnectionTable::State::Disconnecting, std::memory_order_release);
+    if (timer_ != 0)
+        loop_.Cancel(timer_);
+    timer_ = loop_.RunAfter(std::chrono::milliseconds(100),
+                            [this]
+                            {
+                                timer_ = 0;
+                                CloseWith(io_close_reason_, 0);
+                            });
+    FlushWire();
+    if (state_ != State::Disconnected && !io_write_pending_ && layer_->PendingWire().empty())
+        CloseWith(io_close_reason_, 0);
 }
 
 // 关闭之前尽力把层里待发的字节写出去一次（TLS 的 alert / close_notify）：不排队、不等待、不因写失败再关一次。
@@ -185,11 +226,36 @@ void LayeredStreamConnection::HandleRead()
     if (idle_timeout_ms_ != 0)
         loop_.TouchIdle(slot_index_);
 
+    HandleWireChunk(std::span<std::byte>(buf, static_cast<std::size_t>(n)));
+}
+
+void LayeredStreamConnection::OnIoRead(std::span<std::byte> data, int error)
+{
+    if (state_ == State::Disconnected || io_closing_)
+        return;
+    if (error != 0)
+    {
+        CloseWith(CloseReason::IoError, error);
+        return;
+    }
+    if (data.empty())
+    {
+        CloseWith(PeerCloseReason(), 0);
+        return;
+    }
+    LoopStats::Bump(loop_.stats().bytes_in, static_cast<std::uint64_t>(data.size()));
+    if (idle_timeout_ms_ != 0)
+        loop_.TouchIdle(slot_index_);
+    HandleWireChunk(data);
+}
+
+void LayeredStreamConnection::HandleWireChunk(std::span<std::byte> wire)
+{
     const LayerStatus st = layer_->Unwrap(
-        std::span<std::byte>(buf, static_cast<std::size_t>(n)),
+        wire,
         [this](std::span<std::byte> plain)
         {
-            if (state_ == State::Disconnected)
+            if (state_ == State::Disconnected || io_closing_)
                 return false;
             // 层只在握手完成之后才交付明文，所以"交付明文"本身就是握手完成的信号。TLS 的客户端发完 Finished 可以立刻发
             // 应用数据，两者常在同一次 read 里到达：层先交付明文、Unwrap 返回时才报 HandshakeDone。不在这里先处理的话，
@@ -253,8 +319,8 @@ void LayeredStreamConnection::SendBatchFromTask(std::span<SharedBuffer> payloads
     for (; i < count; ++i)
     {
         consumed = EncryptFrame(headers[i].data(), header_len[i], payloads[i].bytes(), 0);
-        if (state_ == State::Disconnected)
-            return; // 层出错，连接已在 EncryptFrame 里关闭
+        if (state_ >= State::Disconnected)
+            return; // 层出错，已关闭或正在提交最终 alert
         if (consumed != header_len[i] + payloads[i].size())
             break; // 层内字节到预算了：这一帧（及之后）剩下的入队
         slot_.pending_bytes.fetch_sub(payloads[i].size(), std::memory_order_relaxed);
@@ -382,8 +448,54 @@ void LayeredStreamConnection::EncryptQueued()
     }
 }
 
+void LayeredStreamConnection::StartIoWrite()
+{
+    if (state_ != State::Disconnected && !io_closing_)
+        HandleWrite();
+}
+
+void LayeredStreamConnection::OnIoWrite(std::size_t bytes, int error)
+{
+    if (io_closing_)
+    {
+        if (state_ == State::Disconnected)
+            return;
+        const bool valid = io_write_pending_ && bytes <= io_write_bytes_;
+        io_write_pending_ = false;
+        io_write_bytes_ = 0;
+        if (!valid || error != 0 || bytes == 0)
+        {
+            CloseWith(io_close_reason_, 0);
+            return;
+        }
+        LoopStats::Bump(loop_.stats().bytes_out, static_cast<std::uint64_t>(bytes));
+        layer_->ConsumeWire(bytes);
+        FlushWire();
+        if (state_ != State::Disconnected && !io_write_pending_ && layer_->PendingWire().empty())
+            CloseWith(io_close_reason_, 0);
+        return;
+    }
+    if (!CompleteIoWrite(bytes, error))
+        return;
+    layer_->ConsumeWire(bytes);
+    HandleWrite();
+}
+
 void LayeredStreamConnection::FlushWire()
 {
+    if (io_registration_ != 0)
+    {
+        if (state_ == State::Disconnected || io_write_pending_)
+            return;
+        const std::span<const std::byte> wire = layer_->PendingWire();
+        if (!wire.empty())
+        {
+            // WriteStream 持有快照；PendingWire 可在 read/Wrap 时重新分配，CQE 前仍计入 wire budget。
+            iovec buffer{const_cast<std::byte*>(wire.data()), std::min(wire.size(), std::size_t{256 * 1024})};
+            (void)SubmitIoWrite(std::span<const iovec>(&buffer, 1));
+        }
+        return;
+    }
     while (state_ != State::Disconnected)
     {
         const std::span<const std::byte> wire = layer_->PendingWire();
@@ -424,7 +536,16 @@ SendResult LayeredStreamConnection::SendImpl(std::span<const std::byte> payload,
     {
         LOG_ERROR("Send 的 payload 超过 codec 上限 size={}，关闭连接", payload.size());
         LoopStats::Add(loop_.stats().send_closed_oversize);
-        CloseWith(CloseReason::ProtocolError, 0);
+        if (io_registration_ != 0)
+        {
+            // 先前 accepted 的小帧可能仍在等 CQE；本地编码失败不能取消已经能放进 wire 预算的前缀。
+            if (!Has(Flag::LayerHandshaking) && !out_.empty())
+                EncryptQueued();
+            if (state_ < State::Disconnected)
+                CloseIoAfterFlush(CloseReason::ProtocolError);
+        }
+        else
+            CloseWith(CloseReason::ProtocolError, 0);
         return SendResult::Closed;
     }
 
@@ -443,10 +564,10 @@ SendResult LayeredStreamConnection::SendImpl(std::span<const std::byte> payload,
     {
         // 无积压：直写。明文被加密吃掉之后，写不完的是密文、留在层里，不需要把 payload 拷成 SharedBuffer。
         consumed = EncryptFrame(header.data(), header_len, payload, 0);
-        if (state_ == State::Disconnected)
+        if (state_ >= State::Disconnected)
             return SendResult::Closed;
         FlushWire();
-        if (state_ == State::Disconnected)
+        if (state_ >= State::Disconnected)
             return SendResult::Closed;
         if (consumed == header_len + payload.size())
         {
@@ -484,7 +605,7 @@ SendResult LayeredStreamConnection::SendImpl(std::span<const std::byte> payload,
 void LayeredStreamConnection::WriteRaw(std::span<const std::byte> bytes)
 {
     loop_.AssertInLoopThread();
-    if (state_ == State::Disconnected || bytes.empty())
+    if (state_ >= State::Disconnected || bytes.empty())
         return;
 
     std::size_t consumed = 0;
@@ -492,10 +613,10 @@ void LayeredStreamConnection::WriteRaw(std::span<const std::byte> bytes)
     if (!Has(Flag::LayerHandshaking) && out_.empty() && layer_->PendingWire().empty())
     {
         consumed = EncryptFrame(nullptr, 0, bytes, 0);
-        if (state_ == State::Disconnected)
+        if (state_ >= State::Disconnected)
             return;
         FlushWire();
-        if (state_ == State::Disconnected || consumed == bytes.size())
+        if (state_ >= State::Disconnected || consumed == bytes.size())
             return;
     }
 
@@ -517,6 +638,8 @@ void LayeredStreamConnection::WriteRaw(std::span<const std::byte> bytes)
 
 void LayeredStreamConnection::HandleWrite()
 {
+    if (state_ == State::Disconnected || io_closing_)
+        return;
     for (;;)
     {
         FlushWire();
@@ -527,7 +650,7 @@ void LayeredStreamConnection::HandleWrite()
         if (out_.empty() || Has(Flag::LayerHandshaking))
             break; // 握手期排队的 codec 原始字节，等层就绪再加密
         EncryptQueued();
-        if (state_ == State::Disconnected)
+        if (state_ >= State::Disconnected)
             return;
     }
     SetWriteInterest(false); // 队列与层里都排空：EPOLLOUT 仅在有东西要写时注册
@@ -537,6 +660,8 @@ void LayeredStreamConnection::HandleWrite()
 
 void LayeredStreamConnection::FinishWrites()
 {
+    if (state_ >= State::Disconnected)
+        return;
     // 写队列已排空：让层发关闭通知（TLS 的 close_notify），排空之后才 shutdown(SHUT_WR)。幂等：排空不了会再来一次。
     if (!layer_shutdown_)
     {

@@ -13,9 +13,14 @@
     "yaml-cpp"
   ],
   "default-features": [
-    "tls"
+    "tls",
+    "uring"
   ],
   "features": {
+    "uring": {
+      "description": "Linux io_uring 后端；运行时仍可选择 epoll",
+      "dependencies": [{ "name": "liburing", "platform": "linux" }]
+    },
     "tls": {
       "description": "BoringSSL：breeze_net_tls（tls:// 与 wss://）。不要 TLS 的构建用 -DVCPKG_MANIFEST_NO_DEFAULT_FEATURES=ON 配 -DBREEZE_BUILD_NET_TLS=OFF（release-notls 预设）",
       "dependencies": [

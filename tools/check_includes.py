@@ -52,6 +52,8 @@ PUBLIC_HEADERS = {
     # loop/：EventLoopGroup 与统计（EventLoop 本身不是公开类型）
     NET + "loop/event_loop_group.h",
     NET + "loop/net_stats.h",
+    NET + "loop/io_backend.h",
+    NET + "loop/io_stats.h",
     # stream/：TCP / UDS 共用的服务端 / 客户端基类
     NET + "stream/reconnect_policy.h",
     NET + "stream/stream_client.h",

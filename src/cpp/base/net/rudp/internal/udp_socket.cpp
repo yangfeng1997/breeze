@@ -115,15 +115,37 @@ int UdpSocket::Open(EventLoop& loop,
     }
 
     std::unique_ptr<UdpSocket> s(new UdpSocket(loop, std::move(fd), std::move(local), handler));
-    if (const int e = loop.Add(s.get(), s->fd_.get(), EPOLLIN); e != 0)
-        return e;
-    s->registered_ = true;
+    if (loop.io_backend() == IoBackend::IoUring)
+    {
+        s->engine_ = &loop.io_engine();
+        s->engine_lifetime_ = s->engine_->lifetime();
+        int error = 0;
+        s->io_registration_ = s->engine_->AttachDatagram(s->fd_.get(), *s, error);
+        if (s->io_registration_ == 0)
+            return error;
+    }
+    else
+    {
+        if (const int e = loop.Add(s.get(), s->fd_.get(), EPOLLIN); e != 0)
+            return e;
+        s->registered_ = true;
+    }
     out = std::move(s);
     return 0;
 }
 
+UdpSocket::~UdpSocket()
+{
+    // UdpSocket 可比 loop 晚析构；仅在引擎仍存活时撤销完成回调。
+    if (io_registration_ != 0 && !engine_lifetime_.expired())
+        engine_->Detach(io_registration_);
+}
+
 void UdpSocket::Close()
 {
+    if (io_registration_ != 0 && !engine_lifetime_.expired())
+        engine_->Detach(io_registration_);
+    io_registration_ = 0;
     if (!fd_.valid())
         return;
     if (registered_)
@@ -141,6 +163,8 @@ int UdpSocket::Send(std::span<const std::byte> prefix,
 {
     if (!fd_.valid())
         return EBADF;
+    if (io_registration_ != 0)
+        return engine_->SendDatagram(io_registration_, prefix, payload, to, to_len);
     iovec iov[2];
     int cnt = 0;
     if (!prefix.empty())
@@ -166,6 +190,27 @@ int UdpSocket::Send(std::span<const std::byte> prefix,
         if (errno != EINTR)
             return errno;
     }
+}
+
+void UdpSocket::OnIoDatagram(const sockaddr_storage& src, socklen_t length,
+                              std::span<const std::byte> data)
+{
+    if (data.size() > rudp::kMaxMtu || !fd_.valid())
+        return;
+    LoopStats::Bump(loop_.stats().bytes_in, data.size());
+    handler_.OnDatagram(src, length, data);
+}
+
+void UdpSocket::OnIoDatagramError(int error)
+{
+    if (fd_.valid() && error != EAGAIN && error != ENOBUFS && error != ECANCELED)
+        handler_.OnSocketError(error);
+}
+
+void UdpSocket::OnIoDatagramSent(std::size_t bytes)
+{
+    if (fd_.valid())
+        LoopStats::Bump(loop_.stats().bytes_out, bytes);
 }
 
 void UdpSocket::OnEvents(std::uint32_t events)

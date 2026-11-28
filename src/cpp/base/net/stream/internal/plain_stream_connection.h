@@ -41,4 +41,44 @@ private:
     void HandleWrite();
 };
 
+// 工厂按后端选定，避免 epoll 的 Send / HandleRead 为 completion 增加每消息分支。
+class CompletionPlainStreamConnection final : public StreamConnection
+{
+public:
+    SendResult Send(SharedBuffer payload) override;
+    SendResult Send(std::span<const std::byte> payload) override;
+
+private:
+    friend class StreamConnection;
+
+    CompletionPlainStreamConnection(EventLoop& loop,
+                                    UniqueFd fd,
+                                    PeerInfo peer,
+                                    IConnectionHandler& handler,
+                                    std::unique_ptr<IFrameCodec> codec,
+                                    const ConnectionOptions& options,
+                                    ConnectionTable::Slot& slot,
+                                    std::uint32_t slot_index,
+                                    ConnectionHandle handle)
+        : StreamConnection(loop, std::move(fd), std::move(peer), handler, std::move(codec), options, slot, slot_index, handle)
+    {
+    }
+
+    void OnEvents(std::uint32_t) override {}
+    void SendFromTask(SharedBuffer payload) override;
+    void SendBatchFromTask(std::span<SharedBuffer> payloads) override;
+    void FinishWrites() override;
+    void WriteRaw(std::span<const std::byte> bytes) override;
+    void OnIoRead(std::span<std::byte> data, int error) override;
+    void OnIoWrite(std::size_t bytes, int error) override;
+    SendResult Enqueue(std::span<const std::byte> payload, SharedBuffer* owned, bool counted, bool raw);
+    void SubmitQueued();
+    void CloseAfterIoPrefix(CloseReason reason);
+    // 首帧独占一个稳定的 wire 块；只有积压才构造 out_ 的 deque。
+    SharedBuffer pending_wire_;
+    std::size_t pending_payload_bytes_ = 0;
+    std::size_t pending_wire_offset_ = 0;
+    CloseReason io_close_reason_ = CloseReason::LocalClose;
+};
+
 } // namespace breeze

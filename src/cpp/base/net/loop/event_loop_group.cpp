@@ -52,7 +52,7 @@ int EventLoopGroup::Start()
     for (std::uint32_t i = 0; i < options_.io_threads; ++i)
     {
         auto w = std::make_unique<Worker>();
-        const EventLoopOptions lo{id, i, options_.max_connections_per_loop};
+        const EventLoopOptions lo{id, i, options_.max_connections_per_loop, options_.io_backend};
         if (const int e = w->loop.Init(lo); e != 0)
         {
             workers_.clear();
@@ -150,6 +150,14 @@ NetStats EventLoopGroup::GetStats() const
     {
         out.connections += w->loop.table().Live();
         w->loop.stats().AddTo(out);
+        const auto io = w->loop.io_engine().stats();
+        out.io.submissions += io.submissions;
+        out.io.completions += io.completions;
+        out.io.receive_buffer_exhaustions += io.receive_buffer_exhaustions;
+        out.io.budget_exhaustions += io.budget_exhaustions;
+        out.io.cancellations += io.cancellations;
+        out.io.receive_buffer_bytes += io.receive_buffer_bytes;
+        out.io.pending_send_bytes += io.pending_send_bytes;
     }
     return out;
 }

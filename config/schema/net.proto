@@ -8,6 +8,14 @@ package config;
 
 import "options.proto";
 
+// YAML 名称：auto / epoll / uring。生产默认保持 epoll，是否改为 Auto 待压测验收后决定。
+enum IoBackendConfig {
+  IO_BACKEND_CONFIG_UNSPECIFIED = 0;
+  IO_BACKEND_CONFIG_AUTO = 1;
+  IO_BACKEND_CONFIG_EPOLL = 2;
+  IO_BACKEND_CONFIG_URING = 3;
+}
+
 message NetConfig {
   // ---- IO 线程与连接容量 ----
   // IO 线程数（每个线程一个 EventLoop）。
@@ -58,7 +66,9 @@ message NetConfig {
   // ---- WebSocket（ws:// 与 wss:// 端点；设计见 docs/网络库设计.md §4.17）----
   WsConfig ws = 18;
 
-  // ---- UDP 分流 ----
+  // ---- IO 后端与 UDP 分流 ----
+  // 各 loop 在启动时选择后端；Auto 不可用时回退 epoll，不在存量连接上切换。
+  IoBackendConfig io_backend = 19 [(config.default) = "epoll"];
   // rudp 服务端在每个 IO loop 上各绑定一个同端口的 UDP socket；启动后不能改变 shard 数。
   bool rudp_reuse_port = 20 [(config.default) = "false"];
 }

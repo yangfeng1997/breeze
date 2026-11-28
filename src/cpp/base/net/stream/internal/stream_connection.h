@@ -36,6 +36,7 @@
 #include "base/net/connection/send_result.h"
 #include "base/net/endpoint/peer_info.h"
 #include "base/net/loop/connection_table.h"
+#include "base/net/loop/io_completion.h"
 #include "base/net/socket/unique_fd.h"
 #include "base/net/stream/internal/handshake_observer_interface.h"
 #include "base/net/stream/internal/lazy_queue.h"
@@ -106,6 +107,7 @@ protected:
         Connected,
         Disconnecting, // 优雅关闭中：不再接受 Send，仍读，等写队列排空与对端关闭
         Disconnected,
+        ClosingIo, // 最终层字节仍在途：停止解帧与新发送，完成或短超时后转 Disconnected
     };
 
     // 待发送的一帧：内联帧头 + 共享的 payload；offset 是已经写出的字节数（帧头 + payload 合计）。
@@ -151,6 +153,13 @@ protected:
     virtual void FinishWrites() { ShutdownWrite(); }
     // ICodecHost::SendRaw 的实现：不经 EncodeHeader 写原始字节，与 Send 保序。连接已关闭时是空操作。
     virtual void WriteRaw(std::span<const std::byte> bytes) = 0;
+    // 只由 completion adapter 调用；epoll 子类不进入这两个钩子。
+    virtual void OnIoRead(std::span<std::byte>, int) {}
+    virtual void OnIoWrite(std::size_t, int) {}
+    virtual void StartIoWrite() {}
+    bool SubmitIoWrite(std::span<const iovec> buffers);
+    bool SubmitIoOwnedWrite(SharedBuffer bytes);
+    bool CompleteIoWrite(std::size_t bytes, int error);
 
     // 一个握手来源完成：清它的位，全部清完就回调 OnConnected。幂等；连接已关闭则忽略。
     void HandshakeSourceDone(Flag source);
@@ -195,6 +204,18 @@ protected:
         StreamConnection& c_;
     };
 
+    // 第二个接口的 vptr 留在冷区，不能通过多继承把 in_ 的偏移从 72 字节后移。
+    class CompletionAdapter final : public IStreamCompletion
+    {
+    public:
+        explicit CompletionAdapter(StreamConnection& c) noexcept : c_(c) {}
+        void OnIoRead(std::span<std::byte> data, int error) override { c_.OnIoRead(data, error); }
+        void OnIoWrite(std::size_t bytes, int error) override { c_.OnIoWrite(bytes, error); }
+
+    private:
+        StreamConnection& c_;
+    };
+
     // 成员顺序是性能决定的：每条消息都碰的热字段集中在前（两条缓存行内），冷的（对端信息、句柄、上下文、定时器、关闭原因）放后面。
     // 10 万连接时每连接多碰一条缓存行就是可测量的代价（docs/网络库设计.md §9.1 / §9.3）。改动时用 sizeof 与 offsetof
     // 核对。新增状态一律放冷区（末尾），子类也不得在热区加字段。
@@ -230,6 +251,10 @@ protected:
     CodecHostAdapter host_{*this};
     const std::uint32_t handshake_timeout_ms_;
     std::uint16_t flags_ = 0; // Flag 的位
+    CompletionAdapter completion_{*this};
+    IoRegistration io_registration_ = 0; // 非零时收发都走真正的 completion，fd 不登记 readiness
+    std::size_t io_write_bytes_ = 0; // 本次在途提交的上限；引擎持有提交字节直到真实完成
+    bool io_write_pending_ = false;
 };
 
 } // namespace breeze
