@@ -453,7 +453,7 @@ struct Correlation {          // 取代信封里的 u64 seq：仍是 8 字节，
 - **为什么保留**：成本几乎为零；将来的协程层需要它（协程帧因实例回收被销毁时，awaiter 的析构要取消挂起的调用，否则应答到来时会去恢复已销毁的协程。这是推断，没有代码验证）。给函数加返回值对忽略返回值的调用点源码兼容，所以去掉也没有后悔成本。
 - **不叫 future / promise**：它们不能阻塞取结果，也不挂续接；`future` 这个名字会让人去找 `.get()`。以后协程层升级成真 future，只改 `Call` 的返回类型。
 
-**回调收到 `CallResult { status, body }`**（`ReplyFn` 是 `std::move_only_function<void(CallResult&&)>`）：成功时 `status` 为 0，`body` 是 `SharedBuffer`；失败时 `body` 为空。`status` 装两类错误：框架错误（超时、无路由、不可达、过载、停机、"无应答"，以及 §7 终态表里的"不存在""邮箱满""正在停用""激活失败"）和业务错误（`err_code` 的业务区间）。类型是 `Status`（`base` 里没有现成的 `Status` / `Result`，只有 `framework/app/errors.h` 的 `Error`），见下一小节。
+**回调收到 `CallResult { status, body }`**（`ReplyFn` 是 `std::move_only_function<void(CallResult&&)>`）：成功时 `status` 为 0，`body` 是 `SharedBuffer`；失败时 `body` 为空。`status` 装两类错误：框架错误（超时、无路由、不可达、过载、停机、"无应答"，以及 §7 终态表里的"不存在""邮箱满""正在停用""激活失败"）和业务错误（`err_code` 的业务区间）。类型是 `Status`（`base` 里没有现成的 `Status` / `Result`，只有 `framework/error/errors.h` 的 `Error`），见下一小节。
 
 **各处的返回值**：
 

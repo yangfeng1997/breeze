@@ -596,8 +596,7 @@ endif()
 add_library(breeze_app
   ${APP_DIR}/app.cpp
   ${APP_DIR}/lifecycle.cpp
-  ${APP_DIR}/loop.cpp
-  ${APP_DIR}/module.cpp)
+  ${APP_DIR}/loop.cpp)
 target_link_libraries(breeze_app PUBLIC Threads::Threads PRIVATE breeze_logger)
 target_compile_options(breeze_app PRIVATE -Wall -Wextra)
 breeze_apply_log_level(breeze_app)

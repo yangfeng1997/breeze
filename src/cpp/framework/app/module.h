@@ -7,7 +7,7 @@
 #include <string_view>
 #include <vector>
 
-#include "framework/app/errors.h"
+#include "framework/error/errors.h"
 
 namespace breeze
 {
@@ -28,7 +28,7 @@ public:
         : app_(app)
     {
     }
-    virtual ~Module(); // 见 module.cpp：钉住 vtable
+    virtual ~Module() = default;
     Module(const Module&) = delete;
     Module& operator=(const Module&) = delete;
 

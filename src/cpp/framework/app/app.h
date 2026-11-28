@@ -19,7 +19,7 @@
 #include <vector>
 
 #include "framework/app/app_options.h"
-#include "framework/app/errors.h"
+#include "framework/error/errors.h"
 #include "framework/app/module.h"
 
 namespace breeze
